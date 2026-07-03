@@ -47,7 +47,7 @@
 //! worker.join().unwrap();
 //! ```
 
-use std::{sync, sync::atomic};
+use std::{cell, sync, sync::atomic};
 
 const MAX_NODE: u32 = u32::MAX;
 
@@ -80,16 +80,25 @@ pub struct Reservoir<T: Send + Sync + Sized> {
     cv: sync::Condvar,
     waiters: atomic::AtomicU32,
     nexts: Box<[atomic::AtomicU32]>,
-    resources: Box<[T]>,
+    resources: Box<[cell::UnsafeCell<Option<T>>]>,
     lock: sync::Mutex<()>,
     head: atomic::AtomicU64,
+    _empty_head: atomic::AtomicU64,
 }
+
+// NOTE:
+//
+// The `UnsafeCell` implementation is `!Sync` by default, but our atomic state machines mathematically
+// guarantee us the exclusive access to the underlying indices
+
+unsafe impl<T: Send + Sync + Sized> Send for Reservoir<T> {}
+unsafe impl<T: Send + Sync + Sized> Sync for Reservoir<T> {}
 
 impl<T> Reservoir<T>
 where
     T: Send + Sync + Sized,
 {
-    /// Creates a new `Reservoir` from a pre-allocated collection of resources
+    /// Creates a new `Reservoir` from a pre-allocated collection of resources of type [`T`]
     ///
     /// **WARNING:** The maximum supported capacity is `u32::MAX - 1`. Attempting to init a
     /// [`Reservoir`] with a vec that equals or exceeds this limit will result in panic.
@@ -107,6 +116,7 @@ where
     /// use frozen_core::reservoir::Reservoir;
     ///
     /// let pool = Reservoir::new(vec!["Conn1".to_string(), "Conn2".to_string()]);
+    ///
     /// let mut lease = pool.acquire();
     /// assert_eq!(*lease, "Conn1");
     ///
@@ -115,32 +125,88 @@ where
     ///
     /// drop(lease);
     /// ```
-    #[inline]
     pub fn new(resources: Vec<T>) -> Self {
-        let capacity = resources.len();
-        assert!(capacity < MAX_NODE as usize, "Resources must not exceed u32::MAX length");
+        let len = resources.len();
+        Self::with_capacity(resources, len)
+    }
+
+    /// Creates a new `Reservoir` from a pre-defined capacity and a pre-allocated collection of
+    /// resources of type [`T`]
+    ///
+    /// **WARNING:** The maximum supported capacity is `u32::MAX - 1`. Attempting to init a
+    /// [`Reservoir`] with a vec that equals or exceeds this limit will result in panic.
+    ///
+    /// ## Uniqueness
+    ///
+    /// The caller is responsible for ensuring that each resource [`T`] appears at most once in the
+    /// provided collection. Supplying the same logical resource multiple times (for example,
+    /// multiple handles referring to the same underlying object) violates the reservoir's
+    /// exclusivity guarantees and results in undefined application behavior.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::reservoir::Reservoir;
+    ///
+    /// let pool = Reservoir::with_capacity(vec!["Conn1".to_string(), "Conn2".to_string()], 0x0A);
+    ///
+    /// let mut lease = pool.acquire();
+    /// assert_eq!(*lease, "Conn1");
+    ///
+    /// lease.push_str("_used");
+    /// assert_eq!(*lease, "Conn1_used");
+    ///
+    /// drop(lease);
+    /// ```
+    pub fn with_capacity(resources: Vec<T>, capacity: usize) -> Self {
+        // sanity checks
+        assert!(capacity > 0, "Reservoir capacity must be greater than 0");
+        assert!(capacity >= resources.len(), "Capacity must be >= initial resources length");
+        assert!(capacity < MAX_NODE as usize, "Resources must not exceed `u32::MAX` length");
+
+        let initial_len = resources.len();
 
         let mut nexts = Vec::with_capacity(capacity);
-        for idx in 0..(capacity as u32) {
-            nexts.push(atomic::AtomicU32::new(if idx + 1 == capacity as u32 {
+        let mut res_cells = Vec::with_capacity(capacity);
+
+        for (idx, res) in resources.into_iter().enumerate() {
+            res_cells.push(std::cell::UnsafeCell::new(Some(res)));
+            nexts.push(atomic::AtomicU32::new(if idx + 1 == initial_len {
                 MAX_NODE
             } else {
-                idx + 1
+                (idx + 1) as u32
             }));
         }
 
+        let empty_head = if initial_len < capacity {
+            for idx in initial_len..capacity {
+                res_cells.push(std::cell::UnsafeCell::new(None));
+                nexts.push(atomic::AtomicU32::new(if idx + 1 == capacity {
+                    MAX_NODE
+                } else {
+                    (idx + 1) as u32
+                }));
+            }
+            pack(initial_len as u32, 0)
+        } else {
+            pack(MAX_NODE, 0)
+        };
+
+        let head = if initial_len > 0 { pack(0, 0) } else { pack(MAX_NODE, 0) };
+
         Self {
             cv: sync::Condvar::new(),
-            head: atomic::AtomicU64::new(0),
+            head: atomic::AtomicU64::new(head),
+            _empty_head: atomic::AtomicU64::new(empty_head),
             lock: sync::Mutex::new(()),
             nexts: nexts.into_boxed_slice(),
-            resources: resources.into_boxed_slice(),
+            resources: res_cells.into_boxed_slice(),
             waiters: atomic::AtomicU32::new(0),
         }
     }
 
-    /// Acquires a resource from the reservoir, with internal blocking if the pool is currently
-    /// exhausted
+    /// Acquires a resource of type [`T`] from the reservoir, with internal blocking when the pool
+    /// is exhausted
     ///
     /// ## Working
     ///
@@ -287,7 +353,12 @@ where
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        &self.reservoir.resources[self.index]
+        // SAFETY: As we have exclusive access to `T` via the `ReservoirPermit`, the use of unsafe
+        // is perfectly sound
+        unsafe {
+            let opt = &*self.reservoir.resources[self.index].get();
+            opt.as_ref().unwrap()
+        }
     }
 }
 
@@ -296,8 +367,12 @@ where
     T: Send + Sync + Sized,
 {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        // SAFETY: We have exclusive access via the permit so the use of unsafe is perfectly sound.
-        unsafe { &mut *(self.reservoir.resources.as_ptr().add(self.index) as *mut T) }
+        // SAFETY: As we have exclusive access to `T` via the `ReservoirPermit`, the use of unsafe
+        // is perfectly sound
+        unsafe {
+            let opt = &mut *self.reservoir.resources[self.index].get();
+            opt.as_mut().unwrap()
+        }
     }
 }
 
