@@ -30,7 +30,7 @@
 //! use std::sync::Arc;
 //! use std::thread;
 //!
-//! let pool = Arc::new(Reservoir::new(vec![0x0A, 0x1A, 0x2A]));
+//! let pool = Arc::new(Reservoir::with_capacity(vec![0x0A, 0x1A], 3));
 //!
 //! let mut permit = pool.acquire();
 //! assert_eq!(*permit, 0x0A);
@@ -38,10 +38,12 @@
 //! *permit = 0x0F;
 //! drop(permit);
 //!
+//! assert!(pool.insert(0x2A).is_ok());
+//!
 //! let pool_clone = Arc::clone(&pool);
 //! let worker = thread::spawn(move || {
 //!     let permit = pool_clone.acquire();
-//!     assert_eq!(*permit, 0x0F);
+//!     assert_eq!(*permit, 0x2A);
 //! });
 //!
 //! worker.join().unwrap();
@@ -70,10 +72,13 @@ const MAX_NODE: u32 = u32::MAX;
 /// let mut lease = pool.acquire();
 /// assert_eq!(*lease, "Conn1");
 ///
-/// lease.push_str("_used");
-/// assert_eq!(*lease, "Conn1_used");
+/// let dead_conn = pool.retire(lease);
+/// assert_eq!(dead_conn, "Conn1");
 ///
-/// drop(lease);
+/// assert!(pool.insert("Conn3".to_string()).is_ok());
+///
+/// let new_lease = pool.acquire();
+/// assert_eq!(*new_lease, "Conn3");
 /// ```
 #[derive(Debug)]
 pub struct Reservoir<T: Send + Sync + Sized> {
@@ -646,5 +651,80 @@ mod tests {
             .expect("Permit leaked during panic! Resource was not returned.");
 
         assert_eq!(recovered_value, 0x63);
+    }
+
+    #[test]
+    fn ok_with_capacity_initializes_empty_slots() {
+        let pool = Reservoir::with_capacity(vec![0x100], 3);
+
+        assert!(pool.insert(0x200).is_ok());
+        assert!(pool.insert(0x300).is_ok());
+        assert_eq!(pool.insert(0x400), Err(0x400));
+
+        let mut sum = 0;
+        let mut held = Vec::new();
+
+        for _ in 0..3 {
+            let p = pool.acquire();
+            sum += *p;
+            held.push(p);
+        }
+
+        assert_eq!(sum, 0x600);
+    }
+
+    #[test]
+    fn ok_retire_resource_extracts_value() {
+        let pool = Reservoir::new(vec!["A", "B"]);
+
+        let permit = pool.acquire();
+        assert_eq!(*permit, "A");
+
+        let extracted = pool.retire(permit);
+        assert_eq!(extracted, "A");
+
+        let p2 = pool.acquire();
+        assert_eq!(*p2, "B");
+    }
+
+    #[test]
+    fn ok_insert_wakes_waiting_thread() {
+        let pool = Arc::new(Reservoir::with_capacity(vec![], 1));
+
+        let pool_clone = Arc::clone(&pool);
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        thread::spawn(move || {
+            let permit = pool_clone.acquire();
+            tx.send(*permit).unwrap();
+        });
+
+        thread::sleep(Duration::from_millis(20));
+
+        assert!(pool.insert(0x63).is_ok());
+
+        let received =
+            rx.recv_timeout(Duration::from_millis(0x64)).expect("Thread was not woken by insert()");
+
+        assert_eq!(received, 0x63);
+    }
+
+    #[test]
+    fn ok_dynamic_swap_retire_and_insert() {
+        let pool = Reservoir::new(vec![1, 2]);
+
+        let p1 = pool.acquire();
+        let p2 = pool.acquire();
+
+        assert_eq!(pool.retire(p1), 1);
+        assert!(pool.insert(10).is_ok());
+
+        drop(p2);
+
+        let p_new_1 = pool.acquire();
+        let p_new_2 = pool.acquire();
+
+        let total = *p_new_1 + *p_new_2;
+        assert_eq!(total, 0x0C);
     }
 }
