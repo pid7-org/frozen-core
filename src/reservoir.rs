@@ -263,7 +263,7 @@ where
     /// let permit = pool.acquire();
     /// assert_eq!(*permit, "world");
     /// ```
-    #[inline]
+    #[inline(always)]
     pub fn retire(&self, permit: ReservoirPermit<'_, T>) -> T {
         let index = permit.index;
 
@@ -282,7 +282,47 @@ where
         resource
     }
 
-    #[inline]
+    /// Attempts to insert a new resource into the [`Reservoir`]
+    ///
+    /// Returns `Ok()` on success, otherwise `Err(T)`, returning the resource back when the pool
+    /// has no empty slots
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::reservoir::Reservoir;
+    ///
+    /// let pool = Reservoir::with_capacity(vec!["hello".to_string()], 2);
+    ///
+    /// let res = pool.insert("world".to_string());
+    /// assert!(res.is_ok());
+    ///
+    /// let res2 = pool.insert("world".to_string());
+    /// assert!(res2.is_err());
+    /// ```
+    #[inline(always)]
+    pub fn insert(&self, resource: T) -> Result<(), T> {
+        if let Some(index) = self.try_pop_stack(&self.empty_head) {
+            unsafe {
+                let opt_ref = &mut *self.resources[index as usize].get();
+                *opt_ref = Some(resource);
+            }
+
+            self.push_stack(&self.head, index);
+
+            // NOTE: to avoid dead locks, we must notify any threads currently waiting in `acquire`
+            if self.waiters.load(atomic::Ordering::SeqCst) > 0 {
+                let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+                self.cv.notify_one();
+            }
+
+            return Ok(());
+        }
+
+        Err(resource)
+    }
+
+    #[inline(always)]
     fn push(&self, index: u32) {
         loop {
             let current_head = self.head.load(atomic::Ordering::Acquire);
@@ -303,7 +343,7 @@ where
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn push_stack(&self, stack: &atomic::AtomicU64, index: u32) {
         loop {
             let current = stack.load(atomic::Ordering::Acquire);
@@ -332,7 +372,7 @@ where
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn try_pop_stack(&self, stack: &atomic::AtomicU64) -> Option<u32> {
         loop {
             let current = stack.load(atomic::Ordering::Acquire);
