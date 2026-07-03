@@ -1,5 +1,13 @@
 # Changelog
 
+## `0.0.31`
+
+- Improvements in `reservoir` module
+  - Improved docs and doctests
+  - Improved internal structure
+  - Impl of `Reservoir::retire()` & `Reservoir::insert()` (#87)
+  - Updated unit test module expanding test coverage (#89)
+
 ## `0.0.30`
 
 - Updated api signature of `FrozenMMap::read()` (#75)
