@@ -94,6 +94,13 @@ where
     /// **WARNING:** The maximum supported capacity is `u32::MAX - 1`. Attempting to init a
     /// [`Reservoir`] with a vec that equals or exceeds this limit will result in panic.
     ///
+    /// ## Uniqueness
+    ///
+    /// The caller is responsible for ensuring that each resource [`T`] appears at most once in the
+    /// provided collection. Supplying the same logical resource multiple times (for example,
+    /// multiple handles referring to the same underlying object) violates the reservoir's
+    /// exclusivity guarantees and results in undefined application behavior.
+    ///
     /// ## Example
     ///
     /// ```
