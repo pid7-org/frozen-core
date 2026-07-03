@@ -47,7 +47,7 @@
 //! worker.join().unwrap();
 //! ```
 
-use std::{cell, sync, sync::atomic};
+use std::{cell, mem, sync, sync::atomic};
 
 const MAX_NODE: u32 = u32::MAX;
 
@@ -83,7 +83,7 @@ pub struct Reservoir<T: Send + Sync + Sized> {
     resources: Box<[cell::UnsafeCell<Option<T>>]>,
     lock: sync::Mutex<()>,
     head: atomic::AtomicU64,
-    _empty_head: atomic::AtomicU64,
+    empty_head: atomic::AtomicU64,
 }
 
 // NOTE:
@@ -197,7 +197,7 @@ where
         Self {
             cv: sync::Condvar::new(),
             head: atomic::AtomicU64::new(head),
-            _empty_head: atomic::AtomicU64::new(empty_head),
+            empty_head: atomic::AtomicU64::new(empty_head),
             lock: sync::Mutex::new(()),
             nexts: nexts.into_boxed_slice(),
             resources: res_cells.into_boxed_slice(),
@@ -231,7 +231,7 @@ where
     /// ```
     #[inline(always)]
     pub fn acquire(&self) -> ReservoirPermit<'_, T> {
-        if let Some(index) = self.try_pop() {
+        if let Some(index) = self.try_pop_stack(&self.head) {
             return ReservoirPermit { reservoir: self, index: index as usize };
         }
 
@@ -239,7 +239,7 @@ where
 
         let mut guard = self.lock.lock().unwrap_or_else(|err| err.into_inner());
         loop {
-            if let Some(index) = self.try_pop() {
+            if let Some(index) = self.try_pop_stack(&self.head) {
                 self.waiters.fetch_sub(1, atomic::Ordering::SeqCst);
                 return ReservoirPermit { reservoir: self, index: index as usize };
             }
@@ -248,30 +248,38 @@ where
         }
     }
 
+    /// Permanently retire a resource [`T`] using its [`ReservoirPermit`]
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::reservoir::Reservoir;
+    ///
+    /// let pool = Reservoir::new(vec!["hello".to_string(), "world".to_string()]);
+    ///
+    /// let permit = pool.acquire();
+    /// assert_eq!(pool.retire(permit), "hello");
+    ///
+    /// let permit = pool.acquire();
+    /// assert_eq!(*permit, "world");
+    /// ```
     #[inline]
-    fn try_pop(&self) -> Option<u32> {
-        loop {
-            let current_head = self.head.load(atomic::Ordering::Acquire);
-            let (head, version) = unpack(current_head);
+    pub fn retire(&self, permit: ReservoirPermit<'_, T>) -> T {
+        let index = permit.index;
 
-            if head == MAX_NODE {
-                return None;
-            }
+        // NOTE: To avoid the automatic drop by the compiler, we must manually forget the `permit`
+        mem::forget(permit);
 
-            let next = self.nexts[head as usize].load(atomic::Ordering::Acquire);
-            if self
-                .head
-                .compare_exchange_weak(
-                    current_head,
-                    pack(next, version.wrapping_add(1)),
-                    atomic::Ordering::AcqRel,
-                    atomic::Ordering::Acquire,
-                )
-                .is_ok()
-            {
-                return Some(head);
-            }
-        }
+        // SAFETY: As we have exclusive access to `T`, the use of unsafe is perfectly sound
+        let resource = unsafe {
+            let opt_ref = &mut *self.resources[index].get();
+            opt_ref.take().expect("Permit held an empty slot (this is a bug in Reservoir)")
+        };
+
+        // NOTE: we reclaim the space back to be used by another `T`
+        self.push_stack(&self.empty_head, index as u32);
+
+        resource
     }
 
     #[inline]
@@ -296,11 +304,56 @@ where
     }
 
     #[inline]
+    fn push_stack(&self, stack: &atomic::AtomicU64, index: u32) {
+        loop {
+            let current = stack.load(atomic::Ordering::Acquire);
+            let (head_idx, version) = unpack(current);
+            self.nexts[index as usize].store(head_idx, atomic::Ordering::Relaxed);
+            if stack
+                .compare_exchange_weak(
+                    current,
+                    pack(index, version.wrapping_add(1)),
+                    atomic::Ordering::AcqRel,
+                    atomic::Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    #[inline]
     fn release(&self, index: u32) {
         self.push(index);
         if self.waiters.load(atomic::Ordering::SeqCst) > 0 {
             let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
             self.cv.notify_one();
+        }
+    }
+
+    #[inline]
+    fn try_pop_stack(&self, stack: &atomic::AtomicU64) -> Option<u32> {
+        loop {
+            let current = stack.load(atomic::Ordering::Acquire);
+            let (head_idx, version) = unpack(current);
+
+            if head_idx == MAX_NODE {
+                return None;
+            }
+
+            let next = self.nexts[head_idx as usize].load(atomic::Ordering::Acquire);
+            if stack
+                .compare_exchange_weak(
+                    current,
+                    pack(next, version.wrapping_add(1)),
+                    atomic::Ordering::AcqRel,
+                    atomic::Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return Some(head_idx);
+            }
         }
     }
 }
