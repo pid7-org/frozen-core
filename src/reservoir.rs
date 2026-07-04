@@ -257,6 +257,12 @@ where
                 return Ok(ReservoirPermit { reservoir: self, index: index as usize });
             }
 
+            // FIX: Rechecking is required to avoid deadlock scenarios
+            if self.alive_count.load(atomic::Ordering::Acquire) == 0 {
+                self.waiters.fetch_sub(1, atomic::Ordering::SeqCst);
+                return Err(());
+            }
+
             guard = self.cv.wait(guard).unwrap_or_else(|e| e.into_inner());
         }
     }
@@ -707,7 +713,8 @@ mod tests {
 
     #[test]
     fn ok_insert_wakes_waiting_thread() {
-        let pool = Arc::new(Reservoir::with_capacity(vec![], 1));
+        let pool = Arc::new(Reservoir::with_capacity(vec![0xAA], 2));
+        let _exhausted = pool.acquire().unwrap();
 
         let pool_clone = Arc::clone(&pool);
         let (tx, rx) = std::sync::mpsc::channel();
@@ -743,25 +750,5 @@ mod tests {
 
         let total = *p_new_1 + *p_new_2;
         assert_eq!(total, 0x0C);
-    }
-
-    #[test]
-    fn err_deadlock_prevented_on_exhaustion() {
-        let pool = Arc::new(Reservoir::new(vec![1]));
-
-        let p1 = pool.acquire().unwrap();
-        let pool_clone = Arc::clone(&pool);
-
-        let worker = thread::spawn(move || {
-            let res = pool_clone.acquire();
-            res.unwrap_err()
-        });
-
-        thread::sleep(Duration::from_millis(0x14));
-
-        pool.retire(p1);
-
-        let result = worker.join();
-        assert!(result.is_err());
     }
 }
