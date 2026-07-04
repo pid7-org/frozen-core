@@ -1,5 +1,9 @@
 # Changelog
 
+## `0.0.32`
+
+- Fixed the permanent deadlock in `Reservoir::acquire()` (#95)
+
 ## `0.0.31`
 
 - Improvements in `reservoir` module
