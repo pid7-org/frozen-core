@@ -32,7 +32,7 @@
 //!
 //! let pool = Arc::new(Reservoir::with_capacity(vec![0x0A, 0x1A], 3));
 //!
-//! let mut permit = pool.acquire();
+//! let mut permit = pool.acquire().unwrap();
 //! assert_eq!(*permit, 0x0A);
 //!
 //! *permit = 0x0F;
@@ -69,7 +69,7 @@ const MAX_NODE: u32 = u32::MAX;
 ///
 /// let pool = Reservoir::new(vec!["Conn1".to_string(), "Conn2".to_string()]);
 ///
-/// let mut lease = pool.acquire();
+/// let mut lease = pool.acquire().unwrap();
 /// assert_eq!(*lease, "Conn1");
 ///
 /// let dead_conn = pool.retire(lease);
@@ -77,7 +77,7 @@ const MAX_NODE: u32 = u32::MAX;
 ///
 /// assert!(pool.insert("Conn3".to_string()).is_ok());
 ///
-/// let new_lease = pool.acquire();
+/// let new_lease = pool.acquire().unwrap();
 /// assert_eq!(*new_lease, "Conn3");
 /// ```
 #[derive(Debug)]
@@ -89,6 +89,7 @@ pub struct Reservoir<T: Send + Sync + Sized> {
     lock: sync::Mutex<()>,
     head: atomic::AtomicU64,
     empty_head: atomic::AtomicU64,
+    alive_count: atomic::AtomicUsize,
 }
 
 // NOTE:
@@ -122,7 +123,7 @@ where
     ///
     /// let pool = Reservoir::new(vec!["Conn1".to_string(), "Conn2".to_string()]);
     ///
-    /// let mut lease = pool.acquire();
+    /// let mut lease = pool.acquire().unwrap();
     /// assert_eq!(*lease, "Conn1");
     ///
     /// lease.push_str("_used");
@@ -155,7 +156,7 @@ where
     ///
     /// let pool = Reservoir::with_capacity(vec!["Conn1".to_string(), "Conn2".to_string()], 0x0A);
     ///
-    /// let mut lease = pool.acquire();
+    /// let mut lease = pool.acquire().unwrap();
     /// assert_eq!(*lease, "Conn1");
     ///
     /// lease.push_str("_used");
@@ -207,6 +208,7 @@ where
             nexts: nexts.into_boxed_slice(),
             resources: res_cells.into_boxed_slice(),
             waiters: atomic::AtomicU32::new(0),
+            alive_count: atomic::AtomicUsize::new(initial_len),
         }
     }
 
@@ -227,17 +229,23 @@ where
     /// let pool = Reservoir::new(vec!["hello".to_string()]);
     ///
     /// {
-    ///     let mut permit = pool.acquire();
+    ///     let mut permit = pool.acquire().unwrap();
     ///     permit.push_str(" world");
     /// }
     ///
-    /// let permit = pool.acquire();
+    /// let permit = pool.acquire().unwrap();
     /// assert_eq!(*permit, "hello world");
     /// ```
     #[inline(always)]
-    pub fn acquire(&self) -> ReservoirPermit<'_, T> {
+    pub fn acquire(&self) -> Result<ReservoirPermit<'_, T>, ()> {
         if let Some(index) = self.try_pop_stack(&self.head) {
-            return ReservoirPermit { reservoir: self, index: index as usize };
+            return Ok(ReservoirPermit { reservoir: self, index: index as usize });
+        }
+
+        // NOTE: If there are exactly 0 active resources available, we must abort, otherwise the
+        // call may wait forever resulting in a deadlock
+        if self.alive_count.load(atomic::Ordering::Acquire) == 0 {
+            return Err(());
         }
 
         self.waiters.fetch_add(1, atomic::Ordering::SeqCst);
@@ -246,7 +254,7 @@ where
         loop {
             if let Some(index) = self.try_pop_stack(&self.head) {
                 self.waiters.fetch_sub(1, atomic::Ordering::SeqCst);
-                return ReservoirPermit { reservoir: self, index: index as usize };
+                return Ok(ReservoirPermit { reservoir: self, index: index as usize });
             }
 
             guard = self.cv.wait(guard).unwrap_or_else(|e| e.into_inner());
@@ -262,20 +270,20 @@ where
     ///
     /// let pool = Reservoir::new(vec!["hello".to_string(), "world".to_string()]);
     ///
-    /// let permit = pool.acquire();
+    /// let permit = pool.acquire().unwrap();
     /// assert_eq!(pool.retire(permit), "hello");
     ///
-    /// let permit = pool.acquire();
+    /// let permit = pool.acquire().unwrap();
     /// assert_eq!(*permit, "world");
     /// ```
     #[inline(always)]
     pub fn retire(&self, permit: ReservoirPermit<'_, T>) -> T {
         let index = permit.index;
 
-        // NOTE: To avoid the automatic drop by the compiler, we must manually forget the `permit`
+        // NOTE: to avoid the automatic drop by the compiler, we must manually forget the `permit`
         mem::forget(permit);
 
-        // SAFETY: As we have exclusive access to `T`, the use of unsafe is perfectly sound
+        // SAFETY: as we have exclusive access to `T`, the use of unsafe is perfectly sound
         let resource = unsafe {
             let opt_ref = &mut *self.resources[index].get();
             opt_ref.take().expect("Permit held an empty slot (this is a bug in Reservoir)")
@@ -283,6 +291,15 @@ where
 
         // NOTE: we reclaim the space back to be used by another `T`
         self.push_stack(&self.empty_head, index as u32);
+
+        if self.alive_count.fetch_sub(1, atomic::Ordering::SeqCst) == 1 {
+            // NOTE: we must wake all waiting threads so they could abort as there are no resources
+            // left to use
+            if self.waiters.load(atomic::Ordering::SeqCst) > 0 {
+                let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+                self.cv.notify_all();
+            }
+        }
 
         resource
     }
@@ -313,6 +330,7 @@ where
                 *opt_ref = Some(resource);
             }
 
+            self.alive_count.fetch_add(1, atomic::Ordering::SeqCst);
             self.push_stack(&self.head, index);
 
             // NOTE: to avoid dead locks, we must notify any threads currently waiting in `acquire`
@@ -419,14 +437,14 @@ where
 /// let pool = Reservoir::new(vec![String::from("initial")]);
 ///
 /// {
-///     let mut permit = pool.acquire();
+///     let mut permit = pool.acquire().unwrap();
 ///     assert_eq!(permit.len(), 7);
 ///     
 ///     permit.push_str(" state");
 ///     assert_eq!(*permit, "initial state");
 /// }
 ///
-/// let permit2 = pool.acquire();
+/// let permit2 = pool.acquire().unwrap();
 /// assert_eq!(*permit2, "initial state");
 /// ```
 #[derive(Debug)]
@@ -495,7 +513,7 @@ mod tests {
     fn ok_create_and_basic_acquire() {
         let pool = Reservoir::new(vec![0x0A, 0x1A, 0x2A]);
 
-        let permit = pool.acquire();
+        let permit = pool.acquire().unwrap();
         assert_eq!(*permit, 0x0A);
     }
 
@@ -507,13 +525,13 @@ mod tests {
             let pool = Reservoir::new(vec![String::from("hello")]);
 
             {
-                let mut permit = pool.acquire();
+                let mut permit = pool.acquire().unwrap();
                 assert_eq!(permit.len(), 5);
 
                 permit.push_str(" world");
             }
 
-            let permit = pool.acquire();
+            let permit = pool.acquire().unwrap();
             assert_eq!(*permit, "hello world");
         }
     }
@@ -522,11 +540,11 @@ mod tests {
     fn ok_exhaustion_and_sequential_reuse() {
         let pool = Reservoir::new(vec![1, 2]);
 
-        let p1 = pool.acquire();
-        let p2 = pool.acquire();
+        let p1 = pool.acquire().unwrap();
+        let p2 = pool.acquire().unwrap();
         drop(p1);
 
-        let p3 = pool.acquire();
+        let p3 = pool.acquire().unwrap();
         assert_eq!(*p3, 1);
         assert_eq!(*p2, 2);
     }
@@ -534,11 +552,11 @@ mod tests {
     #[test]
     fn ok_acquire_blocks_until_notified() {
         let pool = Arc::new(Reservoir::new(vec![0x3C]));
-        let permit = pool.acquire();
+        let permit = pool.acquire().unwrap();
 
         let pool_clone = Arc::clone(&pool);
         let worker = thread::spawn(move || {
-            let p = pool_clone.acquire();
+            let p = pool_clone.acquire().unwrap();
             assert_eq!(*p, 0x3C);
         });
 
@@ -561,7 +579,7 @@ mod tests {
             let pool_clone = Arc::clone(&pool);
             handles.push(thread::spawn(move || {
                 for _ in 0..ITERATIONS {
-                    let mut permit = pool_clone.acquire();
+                    let mut permit = pool_clone.acquire().unwrap();
                     *permit += 1;
 
                     thread::yield_now();
@@ -577,7 +595,7 @@ mod tests {
         let mut _held_permits = Vec::with_capacity(CAPACITY);
 
         for _ in 0..CAPACITY {
-            let permit = pool.acquire();
+            let permit = pool.acquire().unwrap();
             total_sum += *permit;
             _held_permits.push(permit);
         }
@@ -589,7 +607,7 @@ mod tests {
     #[should_panic]
     fn err_zero_capacity_panics_on_acquire() {
         let pool: Reservoir<u32> = Reservoir::new(vec![]);
-        let _permit = pool.acquire();
+        let _permit = pool.acquire().unwrap();
     }
 
     #[test]
@@ -603,8 +621,8 @@ mod tests {
     fn ok_multiple_waiters_wake_sequentially() {
         let pool = Arc::new(Reservoir::new(vec![1, 2]));
 
-        let p1 = pool.acquire();
-        let p2 = pool.acquire();
+        let p1 = pool.acquire().unwrap();
+        let p2 = pool.acquire().unwrap();
 
         let mut handles = Vec::new();
         for _ in 0..3 {
@@ -642,7 +660,7 @@ mod tests {
 
         let (tx, rx) = std::sync::mpsc::channel();
         thread::spawn(move || {
-            let permit = pool.acquire();
+            let permit = pool.acquire().unwrap();
             tx.send(*permit).unwrap();
         });
 
@@ -665,7 +683,7 @@ mod tests {
         let mut held = Vec::new();
 
         for _ in 0..3 {
-            let p = pool.acquire();
+            let p = pool.acquire().unwrap();
             sum += *p;
             held.push(p);
         }
@@ -677,13 +695,13 @@ mod tests {
     fn ok_retire_resource_extracts_value() {
         let pool = Reservoir::new(vec!["A", "B"]);
 
-        let permit = pool.acquire();
+        let permit = pool.acquire().unwrap();
         assert_eq!(*permit, "A");
 
         let extracted = pool.retire(permit);
         assert_eq!(extracted, "A");
 
-        let p2 = pool.acquire();
+        let p2 = pool.acquire().unwrap();
         assert_eq!(*p2, "B");
     }
 
@@ -695,12 +713,11 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
 
         thread::spawn(move || {
-            let permit = pool_clone.acquire();
+            let permit = pool_clone.acquire().unwrap();
             tx.send(*permit).unwrap();
         });
 
-        thread::sleep(Duration::from_millis(20));
-
+        thread::sleep(Duration::from_millis(0x14));
         assert!(pool.insert(0x63).is_ok());
 
         let received =
@@ -713,18 +730,38 @@ mod tests {
     fn ok_dynamic_swap_retire_and_insert() {
         let pool = Reservoir::new(vec![1, 2]);
 
-        let p1 = pool.acquire();
-        let p2 = pool.acquire();
+        let p1 = pool.acquire().unwrap();
+        let p2 = pool.acquire().unwrap();
 
         assert_eq!(pool.retire(p1), 1);
-        assert!(pool.insert(10).is_ok());
+        assert!(pool.insert(0x0A).is_ok());
 
         drop(p2);
 
-        let p_new_1 = pool.acquire();
-        let p_new_2 = pool.acquire();
+        let p_new_1 = pool.acquire().unwrap();
+        let p_new_2 = pool.acquire().unwrap();
 
         let total = *p_new_1 + *p_new_2;
         assert_eq!(total, 0x0C);
+    }
+
+    #[test]
+    fn err_deadlock_prevented_on_exhaustion() {
+        let pool = Arc::new(Reservoir::new(vec![1]));
+
+        let p1 = pool.acquire().unwrap();
+        let pool_clone = Arc::clone(&pool);
+
+        let worker = thread::spawn(move || {
+            let res = pool_clone.acquire();
+            res.unwrap_err()
+        });
+
+        thread::sleep(Duration::from_millis(0x14));
+
+        pool.retire(p1);
+
+        let result = worker.join();
+        assert!(result.is_err());
     }
 }
