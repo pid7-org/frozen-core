@@ -2,14 +2,14 @@
 //!
 //! This module provides,
 //!
-//! - [`FrozenError`]: a structured error w/ 32-bit identifier
-//! - [`FrozenResult`]: a result alias using [`FrozenError`]
+//! - [`FrozenError`] which is a structured error w/ 24-bit identifier
+//! - [`FrozenResult`] which is a result alias using [`FrozenError`]
 //!
 //! ## Id
 //!
-//! Each [`FrozenError`] uses a 32-bit identifier encoded in following format,
+//! Each [`FrozenError`] uses a 24-bit identifier encoded in the following format,
 //!
-//! `| module:8 | domain:8 | reason:16 |`
+//! `| module:8 | domain:8 | reason:8 |`
 //!
 //! This id packs important context which aids in the debugging process
 //!
@@ -47,7 +47,7 @@ pub struct FrozenError {
     pub reason: u8,
 
     /// Error context for the [`FrozenError`]
-    pub context: String,
+    pub context: Box<str>,
 }
 
 impl FrozenError {
@@ -73,7 +73,7 @@ impl FrozenError {
             module,
             domain,
             reason: code.reason,
-            context: format!("[{}] {}", code.detail, errmsg),
+            context: format!("[{}] {}", code.detail, errmsg).into_boxed_str(),
         }
     }
 
@@ -96,36 +96,31 @@ impl FrozenError {
     /// ```
     #[inline(always)]
     pub fn new_raw<E: std::fmt::Display>(module: u8, domain: u8, code: ErrCode, err: E) -> Self {
-        Self { domain, module, reason: code.reason, context: format!("[{}] {}", code.detail, err) }
-    }
-
-    /// Compare two errors by their encoded id's
-    ///
-    /// ## Example
-    ///
-    /// ```
-    /// use frozen_core::error::{FrozenError, ErrCode};
-    ///
-    /// let err1 = FrozenError::new(0x1A, 0x2A, ErrCode::new(0x3A, "test"), "something failed");
-    /// let err2 = FrozenError::new(0x1A, 0x2A, ErrCode::new(0x3A, "test"), "another message");
-    ///
-    /// assert!(err1.is_equal(&err2));
-    /// ```
-    #[inline(always)]
-    pub fn is_equal(&self, err: &FrozenError) -> bool {
-        self == err
+        Self { domain, module, reason: code.reason, context: format!("[{}] {}", code.detail, err).into_boxed_str() }
     }
 }
 
 impl std::fmt::Debug for FrozenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FrozenError")
-            .field("Module", &self.module)
-            .field("Domain", &self.domain)
-            .field("Reason", &self.reason)
-            .finish()
+        write!(
+            f,
+            "FrozenError {{ module: {:#04x}, domain: {:#04x}, reason: {:#04x}, context: {:?} }}",
+            self.module, self.domain, self.reason, self.context
+        )
     }
 }
+
+impl std::fmt::Display for FrozenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "[{:#04x}:{:#04x}:{:#04x}] {}",
+            self.module, self.domain, self.reason, self.context
+        )
+    }
+}
+
+impl std::error::Error for FrozenError {}
 
 impl PartialEq for FrozenError {
     fn eq(&self, other: &Self) -> bool {
@@ -184,19 +179,19 @@ mod tests {
     #[test]
     fn ok_context_exact_format() {
         let err = FrozenError::new(1, 2, ErrCode::new(3, "io"), "failure");
-        assert_eq!(err.context, "[io] failure");
+        assert_eq!(err.context, "[io] failure".into());
     }
 
     #[test]
     fn ok_empty_message() {
         let err = FrozenError::new(1, 2, ErrCode::new(3, "io"), "");
-        assert_eq!(err.context, "[io] ");
+        assert_eq!(err.context, "[io] ".into());
     }
 
     #[test]
     fn ok_empty_detail() {
         let err = FrozenError::new(1, 2, ErrCode::new(3, ""), "failure");
-        assert_eq!(err.context, "[] failure");
+        assert_eq!(err.context, "[] failure".into());
     }
 
     #[test]
@@ -212,7 +207,7 @@ mod tests {
     #[test]
     fn ok_context_formatting() {
         let err = FrozenError::new(1, 1, ErrCode::new(1, "io"), "disk failure");
-        assert_eq!(err.context, "[io] disk failure");
+        assert_eq!(err.context, "[io] disk failure".into());
     }
 
     #[test]
@@ -238,5 +233,30 @@ mod tests {
         let e2 = FrozenError::new(1, 2, ErrCode::new(4, "io"), "a");
 
         assert_ne!(e1, e2);
+    }
+
+    #[test]
+    fn ok_display_format() {
+        let err = FrozenError::new(0x01, 0x11, ErrCode::new(0x1C, "lock"), "file locked");
+        assert_eq!(format!("{err}"), "[0x01:0x11:0x1c] [lock] file locked");
+    }
+
+    #[test]
+    fn ok_debug_format_includes_context() {
+        let err = FrozenError::new(0x01, 0x11, ErrCode::new(0x1C, "lock"), "file locked");
+        let dbg = format!("{err:?}");
+        assert!(dbg.contains("0x01"));
+        assert!(dbg.contains("0x11"));
+        assert!(dbg.contains("0x1c"));
+        assert!(dbg.contains("[lock] file locked"));
+    }
+
+    #[test]
+    fn ok_is_std_error() {
+        // FrozenError must satisfy `std::error::Error` so it can be used with `?`
+        // into Box<dyn Error> and ecosystem tooling.
+        fn assert_is_error<E: std::error::Error>(_: &E) {}
+        let err = FrozenError::new(1, 2, ErrCode::new(3, "io"), "fail");
+        assert_is_error(&err);
     }
 }
