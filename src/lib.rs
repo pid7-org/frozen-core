@@ -32,4 +32,7 @@ pub mod wpipe;
 #[cfg(feature = "reservoir")]
 pub mod reservoir;
 
+#[cfg(feature = "isa")]
+pub mod isa;
+
 pub mod utils;

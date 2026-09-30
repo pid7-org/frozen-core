@@ -76,7 +76,9 @@ default = [
     "fmmap",
     "wpipe",
     "reservoir",
+    "isa",
 ]
+isa = []
 
 [dependencies]
 futures = {version = "0.3.32", optional = true}
