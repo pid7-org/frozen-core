@@ -1,4 +1,4 @@
-//! Implementation of branch preditor hints
+//! Minimal set of routines for branch predictor hints
 
 /// Empty function used as a placeholder to influence branch prediction
 #[cold]
@@ -7,7 +7,7 @@ const fn cold_fn() {}
 
 /// Branch predictor hint, which marks given condition as *likely* to be
 ///
-/// # Example
+/// ## Example
 ///
 /// ```
 /// use frozen_core::hints::likely;
@@ -19,12 +19,13 @@ pub const fn likely(b: bool) -> bool {
     if !b {
         cold_fn();
     }
+
     b
 }
 
 /// Branch predictor hint, which marks given condition as *unlikely* to be
 ///
-/// # Example
+/// ## Example
 ///
 /// ```
 /// use frozen_core::hints::unlikely;
@@ -36,6 +37,7 @@ pub const fn unlikely(b: bool) -> bool {
     if b {
         cold_fn();
     }
+
     b
 }
 
