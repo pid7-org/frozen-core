@@ -1,6 +1,6 @@
 [package]
 edition = "2024"
-version = "0.0.32"
+version = "0.0.33"
 name = "frozen-core"
 readme = "README.md"
 rust-version = "1.86.0"
@@ -34,88 +34,11 @@ opt-level = 3
 inherits = "release"
 
 [features]
-ack = [
-    "error",
-    "hints",
-    "futures",
-    "event-listener",
-]
-crc32 = []
 error = []
 hints = []
-mpscq = []
-bufpool = ["error", "hints"]
-reservoir = []
-wpipe = [
-    "ack",
-    "error",
-    "ffile",
-    "mpscq",
-    "bufpool",
-]
-ffile = [
-    "libc",
-    "error",
-    "hints",
-]
-fmmap = [
-    "ack",
-    "libc",
-    "error",
-    "hints",
-    "ffile",
-]
+isa = []
 default = [
-    "ack",
     "error",
     "hints",
-    "mpscq",
-    "crc32",
-    "bufpool",
-    "ffile",
-    "fmmap",
-    "wpipe",
-    "reservoir",
     "isa",
 ]
-isa = []
-
-[dependencies]
-futures = {version = "0.3.32", optional = true}
-event-listener = {version = "5.4.1", optional = true}
-
-[target.'cfg(unix)'.dependencies]
-libc = { version = "0.2.178", optional = true }
-
-[target.'cfg(unix)'.dev-dependencies]
-libc = "0.2.178"
-
-[dev-dependencies]
-tempfile = "3.20.0"
-hdrhistogram = "7.5.4"
-criterion = { version = "0.8", features = ["html_reports"] }
-
-[[bench]]
-name = "crc32"
-harness = false
-required-features = ["crc32"]
-
-[[bench]]
-name = "bufpool"
-harness = false
-required-features = ["bufpool"]
-
-[[bench]]
-name = "mpscq"
-harness = false
-required-features = ["mpscq"]
-
-[[bench]]
-name = "wpipe"
-harness = false
-required-features = ["wpipe"]
-
-[[bench]]
-name = "reservoir"
-harness = false
-required-features = ["reservoir"]
