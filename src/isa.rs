@@ -77,7 +77,13 @@ pub fn detect_best_isa_extension() -> ISAExtension {
 #[inline(always)]
 #[cfg(target_arch = "x86_64")]
 pub fn detect_best_isa_extension() -> ISAExtension {
-    let cpuid1 = x86_64::__cpuid(1);
+    // NOTE:
+    //
+    // `__cpuid` was marked unsafe prior to Rust 1.87.
+    //
+    // An `unsafe` block is required to maintain compatibility with our MSRV (1.86.0).
+    #[allow(unused_unsafe)]
+    let cpuid1 = unsafe { x86_64::__cpuid(1) };
 
     let has_ssse3 = (cpuid1.ecx & (1 << 9)) != 0;
     let has_sse4_2 = (cpuid1.ecx & (1 << 0x14)) != 0;
@@ -88,7 +94,13 @@ pub fn detect_best_isa_extension() -> ISAExtension {
         let xmm_ymm_enabled = (xcr0 & 0b110) == 0b110;
 
         if xmm_ymm_enabled {
-            let cpuid7 = x86_64::__cpuid_count(7, 0);
+            // NOTE:
+            //
+            // `__cpuid_count` was marked unsafe prior to Rust 1.87.
+            //
+            // An `unsafe` block is required to maintain compatibility with our MSRV (1.86.0).
+            #[allow(unused_unsafe)]
+            let cpuid7 = unsafe { x86_64::__cpuid_count(7, 0) };
             let avx512_enabled = (xcr0 & 0b11100110) == 0b11100110;
             let avx512f_bw = (1 << 0x10) | (1 << 0x1E);
 
