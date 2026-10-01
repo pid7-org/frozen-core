@@ -1,5 +1,15 @@
 # Changelog
 
+## `0.0.33`
+
+- Impl of `isa` module
+- Updated docs for `hints` module
+- Improved `FrozenError` in `error` module
+  - Added `Display`, `std::error::Error` impls
+  - Fixed `Debug` to include `context`
+  - Shrunk `context` from `String` to `Box<str>` (32 -> 24 bytes)
+  - Dropped redundant `is_equal`
+
 ## `0.0.32`
 
 - Fixed the permanent deadlock in `Reservoir::acquire()` (#95)
