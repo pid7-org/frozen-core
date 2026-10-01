@@ -30,9 +30,7 @@ pub enum ISAExtension {
     NEON,
 }
 
-/// Detects the highest available vector extension supported on `aarch64` systems.
-///
-/// Returns [`ISAExtension::NEON`] baseline.
+/// Detects the highest available vector extension supported on `aarch64` systems
 ///
 /// ## Example
 ///
@@ -47,21 +45,18 @@ pub enum ISAExtension {
 pub fn detect_best_isa_extension() -> ISAExtension {
     // NOTE:
     //
-    // NEON is part of the mandatory AArch64 baseline ISA.
+    // NEON is part of the mandatory AArch64 baseline ISA
     //
     // The Armv8-A architecture reference manual and AAPCS64 ABI specify Advanced SIMD (NEON) as a
-    // required baseline feature, so every conforming AArch64 CPU is guaranteed to implement it.
+    // required baseline feature, so every conforming AArch64 CPU is guaranteed to implement it
     //
-    // Therefore, we can safely use NEON as the default backend without runtime feature detection.
+    // Therefore, we can safely use NEON as the default backend without runtime feature detection
     //
     // Ref -> https://github.com/ARM-software/abi-aa/blob/main/aapcs64/aapcs64.rst
     ISAExtension::NEON
 }
 
-/// Detects the highest available vector extension supported by both CPU and OS on `x86_64` systems.
-///
-/// Checks `CPUID` and `XCR0` (via `_xgetbv`) to verify OS context switching support for vector
-/// registers before enabling AVX2. Falls back to SSE2 baseline.
+/// Detects the highest available vector extension supported on `x86_64` systems
 ///
 /// ## Example
 ///
@@ -76,9 +71,9 @@ pub fn detect_best_isa_extension() -> ISAExtension {
 pub fn detect_best_isa_extension() -> ISAExtension {
     // NOTE:
     //
-    // `__cpuid` was marked unsafe prior to Rust 1.87.
+    // `__cpuid` was marked unsafe prior to Rust 1.87
     //
-    // An `unsafe` block is required to maintain compatibility with our MSRV (1.86.0).
+    // An `unsafe` block is required to maintain compatibility with our MSRV (1.86.0)
     #[allow(unused_unsafe)]
     let cpuid1 = unsafe { x86_64::__cpuid(1) };
 
@@ -93,9 +88,9 @@ pub fn detect_best_isa_extension() -> ISAExtension {
         if xmm_ymm_enabled {
             // NOTE:
             //
-            // `__cpuid_count` was marked unsafe prior to Rust 1.87.
+            // `__cpuid_count` was marked unsafe prior to Rust 1.87
             //
-            // An `unsafe` block is required to maintain compatibility with our MSRV (1.86.0).
+            // An `unsafe` block is required to maintain compatibility with our MSRV (1.86.0)
             #[allow(unused_unsafe)]
             let cpuid7 = unsafe { x86_64::__cpuid_count(7, 0) };
 
@@ -115,12 +110,12 @@ pub fn detect_best_isa_extension() -> ISAExtension {
 
     // NOTE:
     //
-    // SSE2 is part of the mandatory x86_64 baseline ISA.
+    // SSE2 is part of the mandatory x86_64 baseline ISA
     //
     // The x86_64 System V ABI specifies SSE2 as a required baseline feature, so every conforming
-    // x86_64 CPU is guaranteed to implement it.
+    // x86_64 CPU is guaranteed to implement it
     //
-    // Therefore, we can safely use SSE2 as the default backend without runtime feature detection.
+    // Therefore, we can safely use SSE2 as the default backend without runtime feature detection
     //
     // Ref -> https://gitlab.com/x86-psABIs/x86-64-ABI/-/blob/master/x86-64-ABI/low-level-sys-info.tex
     ISAExtension::SSE2
@@ -257,7 +252,12 @@ mod tests {
                 let c = core::arch::x86_64::_mm_add_epi32(a, b);
 
                 let mut out = [0i32; 4];
-                core::arch::x86_64::_mm_storeu_si128(out.as_mut_ptr() as *mut _, c);
+                unsafe {
+                    core::arch::x86_64::_mm_storeu_si128(
+                        out.as_mut_ptr() as *mut _,
+                        c,
+                    );
+                }
                 assert_eq!(out, [0x34; 4]);
             }
 
@@ -268,13 +268,19 @@ mod tests {
                 let res = core::arch::x86_64::_mm_shuffle_epi8(val, mask);
 
                 let mut out = [0u8; 0x10];
-                core::arch::x86_64::_mm_storeu_si128(out.as_mut_ptr() as *mut _, res);
+                unsafe {
+                    core::arch::x86_64::_mm_storeu_si128(
+                        out.as_mut_ptr() as *mut _,
+                        res,
+                    );
+                }
                 assert_eq!(out[0], 0x04);
             }
 
             #[target_feature(enable = "sse4.2")]
             unsafe fn exec_sse4_2() {
-                let crc = core::arch::x86_64::_mm_crc32_u64(!0, 0x123456789ABCDEF0);
+                let crc =
+                    core::arch::x86_64::_mm_crc32_u64(!0, 0x123456789ABCDEF0);
                 assert_ne!(crc, 0);
             }
 
@@ -285,7 +291,12 @@ mod tests {
                 let c = core::arch::x86_64::_mm256_add_epi32(a, b);
 
                 let mut out = [0i32; 8];
-                core::arch::x86_64::_mm256_storeu_si256(out.as_mut_ptr() as *mut _, c);
+                unsafe {
+                    core::arch::x86_64::_mm256_storeu_si256(
+                        out.as_mut_ptr() as *mut _,
+                        c,
+                    );
+                }
                 assert_eq!(out, [0x12C; 8]);
             }
 
@@ -319,7 +330,9 @@ mod tests {
                 let v = core::arch::aarch64::vdupq_n_u8(0x42);
                 let mut out = [0u8; 0x10];
 
-                core::arch::aarch64::vst1q_u8(out.as_mut_ptr(), v);
+                unsafe {
+                    core::arch::aarch64::vst1q_u8(out.as_mut_ptr(), v);
+                }
                 assert_eq!(out, [0x42; 0x10]);
             }
 
