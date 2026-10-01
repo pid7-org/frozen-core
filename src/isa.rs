@@ -19,9 +19,6 @@ pub enum ISAExtension {
 
     /// AVX2
     AVX2,
-
-    /// AVX512BW
-    AVX512BW,
 }
 
 /// Available ISA extensions on `aarch64` systems
@@ -64,7 +61,7 @@ pub fn detect_best_isa_extension() -> ISAExtension {
 /// Detects the highest available vector extension supported by both CPU and OS on `x86_64` systems.
 ///
 /// Checks `CPUID` and `XCR0` (via `_xgetbv`) to verify OS context switching support for vector
-/// registers before enabling AVX2 or AVX-512BW. Falls back to SSE2 baseline.
+/// registers before enabling AVX2. Falls back to SSE2 baseline.
 ///
 /// ## Example
 ///
@@ -101,12 +98,6 @@ pub fn detect_best_isa_extension() -> ISAExtension {
             // An `unsafe` block is required to maintain compatibility with our MSRV (1.86.0).
             #[allow(unused_unsafe)]
             let cpuid7 = unsafe { x86_64::__cpuid_count(7, 0) };
-            let avx512_enabled = (xcr0 & 0b11100110) == 0b11100110;
-            let avx512f_bw = (1 << 0x10) | (1 << 0x1E);
-
-            if avx512_enabled && (cpuid7.ebx & avx512f_bw) == avx512f_bw {
-                return ISAExtension::AVX512BW;
-            }
 
             if (cpuid7.ebx & (1 << 5)) != 0 {
                 return ISAExtension::AVX2;
@@ -228,11 +219,6 @@ mod tests {
             assert!(std::is_x86_feature_detected!("sse2"));
 
             match detected {
-                ISAExtension::AVX512BW => {
-                    assert!(std::is_x86_feature_detected!("avx2"));
-                    assert!(std::is_x86_feature_detected!("sse4.2"));
-                    assert!(std::is_x86_feature_detected!("ssse3"));
-                }
                 ISAExtension::AVX2 => {
                     assert!(std::is_x86_feature_detected!("avx2"));
                     assert!(std::is_x86_feature_detected!("sse4.2"));
