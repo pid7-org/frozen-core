@@ -9,6 +9,14 @@
   - Fixed `Debug` to include `context`
   - Shrunk `context` from `String` to `Box<str>` (32 -> 24 bytes)
   - Dropped redundant `is_equal`
+- Yanked `ack` module
+- Yanked `bufpool` module
+- Yanked `crc32` module
+- Yanked `ffile` module
+- Yanked `fmmap` module
+- Yanked `mpscq` module
+- Yanked `reservoir` module
+- Yanked `wpipe` module
 
 ## `0.0.32`
 
