@@ -4,13 +4,9 @@ version = "0.0.33"
 name = "frozen-core"
 readme = "README.md"
 rust-version = "1.86.0"
-description = "Custom implementations and core utilities for frozen-lab crates"
-keywords = [
-    "frozen-lab",
-    "frozen-core",
-]
+description = "Custom implementations and core utilities for pid7-org projects"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/frozen-lab/frozen-core"
+repository = "https://github.com/pid7-org/frozen-core"
 exclude = [
     ".github/",
     "shell.nix",
