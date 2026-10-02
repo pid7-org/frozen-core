@@ -9,3 +9,6 @@ pub mod hints;
 
 #[cfg(feature = "isa")]
 pub mod isa;
+
+#[cfg(feature = "memmap")]
+pub mod memmap;
