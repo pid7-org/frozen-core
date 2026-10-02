@@ -20,6 +20,9 @@ default-target = "x86_64-unknown-linux-gnu"
 targets = ["aarch64-unknown-linux-gnu", "aarch64-apple-darwin"]
 additional-targets = ["i686-apple-darwin"]
 
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2.189", optional = true }
+
 [profile.release]
 codegen-units = 1
 lto = "fat"
@@ -35,6 +38,7 @@ hints = []
 isa = []
 memmap = [
     "error",
+    "libc",
 ]
 default = [
     "error",
