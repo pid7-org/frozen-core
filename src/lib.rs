@@ -12,3 +12,6 @@ pub mod isa;
 
 #[cfg(feature = "memmap")]
 pub mod memmap;
+
+#[cfg(feature = "file")]
+pub mod file;
