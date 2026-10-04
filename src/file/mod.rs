@@ -57,16 +57,12 @@ pub(in crate::file) mod err {
         "failed to obtain exclusive lock as file may already opened",
     );
 
-    #[cfg(not(test))]
-    #[inline(always)]
-    fn mid() -> &'static u8 {
-        MID.get().unwrap()
-    }
+    /// Default module id used when [`MID`] is not explicitly initialized
+    const DEFAULT_MID: u8 = 0x00;
 
-    #[cfg(test)]
     #[inline(always)]
-    fn mid() -> &'static u8 {
-        MID.get_or_init(|| 0)
+    fn mid() -> u8 {
+        *MID.get_or_init(|| DEFAULT_MID)
     }
 
     #[inline]
@@ -74,15 +70,22 @@ pub(in crate::file) mod err {
         code: ErrCode,
         error: E,
     ) -> FrozenResult<R> {
-        let err = FrozenError::new_raw(*mid(), ERRDOMAIN, code, error);
+        let err = FrozenError::new_raw(mid(), ERRDOMAIN, code, error);
         Err(err)
     }
 
     #[inline]
     pub(in crate::file) fn default_error<R>(code: ErrCode) -> FrozenResult<R> {
-        let err = FrozenError::new(*mid(), ERRDOMAIN, code, "");
+        let err = FrozenError::new(mid(), ERRDOMAIN, code, "");
         Err(err)
     }
+}
+
+/// Initialize the module identifier used for [`File`] error propagation.
+///
+/// Returns `Ok(())` if set successfully, or `Err(already_set_id)` if it was already initialized.
+pub fn init_mid(id: u8) -> Result<(), u8> {
+    err::MID.set(id)
 }
 
 /// File descriptor of [`File`]
