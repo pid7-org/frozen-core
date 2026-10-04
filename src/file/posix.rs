@@ -1301,6 +1301,40 @@ mod tests {
             let err = POSIXFile::new(&missing).unwrap_err();
             assert_eq!(err.reason, err::INV.reason);
         }
+
+        #[test]
+        fn err_new_on_directory() {
+            let dir = tempfile::tempdir().unwrap();
+            let err = POSIXFile::new(dir.path()).unwrap_err();
+            assert_eq!(err.reason, err::INV.reason);
+        }
+
+        #[test]
+        fn err_new_on_interior_nul() {
+            use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+            let bad_path = std::path::Path::new(OsStr::from_bytes(b"bad\0file.db"));
+            let err = POSIXFile::new(bad_path).unwrap_err();
+            assert_eq!(err.reason, err::INV.reason);
+        }
+
+        #[test]
+        fn err_new_on_permission_denied() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let dir = tempfile::tempdir().unwrap();
+            let sub_dir = dir.path().join("readonly_dir");
+            std::fs::create_dir(&sub_dir).unwrap();
+            std::fs::set_permissions(&sub_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+            let target = sub_dir.join("forbidden.db");
+            let err = POSIXFile::new(&target).unwrap_err();
+
+            // Restore directory permissions for tempdir cleanup
+            std::fs::set_permissions(&sub_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            assert_eq!(err.reason, err::PRM.reason);
+        }
     }
 
     mod file_unlink {
@@ -1330,6 +1364,28 @@ mod tests {
             };
             let err = file2.unlink(&missing_path).unwrap_err();
             assert_eq!(err.reason, err::INV.reason);
+        }
+
+        #[test]
+        fn err_unlink_permission_denied() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let dir = tempfile::tempdir().unwrap();
+            let sub_dir = dir.path().join("readonly_dir");
+            std::fs::create_dir(&sub_dir).unwrap();
+
+            let target = sub_dir.join("victim.db");
+            let file = POSIXFile::new(&target).unwrap();
+
+            // Revoke write permission on directory so unlinking fails with EACCES
+            std::fs::set_permissions(&sub_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+            let err = file.unlink(&target).unwrap_err();
+
+            // Restore directory permissions for tempdir cleanup
+            std::fs::set_permissions(&sub_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            assert_eq!(err.reason, err::PRM.reason);
         }
     }
 
@@ -1408,6 +1464,32 @@ mod tests {
             let file = POSIXFile::new(&path).unwrap();
             file.grow(0, 0).unwrap();
             assert_eq!(file.length().unwrap(), 0);
+            file.close().unwrap();
+        }
+
+        #[test]
+        fn err_grow_overflow_usize() {
+            let (_dir, path) = tmp_path();
+            let file = POSIXFile::new(&path).unwrap();
+
+            let err = file.grow(usize::MAX - 10, 20).unwrap_err();
+            assert_eq!(err.reason, err::GRW.reason);
+
+            file.close().unwrap();
+        }
+
+        #[test]
+        fn err_grow_exceeds_off_t_max() {
+            let (_dir, path) = tmp_path();
+            let file = POSIXFile::new(&path).unwrap();
+
+            if let Ok(too_large) = usize::try_from(libc::off_t::MAX) {
+                if let Some(target) = too_large.checked_add(1) {
+                    let err = file.grow(0, target).unwrap_err();
+                    assert_eq!(err.reason, err::GRW.reason);
+                }
+            }
+
             file.close().unwrap();
         }
     }
@@ -1525,6 +1607,54 @@ mod tests {
             assert!(buf.iter().all(|b| *b == 2));
             file.close().unwrap();
         }
+
+        #[test]
+        fn ok_pread_zero_len() {
+            let (_dir, path) = tmp_path();
+            let file = POSIXFile::new(&path).unwrap();
+            let mut empty = [];
+            file.pread(&mut empty, 0).unwrap();
+            file.close().unwrap();
+        }
+
+        #[test]
+        fn ok_pwrite_zero_len() {
+            let (_dir, path) = tmp_path();
+            let file = POSIXFile::new(&path).unwrap();
+            let empty = [];
+            file.pwrite(&empty, 0).unwrap();
+            file.close().unwrap();
+        }
+
+        #[test]
+        fn err_pread_past_eof() {
+            let (_dir, path) = tmp_path();
+            let file = POSIXFile::new(&path).unwrap();
+            let mut buf = [0u8; 16];
+            let err = file.pread(&mut buf, 0).unwrap_err();
+            assert_eq!(err.reason, err::HCF.reason);
+            file.close().unwrap();
+        }
+
+        #[test]
+        fn err_pwrite_offset_exceeds_off_t() {
+            let (_dir, path) = tmp_path();
+            let file = POSIXFile::new(&path).unwrap();
+            let data = [1u8; 8];
+            let err = file.pwrite(&data, usize::MAX).unwrap_err();
+            assert_eq!(err.reason, err::INV.reason);
+            file.close().unwrap();
+        }
+
+        #[test]
+        fn err_pread_offset_exceeds_off_t() {
+            let (_dir, path) = tmp_path();
+            let file = POSIXFile::new(&path).unwrap();
+            let mut buf = [0u8; 8];
+            let err = file.pread(&mut buf, usize::MAX).unwrap_err();
+            assert_eq!(err.reason, err::INV.reason);
+            file.close().unwrap();
+        }
     }
 
     mod file_exists {
@@ -1542,6 +1672,48 @@ mod tests {
         fn ok_exists_false_on_missing_file() {
             let (_dir, path) = tmp_path();
             assert!(!POSIXFile::exists(&path).unwrap());
+        }
+
+        #[test]
+        fn ok_exists_false_on_enotdir() {
+            let (_dir, path) = tmp_path();
+            let file = POSIXFile::new(&path).unwrap();
+            file.close().unwrap();
+
+            let non_dir_child = path.join("child.db");
+            let exists = POSIXFile::exists(&non_dir_child).unwrap();
+            assert!(!exists);
+        }
+
+        #[test]
+        fn err_exists_on_permission_denied() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let dir = tempfile::tempdir().unwrap();
+            let inaccessible_dir = dir.path().join("inaccessible");
+            std::fs::create_dir(&inaccessible_dir).unwrap();
+            std::fs::set_permissions(&inaccessible_dir, std::fs::Permissions::from_mode(0o000))
+                .unwrap();
+
+            let target = inaccessible_dir.join("secret.db");
+            let res = POSIXFile::exists(&target);
+
+            // Restore directory permissions for tempdir cleanup
+            std::fs::set_permissions(&inaccessible_dir, std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+
+            let err = res.unwrap_err();
+            assert_eq!(err.reason, err::PRM.reason);
+        }
+
+        #[test]
+        fn err_exists_on_symlink_loop() {
+            let dir = tempfile::tempdir().unwrap();
+            let loop_path = dir.path().join("loop_link");
+            std::os::unix::fs::symlink(&loop_path, &loop_path).unwrap();
+
+            let err = POSIXFile::exists(&loop_path).unwrap_err();
+            assert_eq!(err.reason, err::INV.reason);
         }
     }
 
@@ -1673,6 +1845,30 @@ mod tests {
             let (_dir, path) = tmp_path();
             let file = POSIXFile::new(&path).unwrap();
             f_advise_raw(file.fd()).unwrap();
+            file.close().unwrap();
+        }
+
+        #[test]
+        #[cfg(target_os = "linux")]
+        fn err_f_advise_closed_fd() {
+            let err = f_advise_raw(CLOSED_FD).unwrap_err();
+            assert_eq!(err.reason, err::HCF.reason);
+        }
+
+        #[test]
+        fn err_ftruncate_overflow() {
+            let (_dir, path) = tmp_path();
+            let file = POSIXFile::new(&path).unwrap();
+            let err = ftruncate_raw(file.fd(), usize::MAX - 10, 20).unwrap_err();
+            assert_eq!(err.reason, err::GRW.reason);
+            file.close().unwrap();
+        }
+
+        #[test]
+        fn ok_sync_parent_dir() {
+            let (_dir, path) = tmp_path();
+            let file = POSIXFile::new(&path).unwrap();
+            sync_parent_dir(&path).unwrap();
             file.close().unwrap();
         }
     }
