@@ -1,1 +1,1326 @@
+use super::{err, FileId};
+use crate::{error::FrozenResult, hints};
+use libc::{
+    access, c_int, c_uint, c_void, close, flock, fstat, ftruncate, off_t, open,
+    pread, pwrite, size_t, stat, unlink, EACCES, EAGAIN, EBADF, EBUSY, EFAULT,
+    EINTR, EINVAL, EIO, EISDIR, ENOENT, ENOLCK, ENOSPC, ENOTDIR, EOPNOTSUPP,
+    EPERM, EROFS, ESPIPE, EWOULDBLOCK, F_OK, LOCK_EX, LOCK_NB, O_CLOEXEC,
+    O_CREAT, O_DIRECTORY, O_RDONLY, O_RDWR, S_IRUSR, S_IWUSR,
+};
+use std::sync::atomic;
 
+/// Placeholder value for when current fd is closed
+pub(in crate::file) const CLOSED_FD: FileId = FileId::MIN;
+
+/// Max allowed retries for `EINTR`, `EBUSY` and `EAGAIN` errors
+const MAX_RETRIES: usize = 0x0C;
+
+/// Custom implementation of `std::fs::File` for POSIX systems
+#[derive(Debug)]
+pub(super) struct POSIXFile {
+    fd: atomic::AtomicI32,
+}
+
+#[allow(unused)]
+impl POSIXFile {
+    /// Read file descriptor of [`POSIXFile`]
+    pub(super) fn fd(&self) -> FileId {
+        self.fd.load(atomic::Ordering::Acquire)
+    }
+
+    /// Check if [`POSIXFile`] exists on storage device or not
+    ///
+    /// ## Access Semantics
+    ///
+    /// Uses `access(path, F_OK)` to verify the existence of the file
+    pub(super) fn exists(path: &std::path::Path) -> FrozenResult<bool> {
+        let cpath = path_to_cstring(path)?;
+        let res = unsafe { access(cpath.as_ptr(), F_OK) };
+
+        if res == 0 {
+            return Ok(true);
+        }
+
+        let errno = last_errno();
+        let err_msg = err_msg(errno);
+
+        match errno {
+            // File or parent path component genuinely does not exist
+            ENOENT | ENOTDIR => Ok(false),
+
+            // Lack of search or read permission on path components
+            EACCES | EPERM => err::raw_error(err::PRM, err_msg),
+
+            // Hardware I/O or storage failure
+            EIO => err::raw_error(err::HCF, err_msg),
+
+            // Path syntax or resolution errors (e.g. symlink cycle, path too long)
+            libc::ELOOP | libc::ENAMETOOLONG => {
+                err::raw_error(err::INV, err_msg)
+            }
+
+            _ => err::raw_error(err::UNK, err_msg),
+        }
+    }
+
+    /// Create a new or open an existing [`POSIXFile`]
+    ///
+    /// ## Crash safe durability
+    ///
+    /// In POSIX systems, `open(O_CREATE)` only creates the directory entry in memory, it may be visible
+    /// immediately, but the file entry is not crash durable on many fs
+    ///
+    /// On some linux systems, journaling fs (ext4, xfs, etc) often replay their journal on mount after a crash is
+    /// observed, which usually restores recent directory updates, i.e. our newly created file entry, as a result
+    /// newly created file often survive the crash
+    ///
+    /// In our case, when a new [`FrozenFile`] is created, we zero-extend it using `ftruncate()`, and perform
+    /// `fdatasync()` or `fcntl(F_FULLSYNC)`, which in result provides us the crash safe durability we need
+    pub(super) fn new(path: &std::path::Path) -> FrozenResult<Self> {
+        let fd = open_raw(path, prep_flags())?;
+        let file = Self { fd: atomic::AtomicI32::new(fd) };
+
+        // Ensure newly created directory entries are persisted to disk
+        if let Err(e) = sync_parent_dir(path) {
+            let _ = file.close();
+            return Err(e);
+        }
+
+        // best-effort call to provide a hint to the kernel that the file will be accessed in a random pattern
+        #[cfg(target_os = "linux")]
+        if let Err(e) = f_advise_raw(file.fd()) {
+            let _ = file.close();
+            return Err(e);
+        }
+
+        Ok(file)
+    }
+
+    /// Acquire an exclusive advisory lock on [`POSIXFile`]
+    ///
+    /// ## Purpose
+    ///
+    /// We must ensure that only a single [`POSIXFile`] instance, across all processes, can operate on the
+    /// underlying file, at a given time
+    ///
+    /// So, we acquire an exclusive lock, for the entire file, after open, so if another process tries, it could
+    /// halt or choose not to exist anymore, to avoid multiple open handles across the same underlying file
+    ///
+    /// ## Advisory Semantics
+    ///
+    /// We use `flock(fd)`, which provides advisory locking only, the kernel does not prevent other processes from
+    /// calling `open()`, but any cooperating process attempting to acquire the same exclusive lock will fail
+    /// with `EWOULDBLOCK` i.e. [`err::LCK`]
+    ///
+    /// ## Why do we retry?
+    ///
+    /// POSIX syscalls are interruptible by signals, and may fail w/ `EINTR`, in such cases no progress is guaranteed,
+    /// so the syscall must be retried
+    pub(super) fn flock(&self) -> FrozenResult<()> {
+        flock_raw(self.fd())
+    }
+
+    /// Close [`POSIXFile`] to give up on allocated resources
+    ///
+    /// Consumes `self` by value to prevent concurrent use-after-close and descriptor reuse races
+    ///
+    /// ## Sync Error (`err::SYN`)
+    ///
+    /// In POSIX systems, kernel may report delayed write/sync failures when closing, these are durability errors,
+    /// fatal for us
+    ///
+    /// we can easily tackle this error for each batch of writes by enforcing hard durability guarantees right after
+    /// the write ops, and making sure they are completed without errors
+    ///
+    /// this provides strong durability for the storage engine, and if `EIO` occurs, anyhow, we treat it as `err::HCF`
+    /// i.e. impl failure
+    pub(super) fn close(self) -> FrozenResult<()> {
+        let fd = self.fd.swap(CLOSED_FD, atomic::Ordering::AcqRel);
+        if fd == CLOSED_FD {
+            return Ok(());
+        }
+
+        close_raw(fd)
+    }
+
+    /// Deletes the [`POSIXFile`] entry from the fs
+    ///
+    /// ## POSIX Unlink Semantics
+    ///
+    /// In POSIX, open files can be unlinked safely without closing first. Unlinking the
+    /// directory entry before closing the descriptor avoids TOCTOU races where another process
+    /// might recreate or replace the file at `path` in the window between `close` and `unlink`.
+    /// The filesystem reclaims the file's data blocks and inode once all active handles
+    /// (including `self`) are closed.
+    pub(super) fn unlink(self, path: &std::path::Path) -> FrozenResult<()> {
+        let cpath = path_to_cstring(path)?;
+
+        let res = unsafe { unlink(cpath.as_ptr()) };
+        if res == 0 {
+            // Close the descriptor now that the filesystem link has been removed.
+            self.close()?;
+
+            // NOTE: In POSIX systems, `unlink(path)` only updates the entry in memory, and
+            // does not guarantee crash safe durability for the operation, we must perform
+            // `fsync` on the directory to make sure we get crash safe durability.
+            return sync_parent_dir(path);
+        }
+
+        let errno = last_errno();
+        let err_msg = err_msg(errno);
+
+        match errno {
+            // missing file or invalid path
+            ENOENT | ENOTDIR => err::raw_error(err::INV, err_msg),
+
+            // lack of permission or read only fs
+            EACCES | EPERM | EROFS => err::raw_error(err::PRM, err_msg),
+
+            // NOTE: In POSIX systems, kernel may report delayed io failures on `unlink`,
+            // these are fatal errors, and can not be retried
+            //
+            // We protect this by enforcing hard durability right after write ops, so the
+            // occurrence of this error is an implementation failure
+            EIO => err::raw_error(err::HCF, err_msg),
+
+            _ => err::raw_error(err::UNK, err_msg),
+        }
+    }
+
+    /// Read current length of [`POSIXFile`] using file metadata (w/ `fstat` syscall)
+    pub(super) fn length(&self) -> FrozenResult<usize> {
+        let mut st = unsafe { core::mem::zeroed::<stat>() };
+        let res = unsafe { fstat(self.fd(), &mut st) };
+
+        if res != 0 {
+            let errno = last_errno();
+            let err_msg = err_msg(errno);
+
+            // bad or invalid fd
+            if errno == EBADF || errno == EFAULT {
+                return err::raw_error(err::HCF, err_msg);
+            }
+
+            return err::raw_error(err::UNK, err_msg);
+        }
+
+        if hints::unlikely(st.st_size < 0) {
+            return err::raw_error(
+                err::HCF,
+                "filesystem reported negative file size",
+            );
+        }
+
+        match usize::try_from(st.st_size) {
+            Ok(sz) => Ok(sz),
+            Err(_) => err::raw_error(
+                err::HCF,
+                "file size exceeds usize address space",
+            ),
+        }
+    }
+
+    /// Grow (i.e. zero extend) the [`POSIXFile`] w/ given `len_to_add`
+    ///
+    /// ## Semantics
+    ///
+    /// Here `grow()` is not atomic in all or nothing sense, following scenarios may happen:
+    ///
+    /// - on linux `fallocate` may fail, but `ftruncate` succeeds (sparse extension)
+    /// - on mac `ftruncate` succeeds but `f_preallocate` may fail (sparse extension)
+    /// - and on both `ftruncate` may also fail
+    ///
+    /// in all these scenarios, either the `st_size` is correctly updated or not updated at all.
+    ///
+    /// If either of `fallocate` or `f_preallocate` has failed or is not supported by fs, as long as `ftruncate` succeeds,
+    /// our future write ops will work fine. This is mainly because `fallocate` and `f_preallocate` are
+    /// best-effort physical extent reservations to guarantee disk space and reduce write latency.
+    #[inline(always)]
+    pub(super) fn grow(
+        &self,
+        curr_len: usize,
+        len_to_add: usize,
+    ) -> FrozenResult<()> {
+        if len_to_add == 0 {
+            return Ok(());
+        }
+
+        // Validate arithmetic bounds upfront before allocating or truncating
+        let _ = match curr_len.checked_add(len_to_add) {
+            Some(len) => match off_t::try_from(len) {
+                Ok(off) if off >= 0 => off,
+                _ => {
+                    return err::raw_error(
+                        err::GRW,
+                        "target file size exceeds off_t capacity",
+                    );
+                }
+            },
+            None => {
+                return err::raw_error(
+                    err::GRW,
+                    "file growth calculation overflowed usize",
+                );
+            }
+        };
+
+        let fd = self.fd();
+
+        // NOTE:
+        //
+        // On linux, `fallocate` must be called before `ftruncate` to handle `ENOSPC`.
+        //
+        // If the order is reversed, the file length may be updated despite the failure to allocate
+        // space on fs, which may fail all future write ops.
+        #[cfg(target_os = "linux")]
+        fallocate_raw(fd, curr_len, len_to_add)?;
+
+        ftruncate_raw(fd, curr_len, len_to_add)?;
+
+        // INFO: On mac, we can hint the kernel to allocate disk space for the added `len_to_add` as it
+        // can reduce the latency of future write ops
+        //
+        // WARN: Must always be called after `ftruncate` on mac
+        #[cfg(target_os = "macos")]
+        f_preallocate_raw(fd, len_to_add)?;
+
+        Ok(())
+    }
+
+    /// Syncs in cache data updates on the storage device
+    ///
+    /// ## Why do we retry?
+    ///
+    /// POSIX syscalls are interruptible by signals, and may fail w/ `EINTR`, in such cases no progress is guaranteed,
+    /// so the syscall must be retried
+    ///
+    /// ## `F_FULLFSYNC` vs `fsync`
+    ///
+    /// The supposed best os, i.e. mac, does not provide strong durability via `fsync()`, hence writes/updates may lost
+    /// on crash or power failure, as it does not provide strong durability (instant flush), read docs for more info ->
+    /// [https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fsync.2.html]
+    ///
+    /// To achieve true crash durability (including protection against power loss, sudden crash), we have to use
+    /// the `fcntl(fd, F_FULLFSYNC)` syscall
+    ///
+    /// ## Fallback to `fsync`
+    ///
+    /// `fcntl(F_FULLSYNC)` may result in `EINVAL` or `ENOTSUP` on fs which may not support it, such as network fs,
+    /// FUSE mounts, FAT32 volumes, or some external devices
+    ///
+    /// To guard this, we fallback to `fsync()`, which does not guarantee durability for sudden crash or
+    /// power loss, which is acceptable when strong durability is simply not available or allowed
+    #[cfg(target_os = "macos")]
+    pub(super) fn sync(&self) -> FrozenResult<()> {
+        f_fullsync_raw(self.fd())
+    }
+
+    /// Syncs in cache data updates on the storage device
+    ///
+    /// ## Why do we retry?
+    ///
+    /// POSIX syscalls are interruptible by signals, and may fail w/ `EINTR`, in such cases no progress is
+    /// guaranteed, so the syscall must be retried
+    ///
+    /// ## `fsync` vs `fdatasync`
+    ///
+    /// We use `fdatasync()` instead of `fsync()` for persistence, as it guarantees, all updates/writes and
+    /// any metadata, such as file size, are flushed to stable storage
+    ///
+    /// With combination of `O_NOATIME` and `fdatasync()`, we avoid non-essential metadata updates, such as
+    /// access time (`atime`), modification time (`mtime`), and other bookkeeping info
+    #[cfg(target_os = "linux")]
+    pub(super) fn sync(&self) -> FrozenResult<()> {
+        fdatasync_raw(self.fd())
+    }
+
+    /// Initiates writeback (best-effort) of dirty pages in the specified range
+    ///
+    /// ## Purpose
+    ///
+    /// In our case, `sync_range` is used as a prompt for the kernel to start flushing dirty pages in the
+    /// specified range, which result in reduced latency for `fdatasync` and `fcntl(F_FULLSYNC)` syscalls
+    ///
+    /// This syscall, by itself, does not guarantee any kind of durability, and must always be paired with
+    /// strong sync call i.e. `fdatasync()`
+    ///
+    /// ## Why do we retry?
+    ///
+    /// POSIX syscalls are interruptible by signals, and may fail w/ `EINTR`, in such cases no progress is
+    /// guaranteed, so the syscall must be retried
+    #[cfg(target_os = "linux")]
+    pub(super) fn sync_range(
+        &self,
+        offset: usize,
+        len: usize,
+    ) -> FrozenResult<()> {
+        sync_file_range_raw(self.fd(), offset, len)
+    }
+
+    /// Read into given `buf` from specified `offset` w/ `pread` syscall
+    #[inline(always)]
+    pub(super) fn pread(
+        &self,
+        buf: &mut [u8],
+        offset: usize,
+    ) -> FrozenResult<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+
+        let fd = self.fd();
+
+        let mut read = 0usize;
+        let mut retries = 0usize;
+
+        while read < buf.len() {
+            let chunk_offset = match offset.checked_add(read) {
+                Some(off) if off <= off_t::MAX as usize => off as off_t,
+                _ => return err::raw_error(err::INV, "offset overflow"),
+            };
+
+            let res = unsafe {
+                pread(
+                    fd,
+                    buf[read..].as_mut_ptr() as *mut c_void,
+                    (buf.len() - read) as size_t,
+                    chunk_offset,
+                )
+            };
+
+            // unexpected EOF
+            if res == 0 {
+                // NOTE: we treat this as `Hcf` error because this only occurs when we tried to read
+                // beyond current length of the file, which is result of invalid impl
+                return err::default_error(err::HCF);
+            }
+
+            if hints::unlikely(res < 0) {
+                let errno = last_errno();
+                let err_msg = err_msg(errno);
+
+                match errno {
+                    // io interrupt
+                    EINTR | EAGAIN | EBUSY => {
+                        if retries < MAX_RETRIES {
+                            retries += 1;
+                            continue;
+                        }
+
+                        return err::raw_error(err::UNK, err_msg);
+                    }
+
+                    // permission denied
+                    EACCES | EPERM => return err::raw_error(err::RED, err_msg),
+
+                    // invalid fd, invalid fd type, bad pointer, etc.
+                    EINVAL | EBADF | EFAULT | ESPIPE => {
+                        return err::raw_error(err::HCF, err_msg);
+                    }
+
+                    _ => return err::raw_error(err::UNK, err_msg),
+                }
+            }
+
+            read += res as usize;
+            retries = 0;
+        }
+
+        Ok(())
+    }
+
+    /// Write given `buf` at specified `offset` w/ `pwrite` syscall
+    #[inline(always)]
+    pub(super) fn pwrite(&self, buf: &[u8], offset: usize) -> FrozenResult<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+
+        let fd = self.fd();
+
+        let mut written = 0usize;
+        let mut retries = 0usize;
+
+        while written < buf.len() {
+            let chunk_offset = match offset.checked_add(written) {
+                Some(off) if off <= off_t::MAX as usize => off as off_t,
+                _ => return err::raw_error(err::INV, "offset overflow"),
+            };
+
+            let res = unsafe {
+                pwrite(
+                    fd,
+                    buf[written..].as_ptr() as *const c_void,
+                    (buf.len() - written) as size_t,
+                    chunk_offset,
+                )
+            };
+
+            // unexpected EOF / zero write
+            if res == 0 {
+                if retries < MAX_RETRIES {
+                    retries += 1;
+                    continue;
+                }
+
+                return err::default_error(err::HCF);
+            }
+
+            if hints::unlikely(res < 0) {
+                let errno = last_errno();
+                let err_msg = err_msg(errno);
+
+                match errno {
+                    // io interrupt
+                    EINTR | EAGAIN | EBUSY => {
+                        if retries < MAX_RETRIES {
+                            retries += 1;
+                            continue;
+                        }
+
+                        return err::raw_error(err::UNK, err_msg);
+                    }
+
+                    // permission denied or read-only file
+                    EACCES | EPERM | EROFS => {
+                        return err::raw_error(err::WRT, err_msg);
+                    }
+
+                    // no space available or quota exceeded
+                    ENOSPC | libc::EDQUOT => {
+                        return err::raw_error(err::NSP, err_msg);
+                    }
+
+                    // invalid fd, invalid fd type, bad pointer, etc.
+                    EINVAL | EBADF | EFAULT | ESPIPE => {
+                        return err::raw_error(err::HCF, err_msg);
+                    }
+
+                    _ => return err::raw_error(err::UNK, err_msg),
+                }
+            }
+
+            written += res as usize;
+            retries = 0;
+        }
+
+        Ok(())
+    }
+}
+
+impl Drop for POSIXFile {
+    fn drop(&mut self) {
+        let fd = self.fd.swap(CLOSED_FD, atomic::Ordering::AcqRel);
+        if fd != CLOSED_FD {
+            let _ = close_raw(fd);
+        }
+    }
+}
+
+/// create/open a new file w/ `open` syscall
+///
+/// ## Caveats of `O_NOATIME` (`EPERM` err_msg)
+///
+/// `open()` with `O_NOATIME` may fail with `EPERM` instead of silently ignoring the flag
+///
+/// `EPERM` indicates a kernel level permission violation, as the kernel rejects the
+/// request outright, even though the flag only affects metadata behavior
+///
+/// To remain sane across ownership models, containers, and shared filesystems,
+/// we explicitly retry the `open()` w/o `O_NOATIME` when `EPERM` is encountered
+fn open_raw(path: &std::path::Path, flags: c_int) -> FrozenResult<FileId> {
+    let cpath = path_to_cstring(path)?;
+
+    // write + read permissions
+    let perm = (S_IRUSR | S_IWUSR) as c_uint;
+
+    #[cfg(target_os = "linux")]
+    let (mut flags, mut tried_noatime) = (flags, false);
+
+    let mut retries = 0; // only for EINTR errors
+    loop {
+        let fd = if flags & O_CREAT != 0 {
+            unsafe { open(cpath.as_ptr(), flags, perm) }
+        } else {
+            unsafe { open(cpath.as_ptr(), flags) }
+        };
+
+        if hints::unlikely(fd < 0) {
+            let errno = last_errno();
+            let err_msg = err_msg(errno);
+
+            // NOTE: if the error is EPERM and flags contains O_NOATIME flag, we try to open again
+            // w/o the O_NOATIME flag, as some fs does not support this flag
+
+            #[cfg(target_os = "linux")]
+            if errno == EPERM
+                && (flags & libc::O_NOATIME) != 0
+                && !tried_noatime
+            {
+                flags &= !libc::O_NOATIME;
+                tried_noatime = true;
+                continue;
+            }
+
+            match errno {
+                // NOTE: We must retry on interuption errors (EINTR retry)
+                EINTR | EAGAIN | EBUSY => {
+                    if retries < MAX_RETRIES {
+                        retries += 1;
+                        continue;
+                    }
+
+                    return err::raw_error(err::UNK, err_msg);
+                }
+
+                // no space available on disk
+                ENOSPC => return err::raw_error(err::NSP, err_msg),
+
+                // path is a directory or invalid/missing path
+                EISDIR | ENOENT | ENOTDIR => {
+                    return err::raw_error(err::INV, err_msg);
+                }
+
+                // permission denied or read-only fs
+                EACCES | EPERM | EROFS => {
+                    return err::raw_error(err::PRM, err_msg);
+                }
+
+                _ => return err::raw_error(err::UNK, err_msg),
+            }
+        }
+
+        return Ok(fd);
+    }
+}
+
+fn close_raw(fd: FileId) -> FrozenResult<()> {
+    let res = unsafe { close(fd) };
+    if res == 0 {
+        return Ok(());
+    }
+
+    let errno = last_errno();
+    let err_msg = err_msg(errno);
+
+    // POSIX allows `close(fd)` to return `EINTR` when the fd is already closed
+    if errno == EINTR {
+        return Ok(());
+    }
+
+    // NOTE: In POSIX systems, kernel may report delayed io failures on `close`,
+    // these are fatal errors, and can not be retried
+    //
+    // We protect this by enforcing hard durability right after write ops, so the
+    // occurrence of this error is an implementation failure
+    if errno == EIO {
+        return err::raw_error(err::HCF, err_msg);
+    }
+
+    err::raw_error(err::UNK, err_msg)
+}
+
+/// Flush file data to disk using `fdatasync(2)`
+///
+/// ## Indefinite Retry on `EINTR`
+///
+/// In POSIX, `fdatasync` interrupted by a signal (`EINTR`) leaves unwritten blocks
+/// safely in the page cache; no data or descriptor state is lost. Unlike reads/writes,
+/// flush operations have no partial progress metrics. Capping `EINTR` retries would
+/// cause transient signal storms to report false durability failures (`err::SYN`).
+/// Hence, `EINTR` is retried unconditionally until completed or a real hardware I/O
+/// error (`EIO`) occurs (standard practice in engines like Postgres and SQLite).
+#[cfg(target_os = "linux")]
+fn fdatasync_raw(fd: FileId) -> FrozenResult<()> {
+    let mut retries = 0; // only for transient EAGAIN & EBUSY errors
+    loop {
+        let res = unsafe { libc::fdatasync(fd) };
+        if hints::likely(res == 0) {
+            return Ok(());
+        }
+
+        let errno = last_errno();
+        let err_msg = err_msg(errno);
+
+        match errno {
+            // invalid fd or lack of support for sync
+            EINVAL | EBADF => return err::raw_error(err::HCF, err_msg),
+
+            // read-only file (can also be caused by TOCTOU)
+            EROFS => return err::raw_error(err::PRM, err_msg),
+
+            // fatal error, i.e. no sync for writes in recent window/batch
+            EIO => return err::raw_error(err::SYN, err_msg),
+
+            // INFO: Signal interruption does not indicate media or filesystem failure;
+            // dirty pages remain intact in cache. Retrying unconditionally prevents false
+            // durability failure alerts (`err::SYN`) during external signal activity.
+            EINTR => continue,
+
+            // Transient device/resource contention
+            EAGAIN | EBUSY => {
+                if retries < MAX_RETRIES {
+                    retries += 1;
+                    continue;
+                }
+
+                // NOTE: sync error indicates that retries exhausted and durability is broken
+                // in the current/last window/batch
+                return err::raw_error(err::SYN, err_msg);
+            }
+
+            _ => return err::raw_error(err::UNK, err_msg),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn f_fullsync_raw(fd: FileId) -> FrozenResult<()> {
+    let mut retries = 0; // only for transient EAGAIN & EBUSY errors
+    loop {
+        let res = unsafe { libc::fcntl(fd, libc::F_FULLFSYNC) };
+        if hints::likely(res == 0) {
+            return Ok(());
+        }
+
+        let errno = last_errno();
+        let err_msg = err_msg(errno);
+
+        match errno {
+            // INFO: Signal interruption does not indicate media or filesystem failure;
+            // dirty pages remain intact in cache. Retrying unconditionally prevents false
+            // durability failure alerts (`err::SYN`) during external signal activity.
+            EINTR => continue,
+
+            // Transient device/resource contention
+            EAGAIN | EBUSY => {
+                if retries < MAX_RETRIES {
+                    retries += 1;
+                    continue;
+                }
+
+                // NOTE: sync error indicates that retries exhausted and durability is broken
+                // in the current/last window/batch
+                return err::raw_error(err::SYN, err_msg);
+            }
+
+            // lack of support for `F_FULLFSYNC` (e.g. non-APFS/HFS+ mounts like FAT32, exFAT, SMB, NFS, FUSE)
+            libc::ENOTSUP | EOPNOTSUPP | EINVAL => break,
+
+            // invalid fd or bad impl
+            EBADF => return err::raw_error(err::HCF, err_msg),
+
+            // read-only file (can also be caused by TOCTOU)
+            EROFS => return err::raw_error(err::PRM, err_msg),
+
+            // fatal error, i.e. no sync for writes in recent window/batch
+            EIO => return err::raw_error(err::SYN, err_msg),
+
+            _ => return err::raw_error(err::UNK, err_msg),
+        }
+    }
+
+    // NOTE: when the storage device or fs, does not support fullsync, we fallback to `fsync()`,
+    // which does not guaranty durability for sudden crash or power loss, which is acceptable when
+    // strong durability is simply not available or allowed
+    fsync_raw(fd)
+}
+
+/// Syncs in-cache data updates on the storage device
+///
+/// ## Indefinite Retry on `EINTR`
+///
+/// In POSIX, `fsync` interrupted by a signal (`EINTR`) leaves unwritten blocks safely in the page cache; no
+/// data or descriptor state is lost
+///
+/// Unlike reads/writes, flush operations have no partial progress metrics; Capping `EINTR` retries would
+/// cause transient signal storms to report false durability failures (`err::SYN`)
+///
+/// Hence, `EINTR` is retried unconditionally until completed or a real hardware I/O error (`EIO`) occurs
+/// (standard practice in engines like Postgres and SQLite)
+fn fsync_raw(fd: FileId) -> FrozenResult<()> {
+    let mut retries = 0; // only for transient EAGAIN & EBUSY errors
+    loop {
+        let res = unsafe { libc::fsync(fd) };
+        if hints::unlikely(res != 0) {
+            let errno = last_errno();
+            let err_msg = err_msg(errno);
+
+            match errno {
+                // INFO:
+                //
+                // Signal interruption does not indicate media or filesystem failure; dirty pages remain
+                // intact in cache
+                //
+                // Retrying unconditionally prevents false durability failure alerts (`err::SYN`) during
+                // external signal activity
+                EINTR => continue,
+
+                // Transient device/resource contention
+                EAGAIN | EBUSY => {
+                    if retries < MAX_RETRIES {
+                        retries += 1;
+                        continue;
+                    }
+
+                    // NOTE: sync error indicates that retries exhausted and durability is broken
+                    // in the current/last window/batch
+                    return err::raw_error(err::SYN, err_msg);
+                }
+
+                // invalid fd or lack of support for sync
+                EBADF | EINVAL => return err::raw_error(err::HCF, err_msg),
+
+                // read-only file (can also be caused by TOCTOU)
+                EROFS => return err::raw_error(err::PRM, err_msg),
+
+                // fatal error, i.e. no sync for writes in recent window/batch
+                EIO => return err::raw_error(err::SYN, err_msg),
+
+                _ => return err::raw_error(err::UNK, err_msg),
+            }
+        }
+
+        return Ok(());
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn sync_file_range_raw(
+    fd: FileId,
+    offset: usize,
+    len: usize,
+) -> FrozenResult<()> {
+    let flag = libc::SYNC_FILE_RANGE_WRITE;
+    let mut retries = 0; // only for EINTR errors
+
+    loop {
+        let res = unsafe {
+            libc::sync_file_range(fd, offset as off_t, len as off_t, flag)
+        };
+
+        if hints::likely(res == 0) {
+            return Ok(());
+        }
+
+        let errno = last_errno();
+        let err_msg = err_msg(errno);
+
+        match errno {
+            // IO interrupt
+            EINTR | EAGAIN | EBUSY => {
+                if retries < MAX_RETRIES {
+                    retries += 1;
+                    continue;
+                }
+
+                // NOTE: sync error indicates that retries exhausted and durability is broken
+                // in the current/last window/batch
+                return err::raw_error(err::SYN, err_msg);
+            }
+
+            // invalid fd or lack of support for sync
+            EBADF | EINVAL => return err::raw_error(err::HCF, err_msg),
+
+            // read-only file (can also be caused by TOCTOU)
+            EROFS => return err::raw_error(err::PRM, err_msg),
+
+            // fatal error, i.e. no sync for writes in recent window/batch
+            EIO => return err::raw_error(err::SYN, err_msg),
+
+            // NOTE: on many fs mainly ones w/o local journaling, and older kernels does not support
+            // `sync_file_range(SYNC_FILE_RANGE_WRITE)`, also as the use of this is only to hint the
+            // fs (for perf gains for later sync), we simply let go of this and do not elivate any
+            // kind of errors
+            EOPNOTSUPP | libc::ENOSYS => return Ok(()),
+
+            _ => return err::raw_error(err::UNK, err_msg),
+        }
+    }
+}
+
+/// Disk space preallocation using Linux `fallocate()`.
+///
+/// ## Allocation Semantics
+///
+/// Mode `0` (default allocation) allocates physical blocks and extends `st_size` if
+/// `curr_len + len_to_add > st_size`
+///
+/// Any unwritten allocated space within this range is initialized to zero by the filesystem (Unlike
+/// `FALLOC_FL_KEEP_SIZE`, mode 0 adjusts file size upon allocation)
+///
+/// Calling `fallocate()` with `len_to_add == 0` returns `EINVAL` per Linux man pages; this is guarded
+/// by an early-return check
+///
+/// ## Filesystem Support
+///
+/// Not all filesystems (e.g. NFS, older CIFS, or non-extent-based filesystems) support block allocation
+/// (`fallocate`), while `EOPNOTSUPP` and `ENOSYS` are treated as non-fatal because preallocation is a
+/// latency and `ENOSPC`-avoidance optimization
+///
+/// standard zero-fill or `ftruncate()` will handle subsequent space growth
+///
+/// ## Interruption & Retry
+///
+/// Syscalls may fail with `EINTR`, `EAGAIN`, or `EBUSY` under signal pressure or lock contention, and are
+/// retried up to `MAX_RETRIES`
+#[cfg(target_os = "linux")]
+fn fallocate_raw(
+    fd: FileId,
+    curr_len: usize,
+    len_to_add: usize,
+) -> FrozenResult<()> {
+    if len_to_add == 0 {
+        return Ok(());
+    }
+
+    let offset = match off_t::try_from(curr_len) {
+        Ok(off) if off >= 0 => off,
+        _ => return err::raw_error(err::GRW, "offset exceeds off_t capacity"),
+    };
+    let length = match off_t::try_from(len_to_add) {
+        Ok(off) if off >= 0 => off,
+        _ => {
+            return err::raw_error(
+                err::GRW,
+                "len_to_add exceeds off_t capacity",
+            );
+        }
+    };
+
+    let mut retries = 0; // only for EINTR errors
+    loop {
+        let res = unsafe { libc::fallocate(fd, 0, offset, length) };
+
+        if hints::likely(res == 0) {
+            return Ok(());
+        }
+
+        let errno = last_errno();
+        let err_msg = err_msg(errno);
+
+        match errno {
+            // IO interrupt
+            EINTR | EAGAIN | EBUSY => {
+                if retries < MAX_RETRIES {
+                    retries += 1;
+                    continue;
+                }
+
+                return err::raw_error(err::GRW, err_msg);
+            }
+
+            // invalid fd
+            EBADF | EINVAL => return err::raw_error(err::HCF, err_msg),
+
+            // read-only fs (can also be caused by TOCTOU)
+            EROFS => return err::raw_error(err::PRM, err_msg),
+
+            // no space available on disk to grow
+            ENOSPC => return err::raw_error(err::NSP, err_msg),
+
+            // NOTE: on many fs `fallocate()` may not be supported due to old kernel or fs
+            // limitations, as use of this is only to hint the fs (for perf gains while
+            // writes), we simply let go of this and do not elivate any kind of errors
+            EOPNOTSUPP | libc::ENOSYS => return Ok(()),
+
+            _ => return err::raw_error(err::UNK, err_msg),
+        }
+    }
+}
+
+/// sets the size of [`POSIXFile`] to `len = curr_len + len_to_add` on fs
+///
+/// ## Why do we retry?
+///
+/// POSIX syscalls are interruptible by signals, and may fail w/ `EINTR`, in such cases no progress is
+/// guaranteed, so the syscall must be retried
+fn ftruncate_raw(
+    fd: FileId,
+    curr_len: usize,
+    len_to_add: usize,
+) -> FrozenResult<()> {
+    let new_len = match curr_len.checked_add(len_to_add) {
+        Some(len) => match off_t::try_from(len) {
+            Ok(off) if off >= 0 => off,
+            _ => {
+                return err::raw_error(
+                    err::GRW,
+                    "target file size exceeds off_t capacity",
+                );
+            }
+        },
+        None => {
+            return err::raw_error(
+                err::GRW,
+                "file length calculation overflowed usize",
+            );
+        }
+    };
+    let mut retries = 0; // only for EINTR errors
+
+    loop {
+        let res = unsafe { ftruncate(fd, new_len) };
+        if hints::likely(res == 0) {
+            return Ok(());
+        }
+
+        let errno = last_errno();
+        let err_msg = err_msg(errno);
+
+        match errno {
+            // IO interrupt
+            EINTR | EAGAIN | EBUSY => {
+                if retries < MAX_RETRIES {
+                    retries += 1;
+                    continue;
+                }
+
+                return err::raw_error(err::GRW, err_msg);
+            }
+
+            // invalid fd or lack of support for sync
+            EINVAL | EBADF => return err::raw_error(err::HCF, err_msg),
+
+            // read-only fs (can also be caused by TOCTOU)
+            EROFS => return err::raw_error(err::PRM, err_msg),
+
+            // no space available on disk to grow
+            ENOSPC => return err::raw_error(err::NSP, err_msg),
+
+            _ => return err::raw_error(err::UNK, err_msg),
+        }
+    }
+}
+
+/// disk space (best-effort) preallocations using `F_PREALLOCATE`
+///
+/// ## Semantics
+///
+/// This syscall does not change the size, nor the file capacity, the use is to attempt to reserve
+/// disk blocks in advance to reduce latency during write ops to the [`POSIXFile`]
+///
+/// ## Support on fs
+///
+/// On many fs, `fcntl(F_PREALLOCATE)` may not be supported due to older kernels, or fs limitations
+/// in such cases, we simply let go, and do not surface any errors, as this operation is mostly used as
+/// best-effort, and despite the failure of `fcntl(F_PREALLOCATE)`, the later `ftruncate()` would succeed,
+/// and the write ops also would work all well, so we are good ;)
+///
+/// ## Contiguous vs Non-contiguous Allocations
+///
+/// In `F_PREALLOCATE` calls, we get two allocation modes, contiguous and non-contiguous,
+///
+/// Calls w/ `F_ALLOCATECONTIG` are more likely to fail on fragmented fs, so we instantly fallback
+/// to using `F_ALLOCATEALL` for reliability and correctness
+///
+/// ## Caveats (more like stupidity) of `F_ALLOCATEALL`
+///
+/// The preallocations may be revoked by fs due to (intentional) waker semantics, this acts more like a hint
+/// and not a command to the fs, so the perf is not always guaranteed
+///
+/// ## Physical EOF Semantics (`F_PEOFPOSMODE`)
+///
+/// In XNU, `fst_offset` under `F_PEOFPOSMODE` is a delta relative to physical EOF (`PEOF`), and not an
+/// absolute offset from 0
+///
+/// Passing `0` allocates directly starting from current physical EOF
+///
+/// ## Why do we retry?
+///
+/// POSIX syscalls are interruptible by signals, and may fail w/ `EINTR`, in such cases no progress is
+/// guaranteed, so the syscall must be retried
+#[cfg(target_os = "macos")]
+fn f_preallocate_raw(fd: FileId, len_to_add: usize) -> FrozenResult<()> {
+    let mut retries = 0; // only for EINTR errors
+
+    // NOTE:
+    //
+    // Under `F_PEOFPOSMODE`, `fst_offset` is defined by XNU as a delta from physical EOF (PEOF), not logical
+    // offset 0
+    //
+    // Passing offset > 0 allocates at (PEOF + offset), creating an unallocated sparse hole between existing
+    // file blocks and new extents
+    //
+    // Hence fst_offset must always be 0
+    //
+    // By default we try w/ contiguous allocations for optimal perf; when not available (i.e. ENOSPC), we
+    // fallback to non-contiguous allocations
+    let length = match off_t::try_from(len_to_add) {
+        Ok(len) if len >= 0 => len,
+        _ => {
+            return err::raw_error(
+                err::GRW,
+                "len_to_add exceeds off_t capacity",
+            );
+        }
+    };
+
+    let mut store = libc::fstore_t {
+        fst_flags: libc::F_ALLOCATECONTIG,
+        fst_posmode: libc::F_PEOFPOSMODE,
+        fst_offset: 0,
+        fst_length: length,
+        fst_bytesalloc: 0,
+    };
+
+    loop {
+        let res = unsafe { libc::fcntl(fd, libc::F_PREALLOCATE, &store) };
+        if res == 0 {
+            return Ok(());
+        }
+
+        let errno = last_errno();
+        let err_msg = err_msg(errno);
+
+        match errno {
+            // IO interrupt
+            EINTR | EAGAIN | EBUSY => {
+                if retries < MAX_RETRIES {
+                    retries += 1;
+                    continue;
+                }
+
+                return err::raw_error(err::GRW, err_msg);
+            }
+
+            // no space available on disk to grow
+            ENOSPC => {
+                // NOTE: we must retry w/ non-contiguous allocs for correctness, as sometimes
+                // we do get `ENOSPC` only for contiguous allocs
+                if store.fst_flags == libc::F_ALLOCATECONTIG {
+                    store.fst_flags = libc::F_ALLOCATEALL;
+                    retries = 0;
+                    continue;
+                }
+
+                return err::raw_error(err::NSP, err_msg);
+            }
+
+            // NOTE: on many fs `fcntl(F_PREALLOCATE)` may not be supported due to old kernel
+            // or fs limitations, as use of this is only to hint the fs (for perf gains while
+            // writes), we simply let go of this and do not elivate any kind of errors
+            EOPNOTSUPP | libc::ENOTSUP => return Ok(()),
+
+            // lack of support or weird fs behavior
+            EINVAL => return Ok(()), // same reason as above to not elivate the error
+
+            // invalid fd
+            EBADF => return err::raw_error(err::HCF, err_msg),
+
+            // read-only fs
+            EROFS => return err::raw_error(err::PRM, err_msg),
+
+            _ => return err::raw_error(err::UNK, err_msg),
+        }
+    }
+}
+
+fn flock_raw(fd: FileId) -> FrozenResult<()> {
+    let mut retries = 0; // only for EINTR errors
+    loop {
+        let res = unsafe { flock(fd, LOCK_EX | LOCK_NB) };
+        if res == 0 {
+            return Ok(());
+        }
+
+        let errno = last_errno();
+        let err_msg = err_msg(errno);
+
+        match errno {
+            // another process already holds the lock
+            _ if errno == EWOULDBLOCK || errno == EAGAIN => {
+                return err::raw_error(err::LCK, err_msg);
+            }
+
+            // IO interrupt
+            EINTR => {
+                if retries < MAX_RETRIES {
+                    retries += 1;
+                    continue;
+                }
+
+                return err::raw_error(err::UNK, err_msg);
+            }
+
+            // invalid fd or lack of support
+            EBADF | EINVAL => return err::raw_error(err::HCF, err_msg),
+
+            // os or fs out of locks (lock exhaustion, e.g. NFS)
+            ENOLCK => return err::raw_error(err::LEX, err_msg),
+
+            _ => return err::raw_error(err::UNK, err_msg),
+        }
+    }
+}
+
+/// perform `fsync` for parent directory of file at given `path`
+///
+/// ## Purpose
+///
+/// In POSIX systems, syscalls like `open(path)`, `close(fd)` and `unlink(path)`, does not provide
+/// crash safe durability, hence after a sudden crash or power loss, the operation may reverse,
+/// resulting in catastrophic consequences
+///
+/// we must `fsync(parent_dir)`, for crash safe durability
+///
+/// ## Best-effort on Unsupported Filesystems
+///
+/// Not all OS kernels (e.g. macOS Darwin) or filesystems (e.g. NFS, CIFS, exFAT, VFAT) support
+/// calling `fsync` on directory file descriptors
+///
+/// On these systems, directory sync is treated as best-effort and unsupported errors are safely ignored
+fn sync_parent_dir(path: &std::path::Path) -> FrozenResult<()> {
+    let parent = extract_parent_dir(path);
+    let flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC;
+
+    let fd = match open_raw(&parent, flags) {
+        Ok(fd) => fd,
+        Err(e)
+            if e.reason == err::PRM.reason || e.reason == err::INV.reason =>
+        {
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+
+    #[cfg(target_os = "linux")]
+    let res = fsync_raw(fd);
+
+    #[cfg(target_os = "macos")]
+    let res = f_fullsync_raw(fd);
+
+    // INFO:
+    //
+    // We intentionally ignore `close_raw` errors for the dir descriptor
+    //
+    // Directory is opened w/ `O_RDONLY` flag, so there are no dirty pages or delayed writeback
+    // failures to flush (unlike writable files where close may report deferred `EIO`/`ENOSPC`)
+    //
+    // The only possible errors are `EBADF` or `EINTR` (where the kernel already deallocates the fd
+    // slot on Linux/Darwin), making error propagation here unnecessary and counterproductive
+    let _ = close_raw(fd);
+
+    match res {
+        Err(e)
+            if e.reason == err::HCF.reason || e.reason == err::UNK.reason =>
+        {
+            Ok(())
+        }
+        other => other,
+    }
+}
+
+/// preps flags for `open()` syscall
+///
+/// ## Access Time Updates (O_NOATIME)
+///
+/// On linux, we can use the `O_NOATIME` flag to disable access time updates on the [`POSIXFile`]
+///
+/// Normally every I/O operation triggers an `atime` update for every write to disk, w/ use of
+/// this flag, we try to eliminate counterproductive measures
+///
+/// ## Limitations of `O_NOATIME`
+///
+/// - not all fs support this flag, many silently ignore it, but some throw `EPERM` error
+/// - It only works when the UID's are matched for calling process and file owner
+#[cfg(target_os = "linux")]
+const fn prep_flags() -> c_int {
+    O_RDWR | O_CLOEXEC | libc::O_NOATIME | O_CREAT
+}
+
+/// preps flags for `open()` syscall
+#[cfg(target_os = "macos")]
+const fn prep_flags() -> c_int {
+    return O_RDWR | O_CLOEXEC | O_CREAT;
+}
+
+/// convert a `std::path::Path` into `std::ffi::CString`
+fn path_to_cstring(path: &std::path::Path) -> FrozenResult<std::ffi::CString> {
+    match std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) {
+        Ok(cs) => Ok(cs),
+        Err(e) => err::raw_error(err::INV, e),
+    }
+}
+
+#[inline]
+fn last_errno() -> i32 {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        *libc::__errno_location()
+    }
+
+    #[cfg(target_os = "macos")]
+    unsafe {
+        *libc::__error()
+    }
+}
+
+#[inline]
+fn err_msg(errno: i32) -> String {
+    std::io::Error::from_raw_os_error(errno).to_string()
+}
+
+fn extract_parent_dir(path: &std::path::Path) -> std::path::PathBuf {
+    match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => std::path::Path::new(".").to_path_buf(),
+    }
+}
+
+/// Provide access pattern hint using `posix_fadvise(POSIX_FADV_RANDOM)`
+///
+/// ## Semantics
+///
+/// This syscall provides a hint to the kernel that the file will be accessed in a random pattern
+///
+/// The kernel may have disabled read-ahead heuristics for the file
+///
+/// ## Best-effort behavior
+///
+/// This call is purely advisory
+///
+/// If the kernel or filesystem does not support the hint (e.g. `ENOSYS`, `EINVAL`, `ESPIPE`), or if signal
+/// interruption retries exhaust, the failure is safely ignored. Only descriptor corruption (`EBADF`)
+/// returns `err::HCF`
+///
+/// ## Why do we retry?
+///
+/// POSIX syscalls are interruptible by signals, and may fail w/ `EINTR`, in such cases no progress is
+/// guaranteed, so the syscall must be retried
+#[inline]
+#[cfg(target_os = "linux")]
+fn f_advise_raw(fd: FileId) -> FrozenResult<()> {
+    let mut retries = 0;
+    loop {
+        let res =
+            unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_RANDOM) };
+        if res == 0 {
+            return Ok(());
+        }
+
+        match res {
+            // IO interrupt or lock contention - retry bounded
+            EINTR | EAGAIN | EBUSY => {
+                if retries < MAX_RETRIES {
+                    retries += 1;
+                    continue;
+                }
+
+                // Advisory hint failure under signal pressure is non-fatal
+                return Ok(());
+            }
+
+            // Programmer / descriptor corruption bug: descriptor is completely invalid
+            EBADF => {
+                let err_msg = err_msg(res);
+                return err::raw_error(err::HCF, err_msg);
+            }
+
+            // Advisory hints are best-effort: silently ignore lack of kernel/filesystem
+            // support (ENOSYS), unsupported vnode/pipe/device (EINVAL, ESPIPE),
+            // or any other filesystem-specific refusal.
+            _ => return Ok(()),
+        }
+    }
+}

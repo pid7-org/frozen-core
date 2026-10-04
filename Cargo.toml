@@ -39,6 +39,7 @@ isa = []
 file = [
     "error",
     "libc",
+    "hints",
 ]
 memmap = [
     "error",
