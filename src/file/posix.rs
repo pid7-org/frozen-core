@@ -1,11 +1,11 @@
-use super::{err, FileId};
+use super::{FileId, err};
 use crate::{error::FrozenResult, hints};
 use libc::{
-    access, c_int, c_uint, c_void, close, flock, fstat, ftruncate, off_t, open,
-    pread, pwrite, size_t, stat, unlink, EACCES, EAGAIN, EBADF, EBUSY, EFAULT,
-    EINTR, EINVAL, EIO, EISDIR, ENOENT, ENOLCK, ENOSPC, ENOTDIR, EOPNOTSUPP,
-    EPERM, EROFS, ESPIPE, EWOULDBLOCK, F_OK, LOCK_EX, LOCK_NB, O_CLOEXEC,
-    O_CREAT, O_DIRECTORY, O_RDONLY, O_RDWR, S_IRUSR, S_IWUSR,
+    EACCES, EAGAIN, EBADF, EBUSY, EFAULT, EINTR, EINVAL, EIO, EISDIR, ENOENT,
+    ENOLCK, ENOSPC, ENOTDIR, EOPNOTSUPP, EPERM, EROFS, ESPIPE, EWOULDBLOCK,
+    F_OK, LOCK_EX, LOCK_NB, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_RDONLY, O_RDWR,
+    S_IRUSR, S_IWUSR, access, c_int, c_uint, c_void, close, flock, fstat,
+    ftruncate, off_t, open, pread, pwrite, size_t, stat, unlink,
 };
 use std::sync::atomic;
 
@@ -1321,6 +1321,503 @@ fn f_advise_raw(fd: FileId) -> FrozenResult<()> {
             // support (ENOSYS), unsupported vnode/pipe/device (EINVAL, ESPIPE),
             // or any other filesystem-specific refusal.
             _ => return Ok(()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn tmp_path() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tmp_file");
+        (dir, path)
+    }
+
+    mod file_new_close {
+        use super::*;
+
+        #[test]
+        fn ok_new_close_cycle() {
+            let (_dir, path) = tmp_path();
+            let file = POSIXFile::new(&path).unwrap();
+            assert!(path.exists());
+            file.close().unwrap();
+        }
+
+        #[test]
+        fn ok_new_close_cycle_on_existing() {
+            let (_dir, path) = tmp_path();
+            let file1 = POSIXFile::new(&path).unwrap();
+            file1.close().unwrap();
+
+            let file2 = POSIXFile::new(&path).unwrap();
+            file2.close().unwrap();
+        }
+
+        #[test]
+        fn err_new_on_missing_parent_dir() {
+            let (_dir, path) = tmp_path();
+            let missing = path.join("missing/sub/dir/file");
+            let err = POSIXFile::new(&missing).unwrap_err();
+            assert_eq!(err.reason, err::INV.reason);
+        }
+    }
+
+    mod file_unlink {
+        use super::*;
+
+        #[test]
+        fn ok_unlink_existing() {
+            let (_dir, path) = tmp_path();
+            let file = POSIXFile::new(&path).unwrap();
+            assert!(path.exists());
+
+            file.unlink(&path).unwrap();
+            assert!(!path.exists());
+        }
+
+        #[test]
+        fn err_unlink_missing() {
+            let (_dir, path) = tmp_path();
+            let file = POSIXFile::new(&path).unwrap();
+            file.unlink(&path).unwrap();
+
+            let missing_path = path.join("non_existent_file");
+            let file2 = POSIXFile {
+                fd: atomic::AtomicI32::new(unsafe {
+                    libc::open(
+                        b"/dev/null\0".as_ptr() as *const _,
+                        libc::O_RDONLY,
+                    )
+                }),
+            };
+            let err = file2.unlink(&missing_path).unwrap_err();
+            assert_eq!(err.reason, err::INV.reason);
+        }
+    }
+
+    mod file_lock {
+        use super::*;
+
+        #[test]
+        fn ok_flock_acquires_exclusive_lock() {
+            let (_dir, path) = tmp_path();
+            let file = POSIXFile::new(&path).unwrap();
+            file.flock().unwrap();
+            file.close().unwrap();
+        }
+
+        #[test]
+        fn err_flock_when_already_locked() {
+            let (_dir, path) = tmp_path();
+            let file1 = POSIXFile::new(&path).unwrap();
+            file1.flock().unwrap();
+
+            let file2 = POSIXFile::new(&path).unwrap();
+            let err = file2.flock().unwrap_err();
+            assert_eq!(err.reason, err::LCK.reason);
+
+            file1.close().unwrap();
+            file2.close().unwrap();
+        }
+
+        #[test]
+        fn ok_flock_released_after_close() {
+            let (_dir, path) = tmp_path();
+            let file1 = POSIXFile::new(&path).unwrap();
+            file1.flock().unwrap();
+            file1.close().unwrap();
+
+            let file2 = POSIXFile::new(&path).unwrap();
+            file2.flock().unwrap();
+            file2.close().unwrap();
+        }
+    }
+
+    mod file_grow {
+        use super::*;
+
+        #[test]
+        fn ok_grow() {
+            let (_dir, path) = tmp_path();
+            let file = POSIXFile::new(&path).unwrap();
+
+            let initial = file.length().unwrap();
+            assert_eq!(initial, 0);
+
+            file.grow(0, 0x1000).unwrap();
+            let new_len = file.length().unwrap();
+            assert_eq!(new_len, 0x1000);
+
+            file.close().unwrap();
+        }
+
+        #[test]
+        fn ok_grow_extends_with_zero() {
+            let (_dir, path) = tmp_path();
+            let file = POSIXFile::new(&path).unwrap();
+            file.grow(0, 0x500).unwrap();
+
+            let mut buf = vec![0u8; 0x500];
+            file.pread(&mut buf, 0).unwrap();
+
+            assert!(buf.iter().all(|b| *b == 0));
+            file.close().unwrap();
+        }
+
+        #[test]
+        fn ok_grow_len_zero() {
+            let (_dir, path) = tmp_path();
+            let file = POSIXFile::new(&path).unwrap();
+            file.grow(0, 0).unwrap();
+            assert_eq!(file.length().unwrap(), 0);
+            file.close().unwrap();
+        }
+    }
+
+    mod fil_sync {
+        use super::*;
+
+        #[test]
+        fn ok_sync() {
+            let (_dir, path) = tmp_path();
+            let file = POSIXFile::new(&path).unwrap();
+            file.sync().unwrap();
+            file.close().unwrap();
+        }
+
+        #[test]
+        fn ok_sync_after_sync() {
+            let (_dir, path) = tmp_path();
+            let file = POSIXFile::new(&path).unwrap();
+
+            file.sync().unwrap();
+            file.sync().unwrap();
+            file.sync().unwrap();
+            file.sync().unwrap();
+
+            file.close().unwrap();
+        }
+    }
+
+    mod write_read_single {
+        use super::*;
+
+        #[test]
+        fn ok_pwrite_pread_cycle() {
+            let (_dir, path) = tmp_path();
+            let file = POSIXFile::new(&path).unwrap();
+            file.grow(0, 0x200).unwrap();
+
+            let data = b"grave_engine";
+            file.pwrite(data, 0x80).unwrap();
+
+            let mut buf = vec![0u8; data.len()];
+            file.pread(&mut buf, 0x80).unwrap();
+            assert_eq!(&buf[..], data);
+            file.close().unwrap();
+        }
+
+        #[test]
+        fn ok_pwrite_pread_across_sessions() {
+            let (_dir, path) = tmp_path();
+
+            // session 1
+            {
+                let file = POSIXFile::new(&path).unwrap();
+                file.grow(0, 0x1000).unwrap();
+
+                let data = b"persist_me";
+                file.pwrite(data, 0).unwrap();
+
+                file.sync().unwrap();
+                file.close().unwrap();
+            }
+
+            // session 2
+            {
+                let file = POSIXFile::new(&path).unwrap();
+                let mut buf = vec![0u8; 10];
+                file.pread(&mut buf, 0).unwrap();
+                assert_eq!(&buf[..], b"persist_me");
+                file.close().unwrap();
+            }
+        }
+
+        #[test]
+        fn ok_pwrite_concurrent_non_overlapping() {
+            let (_dir, path) = tmp_path();
+            let file = std::sync::Arc::new(POSIXFile::new(&path).unwrap());
+            file.grow(0, 0x2000).unwrap();
+
+            let mut handles = vec![];
+            for i in 0..0x0A {
+                let f = file.clone();
+                handles.push(std::thread::spawn(move || {
+                    let data = vec![i as u8; 0x100];
+                    f.pwrite(&data, i * 0x100).unwrap();
+                }));
+            }
+
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            file.sync().unwrap();
+            for i in 0..0x0A {
+                let mut buf = vec![0u8; 0x100];
+                file.pread(&mut buf, i * 0x100).unwrap();
+                assert!(buf.iter().all(|b| *b == i as u8));
+            }
+        }
+
+        #[test]
+        fn ok_pwrite_when_overlapping_last_wins() {
+            let (_dir, path) = tmp_path();
+            let file = POSIXFile::new(&path).unwrap();
+            file.grow(0, 0x100).unwrap();
+
+            let a = [1u8; 0x80];
+            let b = [2u8; 0x80];
+
+            file.pwrite(&a, 0).unwrap();
+            file.pwrite(&b, 0).unwrap();
+
+            let mut buf = vec![0u8; 0x80];
+            file.pread(&mut buf, 0).unwrap();
+            assert!(buf.iter().all(|b| *b == 2));
+            file.close().unwrap();
+        }
+    }
+
+    mod file_exists {
+        use super::*;
+
+        #[test]
+        fn ok_exists_true_on_existing_file() {
+            let (_dir, path) = tmp_path();
+            let file = POSIXFile::new(&path).unwrap();
+            assert!(POSIXFile::exists(&path).unwrap());
+            file.close().unwrap();
+        }
+
+        #[test]
+        fn ok_exists_false_on_missing_file() {
+            let (_dir, path) = tmp_path();
+            assert!(!POSIXFile::exists(&path).unwrap());
+        }
+    }
+
+    mod file_lifecycle {
+        use super::*;
+
+        #[test]
+        fn err_length_after_closed() {
+            let file = POSIXFile { fd: atomic::AtomicI32::new(CLOSED_FD) };
+            let err = file.length().unwrap_err();
+            assert_eq!(err.reason, err::HCF.reason);
+        }
+
+        #[test]
+        fn err_pread_after_closed() {
+            let file = POSIXFile { fd: atomic::AtomicI32::new(CLOSED_FD) };
+            let mut buf = vec![0u8; 8];
+            let err = file.pread(&mut buf, 0).unwrap_err();
+            assert_eq!(err.reason, err::HCF.reason);
+        }
+
+        #[test]
+        fn err_pwrite_after_closed() {
+            let file = POSIXFile { fd: atomic::AtomicI32::new(CLOSED_FD) };
+            let data = b"dead";
+            let err = file.pwrite(data, 0).unwrap_err();
+            assert_eq!(err.reason, err::HCF.reason);
+        }
+
+        #[test]
+        fn err_sync_after_closed() {
+            let file = POSIXFile { fd: atomic::AtomicI32::new(CLOSED_FD) };
+            let err = file.sync().unwrap_err();
+            assert_eq!(err.reason, err::HCF.reason);
+        }
+
+        #[test]
+        fn err_grow_after_closed() {
+            let file = POSIXFile { fd: atomic::AtomicI32::new(CLOSED_FD) };
+            let err = file.grow(0, 0x100).unwrap_err();
+            assert_eq!(err.reason, err::HCF.reason);
+        }
+
+        #[test]
+        fn ok_drop_closes_descriptor() {
+            let (_dir, path) = tmp_path();
+            let fd = {
+                let file = POSIXFile::new(&path).unwrap();
+                let fd = file.fd();
+                assert_ne!(fd, CLOSED_FD);
+                fd
+                // file dropped here
+            };
+
+            // Calling close on already dropped fd should return EBADF
+            let res = unsafe { libc::close(fd) };
+            assert_eq!(res, -1);
+            let errno = last_errno();
+            assert_eq!(errno, libc::EBADF);
+        }
+    }
+
+    mod raw_syscalls {
+        use super::*;
+
+        #[test]
+        fn ok_sync_cycle() {
+            let (_dir, path) = tmp_path();
+            let file = POSIXFile::new(&path).unwrap();
+            file.grow(0, 0x400).unwrap();
+
+            let data = [7u8; 0x80];
+            file.pwrite(&data, 0).unwrap();
+            file.sync().unwrap();
+
+            let mut buf = vec![0u8; 0x80];
+            file.pread(&mut buf, 0).unwrap();
+            assert_eq!(buf, data);
+            file.close().unwrap();
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn ok_sync_range() {
+            let (_dir, path) = tmp_path();
+            let file = POSIXFile::new(&path).unwrap();
+            file.grow(0, 0x1000).unwrap();
+
+            let data = [5u8; 0x100];
+            file.pwrite(&data, 0x200).unwrap();
+
+            file.sync_range(0x200, 0x100).unwrap();
+            file.sync().unwrap();
+
+            let mut buf = vec![0u8; 0x100];
+            file.pread(&mut buf, 0x200).unwrap();
+            assert_eq!(buf, data);
+            file.close().unwrap();
+        }
+
+        #[test]
+        fn ok_write_read_at_eof_boundary() {
+            let (_dir, path) = tmp_path();
+            let file = POSIXFile::new(&path).unwrap();
+            file.grow(0, 0x200).unwrap();
+
+            let data = [3u8; 0x40];
+            file.pwrite(&data, 0x200 - 0x40).unwrap();
+
+            let mut buf = vec![0u8; 0x40];
+            file.pread(&mut buf, 0x200 - 0x40).unwrap();
+            assert_eq!(buf, data);
+            file.close().unwrap();
+        }
+
+        #[test]
+        fn ok_multiple_open_close_cycles() {
+            let (_dir, path) = tmp_path();
+            for _ in 0..0x0A {
+                let file = POSIXFile::new(&path).unwrap();
+                file.sync().unwrap();
+                file.close().unwrap();
+            }
+        }
+
+        #[test]
+        #[cfg(target_os = "linux")]
+        fn ok_f_advice_random() {
+            let (_dir, path) = tmp_path();
+            let file = POSIXFile::new(&path).unwrap();
+            f_advise_raw(file.fd()).unwrap();
+            file.close().unwrap();
+        }
+    }
+
+    mod utils {
+        use super::*;
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+        #[test]
+        fn ok_extract_parent_dir() {
+            let cases = [
+                ("/", "."),
+                ("file.db", "."),
+                ("./a/b/c.log", "./a/b"),
+                ("data/file.db", "data"),
+                ("/var/lib/grave/", "/var/lib"),
+                ("/tmp/grave/file.db", "/tmp/grave"),
+            ];
+
+            for (input, expected) in cases {
+                let path = PathBuf::from(input);
+                let parent = extract_parent_dir(&path);
+                assert_eq!(
+                    parent,
+                    PathBuf::from(expected),
+                    "failed for input: {input}"
+                );
+            }
+        }
+
+        #[test]
+        fn ok_path_to_cstring() {
+            let cases: &[(&[u8], bool)] = &[
+                (b"", true),
+                (b"file.db", true),
+                (b"bad\0path.db", false),
+                (b"relative/path.db", true),
+                (b"/tmp/grave/file.db", true),
+            ];
+
+            for (bytes, should_ok) in cases {
+                let path = PathBuf::from(std::ffi::OsStr::from_bytes(bytes));
+                let res = path_to_cstring(&path);
+
+                match (res, should_ok) {
+                    (Ok(cs), true) => {
+                        let expected = CString::new(*bytes).expect(
+                            "valid test case must not contain interior NUL",
+                        );
+                        assert_eq!(
+                            cs.as_bytes(),
+                            expected.as_bytes(),
+                            "mismatch for input: {:?}",
+                            bytes
+                        );
+                    }
+                    (Err(_), false) => {}
+                    (other, _) => {
+                        panic!(
+                            "unexpected result for input {:?}: {:?}",
+                            bytes, other
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn ok_last_errno() {
+            unsafe {
+                let _ = libc::close(-1);
+                assert_eq!(last_errno(), libc::EBADF);
+            }
+        }
+
+        #[test]
+        fn ok_err_msg() {
+            let msg = err_msg(libc::ENOENT);
+            assert!(!msg.is_empty(), "ENOENT must produce message");
         }
     }
 }
