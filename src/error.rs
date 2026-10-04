@@ -95,12 +95,7 @@ impl FrozenError {
     /// assert!(err.context.contains("file missing"));
     /// ```
     #[inline(always)]
-    pub fn new_raw<E: std::fmt::Display>(
-        module: u8,
-        domain: u8,
-        code: ErrCode,
-        err: E,
-    ) -> Self {
+    pub fn new_raw<E: std::fmt::Display>(module: u8, domain: u8, code: ErrCode, err: E) -> Self {
         Self {
             domain,
             module,
@@ -222,10 +217,7 @@ mod tests {
 
     #[test]
     fn ok_new_raw_uses_display() {
-        let io_err = std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "access denied",
-        );
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access denied");
         let err = FrozenError::new_raw(1, 2, ErrCode::new(3, "io"), io_err);
 
         assert!(err.context.contains("[io]"));
@@ -250,23 +242,13 @@ mod tests {
 
     #[test]
     fn ok_display_format() {
-        let err = FrozenError::new(
-            0x01,
-            0x11,
-            ErrCode::new(0x1C, "lock"),
-            "file locked",
-        );
+        let err = FrozenError::new(0x01, 0x11, ErrCode::new(0x1C, "lock"), "file locked");
         assert_eq!(format!("{err}"), "[0x01:0x11:0x1c] [lock] file locked");
     }
 
     #[test]
     fn ok_debug_format_includes_context() {
-        let err = FrozenError::new(
-            0x01,
-            0x11,
-            ErrCode::new(0x1C, "lock"),
-            "file locked",
-        );
+        let err = FrozenError::new(0x01, 0x11, ErrCode::new(0x1C, "lock"), "file locked");
         let dbg = format!("{err:?}");
         assert!(dbg.contains("0x01"));
         assert!(dbg.contains("0x11"));

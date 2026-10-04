@@ -20,16 +20,13 @@ pub(in crate::file) mod err {
     pub const UNK: ErrCode = ErrCode::new(0x04, "unknown error");
 
     /// no more space available
-    pub const NSP: ErrCode =
-        ErrCode::new(0x08, "not enough space available on the storage device");
+    pub const NSP: ErrCode = ErrCode::new(0x08, "not enough space available on the storage device");
 
     /// syncing error
-    pub const SYN: ErrCode =
-        ErrCode::new(0x0A, "failed to sync/flush data to storage device");
+    pub const SYN: ErrCode = ErrCode::new(0x0A, "failed to sync/flush data to storage device");
 
     /// no write perm
-    pub const WRT: ErrCode =
-        ErrCode::new(0x0C, "missing permissions for write");
+    pub const WRT: ErrCode = ErrCode::new(0x0C, "missing permissions for write");
 
     /// no read perm
     pub const RED: ErrCode = ErrCode::new(0x0E, "missing permissions for read");
@@ -38,8 +35,7 @@ pub(in crate::file) mod err {
     pub const INV: ErrCode = ErrCode::new(0x10, "invalid path to file");
 
     /// corrupted file
-    pub const CPT: ErrCode =
-        ErrCode::new(0x12, "file is either invalid or corrupted");
+    pub const CPT: ErrCode = ErrCode::new(0x12, "file is either invalid or corrupted");
 
     /// unable to grow
     pub const GRW: ErrCode = ErrCode::new(0x14, "unable to zero-extend file");
@@ -52,10 +48,8 @@ pub(in crate::file) mod err {
     pub const PRM: ErrCode = ErrCode::new(0x1A, "missing permissions for IO");
 
     /// unable to obtain exclusive lock
-    pub const LCK: ErrCode = ErrCode::new(
-        0x1C,
-        "failed to obtain exclusive lock as file may already opened",
-    );
+    pub const LCK: ErrCode =
+        ErrCode::new(0x1C, "failed to obtain exclusive lock as file may already opened");
 
     /// Default module id used when [`MID`] is not explicitly initialized
     const DEFAULT_MID: u8 = 0x00;

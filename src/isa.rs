@@ -254,10 +254,7 @@ mod tests {
 
                 let mut out = [0i32; 4];
                 unsafe {
-                    core::arch::x86_64::_mm_storeu_si128(
-                        out.as_mut_ptr() as *mut _,
-                        c,
-                    );
+                    core::arch::x86_64::_mm_storeu_si128(out.as_mut_ptr() as *mut _, c);
                 }
                 assert_eq!(out, [0x34; 4]);
             }
@@ -270,18 +267,14 @@ mod tests {
 
                 let mut out = [0u8; 0x10];
                 unsafe {
-                    core::arch::x86_64::_mm_storeu_si128(
-                        out.as_mut_ptr() as *mut _,
-                        res,
-                    );
+                    core::arch::x86_64::_mm_storeu_si128(out.as_mut_ptr() as *mut _, res);
                 }
                 assert_eq!(out[0], 0x04);
             }
 
             #[target_feature(enable = "sse4.2")]
             unsafe fn exec_sse4_2() {
-                let crc =
-                    core::arch::x86_64::_mm_crc32_u64(!0, 0x123456789ABCDEF0);
+                let crc = core::arch::x86_64::_mm_crc32_u64(!0, 0x123456789ABCDEF0);
                 assert_ne!(crc, 0);
             }
 
@@ -293,10 +286,7 @@ mod tests {
 
                 let mut out = [0i32; 8];
                 unsafe {
-                    core::arch::x86_64::_mm256_storeu_si256(
-                        out.as_mut_ptr() as *mut _,
-                        c,
-                    );
+                    core::arch::x86_64::_mm256_storeu_si256(out.as_mut_ptr() as *mut _, c);
                 }
                 assert_eq!(out, [0x12C; 8]);
             }

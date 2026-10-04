@@ -1,11 +1,10 @@
 use super::{FileId, err};
 use crate::{error::FrozenResult, hints};
 use libc::{
-    EACCES, EAGAIN, EBADF, EBUSY, EFAULT, EINTR, EINVAL, EIO, EISDIR, ENOENT,
-    ENOLCK, ENOSPC, ENOTDIR, EOPNOTSUPP, EPERM, EROFS, ESPIPE, EWOULDBLOCK,
-    F_OK, LOCK_EX, LOCK_NB, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_RDONLY, O_RDWR,
-    S_IRUSR, S_IWUSR, access, c_int, c_uint, c_void, close, flock, fstat,
-    ftruncate, off_t, open, pread, pwrite, size_t, stat, unlink,
+    EACCES, EAGAIN, EBADF, EBUSY, EFAULT, EINTR, EINVAL, EIO, EISDIR, ENOENT, ENOLCK, ENOSPC,
+    ENOTDIR, EOPNOTSUPP, EPERM, EROFS, ESPIPE, EWOULDBLOCK, F_OK, LOCK_EX, LOCK_NB, O_CLOEXEC,
+    O_CREAT, O_DIRECTORY, O_RDONLY, O_RDWR, S_IRUSR, S_IWUSR, access, c_int, c_uint, c_void, close,
+    flock, fstat, ftruncate, off_t, open, pread, pwrite, size_t, stat, unlink,
 };
 use std::sync::atomic;
 
@@ -55,9 +54,7 @@ impl POSIXFile {
             EIO => err::raw_error(err::HCF, err_msg),
 
             // Path syntax or resolution errors (e.g. symlink cycle, path too long)
-            libc::ELOOP | libc::ENAMETOOLONG => {
-                err::raw_error(err::INV, err_msg)
-            }
+            libc::ELOOP | libc::ENAMETOOLONG => err::raw_error(err::INV, err_msg),
 
             _ => err::raw_error(err::UNK, err_msg),
         }
@@ -205,18 +202,12 @@ impl POSIXFile {
         }
 
         if hints::unlikely(st.st_size < 0) {
-            return err::raw_error(
-                err::HCF,
-                "filesystem reported negative file size",
-            );
+            return err::raw_error(err::HCF, "filesystem reported negative file size");
         }
 
         match usize::try_from(st.st_size) {
             Ok(sz) => Ok(sz),
-            Err(_) => err::raw_error(
-                err::HCF,
-                "file size exceeds usize address space",
-            ),
+            Err(_) => err::raw_error(err::HCF, "file size exceeds usize address space"),
         }
     }
 
@@ -236,11 +227,7 @@ impl POSIXFile {
     /// our future write ops will work fine. This is mainly because `fallocate` and `f_preallocate` are
     /// best-effort physical extent reservations to guarantee disk space and reduce write latency.
     #[inline(always)]
-    pub(super) fn grow(
-        &self,
-        curr_len: usize,
-        len_to_add: usize,
-    ) -> FrozenResult<()> {
+    pub(super) fn grow(&self, curr_len: usize, len_to_add: usize) -> FrozenResult<()> {
         if len_to_add == 0 {
             return Ok(());
         }
@@ -250,17 +237,11 @@ impl POSIXFile {
             Some(len) => match off_t::try_from(len) {
                 Ok(off) if off >= 0 => off,
                 _ => {
-                    return err::raw_error(
-                        err::GRW,
-                        "target file size exceeds off_t capacity",
-                    );
+                    return err::raw_error(err::GRW, "target file size exceeds off_t capacity");
                 }
             },
             None => {
-                return err::raw_error(
-                    err::GRW,
-                    "file growth calculation overflowed usize",
-                );
+                return err::raw_error(err::GRW, "file growth calculation overflowed usize");
             }
         };
 
@@ -349,21 +330,13 @@ impl POSIXFile {
     /// POSIX syscalls are interruptible by signals, and may fail w/ `EINTR`, in such cases no progress is
     /// guaranteed, so the syscall must be retried
     #[cfg(target_os = "linux")]
-    pub(super) fn sync_range(
-        &self,
-        offset: usize,
-        len: usize,
-    ) -> FrozenResult<()> {
+    pub(super) fn sync_range(&self, offset: usize, len: usize) -> FrozenResult<()> {
         sync_file_range_raw(self.fd(), offset, len)
     }
 
     /// Read into given `buf` from specified `offset` w/ `pread` syscall
     #[inline(always)]
-    pub(super) fn pread(
-        &self,
-        buf: &mut [u8],
-        offset: usize,
-    ) -> FrozenResult<()> {
+    pub(super) fn pread(&self, buf: &mut [u8], offset: usize) -> FrozenResult<()> {
         if buf.is_empty() {
             return Ok(());
         }
@@ -553,10 +526,7 @@ fn open_raw(path: &std::path::Path, flags: c_int) -> FrozenResult<FileId> {
             // w/o the O_NOATIME flag, as some fs does not support this flag
 
             #[cfg(target_os = "linux")]
-            if errno == EPERM
-                && (flags & libc::O_NOATIME) != 0
-                && !tried_noatime
-            {
+            if errno == EPERM && (flags & libc::O_NOATIME) != 0 && !tried_noatime {
                 flags &= !libc::O_NOATIME;
                 tried_noatime = true;
                 continue;
@@ -786,18 +756,12 @@ fn fsync_raw(fd: FileId) -> FrozenResult<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn sync_file_range_raw(
-    fd: FileId,
-    offset: usize,
-    len: usize,
-) -> FrozenResult<()> {
+fn sync_file_range_raw(fd: FileId, offset: usize, len: usize) -> FrozenResult<()> {
     let flag = libc::SYNC_FILE_RANGE_WRITE;
     let mut retries = 0; // only for EINTR errors
 
     loop {
-        let res = unsafe {
-            libc::sync_file_range(fd, offset as off_t, len as off_t, flag)
-        };
+        let res = unsafe { libc::sync_file_range(fd, offset as off_t, len as off_t, flag) };
 
         if hints::likely(res == 0) {
             return Ok(());
@@ -865,11 +829,7 @@ fn sync_file_range_raw(
 /// Syscalls may fail with `EINTR`, `EAGAIN`, or `EBUSY` under signal pressure or lock contention, and are
 /// retried up to `MAX_RETRIES`
 #[cfg(target_os = "linux")]
-fn fallocate_raw(
-    fd: FileId,
-    curr_len: usize,
-    len_to_add: usize,
-) -> FrozenResult<()> {
+fn fallocate_raw(fd: FileId, curr_len: usize, len_to_add: usize) -> FrozenResult<()> {
     if len_to_add == 0 {
         return Ok(());
     }
@@ -881,10 +841,7 @@ fn fallocate_raw(
     let length = match off_t::try_from(len_to_add) {
         Ok(off) if off >= 0 => off,
         _ => {
-            return err::raw_error(
-                err::GRW,
-                "len_to_add exceeds off_t capacity",
-            );
+            return err::raw_error(err::GRW, "len_to_add exceeds off_t capacity");
         }
     };
 
@@ -935,26 +892,16 @@ fn fallocate_raw(
 ///
 /// POSIX syscalls are interruptible by signals, and may fail w/ `EINTR`, in such cases no progress is
 /// guaranteed, so the syscall must be retried
-fn ftruncate_raw(
-    fd: FileId,
-    curr_len: usize,
-    len_to_add: usize,
-) -> FrozenResult<()> {
+fn ftruncate_raw(fd: FileId, curr_len: usize, len_to_add: usize) -> FrozenResult<()> {
     let new_len = match curr_len.checked_add(len_to_add) {
         Some(len) => match off_t::try_from(len) {
             Ok(off) if off >= 0 => off,
             _ => {
-                return err::raw_error(
-                    err::GRW,
-                    "target file size exceeds off_t capacity",
-                );
+                return err::raw_error(err::GRW, "target file size exceeds off_t capacity");
             }
         },
         None => {
-            return err::raw_error(
-                err::GRW,
-                "file length calculation overflowed usize",
-            );
+            return err::raw_error(err::GRW, "file length calculation overflowed usize");
         }
     };
     let mut retries = 0; // only for EINTR errors
@@ -1049,10 +996,7 @@ fn f_preallocate_raw(fd: FileId, len_to_add: usize) -> FrozenResult<()> {
     let length = match off_t::try_from(len_to_add) {
         Ok(len) if len >= 0 => len,
         _ => {
-            return err::raw_error(
-                err::GRW,
-                "len_to_add exceeds off_t capacity",
-            );
+            return err::raw_error(err::GRW, "len_to_add exceeds off_t capacity");
         }
     };
 
@@ -1176,9 +1120,7 @@ fn sync_parent_dir(path: &std::path::Path) -> FrozenResult<()> {
 
     let fd = match open_raw(&parent, flags) {
         Ok(fd) => fd,
-        Err(e)
-            if e.reason == err::PRM.reason || e.reason == err::INV.reason =>
-        {
+        Err(e) if e.reason == err::PRM.reason || e.reason == err::INV.reason => {
             return Ok(());
         }
         Err(e) => return Err(e),
@@ -1202,11 +1144,7 @@ fn sync_parent_dir(path: &std::path::Path) -> FrozenResult<()> {
     let _ = close_raw(fd);
 
     match res {
-        Err(e)
-            if e.reason == err::HCF.reason || e.reason == err::UNK.reason =>
-        {
-            Ok(())
-        }
+        Err(e) if e.reason == err::HCF.reason || e.reason == err::UNK.reason => Ok(()),
         other => other,
     }
 }
@@ -1293,8 +1231,7 @@ fn extract_parent_dir(path: &std::path::Path) -> std::path::PathBuf {
 fn f_advise_raw(fd: FileId) -> FrozenResult<()> {
     let mut retries = 0;
     loop {
-        let res =
-            unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_RANDOM) };
+        let res = unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_RANDOM) };
         if res == 0 {
             return Ok(());
         }
@@ -1388,10 +1325,7 @@ mod tests {
             let missing_path = path.join("non_existent_file");
             let file2 = POSIXFile {
                 fd: atomic::AtomicI32::new(unsafe {
-                    libc::open(
-                        b"/dev/null\0".as_ptr() as *const _,
-                        libc::O_RDONLY,
-                    )
+                    libc::open(b"/dev/null\0".as_ptr() as *const _, libc::O_RDONLY)
                 }),
             };
             let err = file2.unlink(&missing_path).unwrap_err();
@@ -1761,11 +1695,7 @@ mod tests {
             for (input, expected) in cases {
                 let path = PathBuf::from(input);
                 let parent = extract_parent_dir(&path);
-                assert_eq!(
-                    parent,
-                    PathBuf::from(expected),
-                    "failed for input: {input}"
-                );
+                assert_eq!(parent, PathBuf::from(expected), "failed for input: {input}");
             }
         }
 
@@ -1785,9 +1715,8 @@ mod tests {
 
                 match (res, should_ok) {
                     (Ok(cs), true) => {
-                        let expected = CString::new(*bytes).expect(
-                            "valid test case must not contain interior NUL",
-                        );
+                        let expected = CString::new(*bytes)
+                            .expect("valid test case must not contain interior NUL");
                         assert_eq!(
                             cs.as_bytes(),
                             expected.as_bytes(),
@@ -1797,10 +1726,7 @@ mod tests {
                     }
                     (Err(_), false) => {}
                     (other, _) => {
-                        panic!(
-                            "unexpected result for input {:?}: {:?}",
-                            bytes, other
-                        );
+                        panic!("unexpected result for input {:?}: {:?}", bytes, other);
                     }
                 }
             }
