@@ -1,6 +1,7 @@
 //!
 
 use crate::error::{ErrCode, FrozenError, FrozenResult};
+use std::sync::atomic;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod posix;
@@ -118,11 +119,11 @@ pub struct FileCfg {
     pub initial_available_buffers: usize,
 }
 
-///
+/// Custom implementation of file handle for [`frozen_core`]
 #[derive(Debug)]
 pub struct File {
     cfg: FileCfg,
-    current_length: usize,
+    current_length: atomic::AtomicUsize,
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     file: posix::POSIXFile,
@@ -170,7 +171,7 @@ impl File {
             return Err(e);
         }
 
-        Ok(Self { cfg, file, current_length: init_len })
+        Ok(Self { cfg, file, current_length: atomic::AtomicUsize::new(init_len) })
     }
 
     /// Open an existing [`File`] while validating its layout invariants
@@ -215,7 +216,125 @@ impl File {
             return err::default_error(err::CPT);
         }
 
-        Ok(Self { cfg, file, current_length: curr_len })
+        Ok(Self { cfg, file, current_length: atomic::AtomicUsize::new(curr_len) })
+    }
+
+    /// Read bytes starting from buffer `index` into `buf` w/ `pread` syscall
+    ///
+    /// ## Multiple Buffers
+    ///
+    /// The input `buf` can span across a single or multiple buffers in memory
+    ///
+    /// ## Constraints
+    ///
+    /// - `buf.len()` must be a non-zero multiple of `cfg.buffer_size`
+    /// - Reading beyond current file length will return [`err::HCF`]
+    #[inline(always)]
+    pub fn read(&self, buf: &mut [u8], index: usize) -> FrozenResult<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+
+        if buf.len() % self.cfg.buffer_size != 0 {
+            return err::default_error(err::INV);
+        }
+
+        let offset = match index.checked_mul(self.cfg.buffer_size) {
+            Some(off) => off,
+            None => return err::default_error(err::INV),
+        };
+
+        if offset.checked_add(buf.len()).map_or(true, |end| end > self.length()) {
+            return err::default_error(err::HCF);
+        }
+
+        self.file.pread(buf, offset)
+    }
+
+    /// Write bytes starting at buffer `index` from `buf` w/ `pwrite` syscall
+    ///
+    /// ## Multiple Buffers
+    ///
+    /// The input `buf` can span across a single or multiple buffers in memory
+    ///
+    /// ## Constraints
+    ///
+    /// - `buf.len()` must be a non-zero multiple of `cfg.buffer_size`
+    /// - Writing beyond current file length will return [`err::HCF`]
+    #[inline(always)]
+    pub fn write(&self, buf: &[u8], index: usize) -> FrozenResult<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+
+        if buf.len() % self.cfg.buffer_size != 0 {
+            return err::default_error(err::INV);
+        }
+
+        let offset = match index.checked_mul(self.cfg.buffer_size) {
+            Some(off) => off,
+            None => return err::default_error(err::INV),
+        };
+
+        if offset.checked_add(buf.len()).map_or(true, |end| end > self.length()) {
+            return err::default_error(err::HCF);
+        }
+
+        self.file.pwrite(buf, offset)
+    }
+
+    /// Grow file size of [`File`] by given `count` of buffers
+    ///
+    /// After successful execution, updated file length will be `current_length + (count * buffer_size)`
+    pub fn grow(&self, count: usize) -> FrozenResult<()> {
+        if count == 0 {
+            return Ok(());
+        }
+
+        let len_to_add = match self.cfg.buffer_size.checked_mul(count) {
+            Some(len) => len,
+            None => return err::default_error(err::GRW),
+        };
+
+        let curr_len = self.current_length.load(atomic::Ordering::Acquire);
+        self.file.grow(curr_len, len_to_add)?;
+        self.current_length.fetch_add(len_to_add, atomic::Ordering::Release);
+
+        Ok(())
+    }
+
+    /// Syncs in-mem data to the storage device
+    #[inline]
+    pub fn sync(&self) -> FrozenResult<()> {
+        self.file.sync()
+    }
+
+    /// Best-effort call to prompt kernel to start flushing dirty pages in the specified chunk range
+    #[cfg(target_os = "linux")]
+    pub fn sync_range(&self, index: usize, count: usize) -> FrozenResult<()> {
+        let offset = match index.checked_mul(self.cfg.buffer_size) {
+            Some(off) => off,
+            None => return err::default_error(err::INV),
+        };
+        let len_to_sync = match count.checked_mul(self.cfg.buffer_size) {
+            Some(len) => len,
+            None => return err::default_error(err::INV),
+        };
+
+        self.file.sync_range(offset, len_to_sync)
+    }
+
+    /// Fetch total available buffers in [`File`]
+    #[inline]
+    pub fn total_buffers(&self) -> FrozenResult<usize> {
+        let curr_len = self.length();
+        let buffer_size = self.cfg.buffer_size;
+
+        if crate::hints::unlikely(curr_len % buffer_size != 0) {
+            return err::default_error(err::CPT);
+        }
+
+        Ok(curr_len / buffer_size)
     }
 
     /// Get reference to configuration of [`File`]
@@ -227,7 +346,7 @@ impl File {
     /// Read current length (in bytes) of [`File`]
     #[inline]
     pub fn length(&self) -> usize {
-        self.current_length
+        self.current_length.load(atomic::Ordering::Acquire)
     }
 
     /// Get file descriptor for [`File`]
