@@ -652,4 +652,258 @@ mod tests {
             assert_send_sync::<File>();
         }
     }
+
+    mod file_write_read {
+        use super::*;
+
+        #[test]
+        fn ok_single_buffer_write_read() {
+            let (_dir, cfg) = tmp_path();
+            let file = File::new(cfg).unwrap();
+
+            let data = [0xABu8; BUFFER_SIZE];
+            file.write(&data, 2).unwrap();
+            file.sync().unwrap();
+
+            let mut buf = [0u8; BUFFER_SIZE];
+            file.read(&mut buf, 2).unwrap();
+            assert_eq!(buf, data);
+        }
+
+        #[test]
+        fn ok_multi_buffer_write_read() {
+            let (_dir, cfg) = tmp_path();
+            let file = File::new(cfg).unwrap();
+
+            // Span across 2 buffers in a single write and read call
+            let multi_buf_data = [0x77u8; BUFFER_SIZE * 2];
+            file.write(&multi_buf_data, 1).unwrap();
+            file.sync().unwrap();
+
+            let mut read_buf = [0u8; BUFFER_SIZE * 2];
+            file.read(&mut read_buf, 1).unwrap();
+            assert_eq!(read_buf, multi_buf_data);
+
+            // Verify individual buffers also match
+            let mut chunk1 = [0u8; BUFFER_SIZE];
+            let mut chunk2 = [0u8; BUFFER_SIZE];
+            file.read(&mut chunk1, 1).unwrap();
+            file.read(&mut chunk2, 2).unwrap();
+            assert_eq!(chunk1, [0x77u8; BUFFER_SIZE]);
+            assert_eq!(chunk2, [0x77u8; BUFFER_SIZE]);
+        }
+
+        #[test]
+        fn ok_empty_buffer_noop() {
+            let (_dir, cfg) = tmp_path();
+            let file = File::new(cfg).unwrap();
+
+            assert!(file.write(&[], 0).is_ok());
+            assert!(file.read(&mut [], 0).is_ok());
+        }
+
+        #[test]
+        fn err_write_unaligned_buffer_size() {
+            let (_dir, cfg) = tmp_path();
+            let file = File::new(cfg).unwrap();
+
+            let data = [0u8; BUFFER_SIZE - 1];
+            let err = file.write(&data, 0).unwrap_err();
+            assert_eq!(err.reason, err::INV.reason);
+
+            let data_multi_unaligned = [0u8; (BUFFER_SIZE * 2) + 1];
+            let err = file.write(&data_multi_unaligned, 0).unwrap_err();
+            assert_eq!(err.reason, err::INV.reason);
+        }
+
+        #[test]
+        fn err_read_unaligned_buffer_size() {
+            let (_dir, cfg) = tmp_path();
+            let file = File::new(cfg).unwrap();
+
+            let mut buf = [0u8; BUFFER_SIZE - 1];
+            let err = file.read(&mut buf, 0).unwrap_err();
+            assert_eq!(err.reason, err::INV.reason);
+
+            let mut buf_multi_unaligned = [0u8; (BUFFER_SIZE * 2) + 3];
+            let err = file.read(&mut buf_multi_unaligned, 0).unwrap_err();
+            assert_eq!(err.reason, err::INV.reason);
+        }
+
+        #[test]
+        fn err_read_past_eof() {
+            let (_dir, cfg) = tmp_path();
+            let file = File::new(cfg).unwrap();
+
+            let mut buf = [0u8; BUFFER_SIZE];
+            let err = file.read(&mut buf, INIT_BUFFERS).unwrap_err();
+            assert_eq!(err.reason, err::HCF.reason);
+
+            // Multi-buffer read exceeding available chunks
+            let mut multi_buf = [0u8; BUFFER_SIZE * 2];
+            let err = file.read(&mut multi_buf, INIT_BUFFERS - 1).unwrap_err();
+            assert_eq!(err.reason, err::HCF.reason);
+        }
+
+        #[test]
+        fn err_write_past_eof() {
+            let (_dir, cfg) = tmp_path();
+            let file = File::new(cfg).unwrap();
+
+            let data = [1u8; BUFFER_SIZE];
+            let err = file.write(&data, INIT_BUFFERS).unwrap_err();
+            assert_eq!(err.reason, err::HCF.reason);
+
+            // Multi-buffer write exceeding available chunks
+            let multi_data = [1u8; BUFFER_SIZE * 2];
+            let err = file.write(&multi_data, INIT_BUFFERS - 1).unwrap_err();
+            assert_eq!(err.reason, err::HCF.reason);
+        }
+
+        #[test]
+        fn ok_concurrent_non_overlapping_writes() {
+            let (_dir, mut cfg) = tmp_path();
+            cfg.initial_available_buffers = 16;
+            let file = Arc::new(File::new(cfg).unwrap());
+
+            let mut handles = vec![];
+            for i in 0..4 {
+                let f = file.clone();
+                handles.push(std::thread::spawn(move || {
+                    let data = [i as u8 + 10; BUFFER_SIZE * 2];
+                    f.write(&data, i * 2).unwrap();
+                }));
+            }
+
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            file.sync().unwrap();
+
+            for i in 0..4 {
+                let mut buf = [0u8; BUFFER_SIZE * 2];
+                file.read(&mut buf, i * 2).unwrap();
+                assert_eq!(buf, [i as u8 + 10; BUFFER_SIZE * 2]);
+            }
+        }
+
+        #[test]
+        fn ok_concurrent_readers() {
+            let (_dir, cfg) = tmp_path();
+            let file = Arc::new(File::new(cfg).unwrap());
+
+            let data = [0x42u8; BUFFER_SIZE * 2];
+            file.write(&data, 0).unwrap();
+            file.sync().unwrap();
+
+            let mut handles = vec![];
+            for _ in 0..8 {
+                let f = file.clone();
+                let expected = data;
+                handles.push(std::thread::spawn(move || {
+                    let mut buf = [0u8; BUFFER_SIZE * 2];
+                    f.read(&mut buf, 0).unwrap();
+                    assert_eq!(buf, expected);
+                }));
+            }
+
+            for h in handles {
+                h.join().unwrap();
+            }
+        }
+    }
+
+    mod file_grow {
+        use super::*;
+
+        #[test]
+        fn ok_grow_updates_length() {
+            let (_dir, cfg) = tmp_path();
+            let file = File::new(cfg).unwrap();
+            assert_eq!(file.length(), BUFFER_SIZE * INIT_BUFFERS);
+            assert_eq!(file.total_buffers().unwrap(), INIT_BUFFERS);
+
+            file.grow(0x20).unwrap();
+            assert_eq!(file.length(), BUFFER_SIZE * (INIT_BUFFERS + 0x20));
+            assert_eq!(file.total_buffers().unwrap(), INIT_BUFFERS + 0x20);
+        }
+
+        #[test]
+        fn ok_grow_zero_count() {
+            let (_dir, cfg) = tmp_path();
+            let file = File::new(cfg).unwrap();
+            file.grow(0).unwrap();
+            assert_eq!(file.length(), BUFFER_SIZE * INIT_BUFFERS);
+        }
+
+        #[test]
+        fn ok_grow_and_multi_buffer_write_read() {
+            let (_dir, cfg) = tmp_path();
+            let file = File::new(cfg).unwrap();
+
+            file.grow(4).unwrap();
+            let new_index = INIT_BUFFERS;
+
+            let data = [0x55u8; BUFFER_SIZE * 3];
+            file.write(&data, new_index).unwrap();
+            file.sync().unwrap();
+
+            let mut buf = [0u8; BUFFER_SIZE * 3];
+            file.read(&mut buf, new_index).unwrap();
+            assert_eq!(buf, data);
+        }
+
+        #[test]
+        fn ok_concurrent_grow_and_write() {
+            let (_dir, cfg) = tmp_path();
+            let file = Arc::new(File::new(cfg).unwrap());
+
+            let writer = {
+                let f = file.clone();
+                std::thread::spawn(move || {
+                    for i in 0..INIT_BUFFERS {
+                        let data = [i as u8; BUFFER_SIZE];
+                        f.write(&data, i).unwrap();
+                    }
+                })
+            };
+
+            let chunks_to_grow = 0x20;
+            let grower = {
+                let f = file.clone();
+                std::thread::spawn(move || {
+                    f.grow(chunks_to_grow).unwrap();
+                })
+            };
+
+            writer.join().unwrap();
+            grower.join().unwrap();
+
+            file.sync().unwrap();
+            assert_eq!(file.length(), BUFFER_SIZE * (INIT_BUFFERS + chunks_to_grow));
+
+            for i in 0..INIT_BUFFERS {
+                let mut buf = [0u8; BUFFER_SIZE];
+                file.read(&mut buf, i).unwrap();
+                assert_eq!(buf, [i as u8; BUFFER_SIZE]);
+            }
+        }
+
+        #[test]
+        #[cfg(target_os = "linux")]
+        fn ok_sync_range() {
+            let (_dir, cfg) = tmp_path();
+            let file = File::new(cfg).unwrap();
+
+            let data = [0x33u8; BUFFER_SIZE * 2];
+            file.write(&data, 0).unwrap();
+            file.sync_range(0, 2).unwrap();
+            file.sync().unwrap();
+
+            let mut buf = [0u8; BUFFER_SIZE * 2];
+            file.read(&mut buf, 0).unwrap();
+            assert_eq!(buf, data);
+        }
+    }
 }
