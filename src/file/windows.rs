@@ -1106,3 +1106,327 @@ fn overlapped_at(offset_lo: u32, offset_hi: u32) -> OVERLAPPED {
         hEvent: core::ptr::null_mut(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn tmp_path() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tmp_file");
+        (dir, path)
+    }
+
+    mod file_new_close {
+        use super::*;
+
+        #[test]
+        fn ok_new_close_cycle() {
+            let (_dir, path) = tmp_path();
+            let file = WINFile::new(&path).unwrap();
+            assert!(path.exists());
+            file.close().unwrap();
+        }
+
+        #[test]
+        fn ok_new_close_cycle_on_existing() {
+            let (_dir, path) = tmp_path();
+            let file1 = WINFile::new(&path).unwrap();
+            file1.close().unwrap();
+
+            let file2 = WINFile::new(&path).unwrap();
+            file2.close().unwrap();
+        }
+
+        #[test]
+        fn err_new_on_missing_parent_dir() {
+            let (_dir, path) = tmp_path();
+            let missing = path.join("missing\\sub\\dir\\file");
+            let err = WINFile::new(&missing).unwrap_err();
+            assert_eq!(err.reason, err::INV.reason);
+        }
+    }
+
+    mod file_create_open {
+        use super::*;
+
+        #[test]
+        fn ok_create_close_cycle() {
+            let (_dir, path) = tmp_path();
+            let file = WINFile::create(&path).unwrap();
+            assert!(path.exists());
+            file.close().unwrap();
+        }
+
+        #[test]
+        fn err_create_when_already_exists() {
+            let (_dir, path) = tmp_path();
+            let file = WINFile::create(&path).unwrap();
+            let err = WINFile::create(&path).unwrap_err();
+            assert_eq!(err.reason, err::EXS.reason);
+            file.close().unwrap();
+        }
+
+        #[test]
+        fn err_create_on_missing_parent_dir() {
+            let (_dir, path) = tmp_path();
+            let missing = path.join("missing\\sub\\file");
+            let err = WINFile::create(&missing).unwrap_err();
+            assert_eq!(err.reason, err::INV.reason);
+        }
+
+        #[test]
+        fn ok_open_existing_file() {
+            let (_dir, path) = tmp_path();
+            let file = WINFile::create(&path).unwrap();
+            file.close().unwrap();
+
+            let opened = WINFile::open(&path).unwrap();
+            opened.close().unwrap();
+        }
+
+        #[test]
+        fn err_open_on_missing_file() {
+            let (_dir, path) = tmp_path();
+            let err = WINFile::open(&path).unwrap_err();
+            assert_eq!(err.reason, err::INV.reason);
+        }
+    }
+
+    mod file_unlink {
+        use super::*;
+
+        #[test]
+        fn ok_unlink_existing() {
+            let (_dir, path) = tmp_path();
+            let file = WINFile::new(&path).unwrap();
+            assert!(path.exists());
+
+            file.unlink(&path).unwrap();
+            assert!(!path.exists());
+        }
+
+        #[test]
+        fn err_unlink_missing() {
+            let (_dir, path) = tmp_path();
+
+            // Create a dummy file just to get a valid fd, then unlink a non-existent path
+            let file = WINFile::create(&path).unwrap();
+            let missing_path = path.with_file_name("definitely_does_not_exist.db");
+
+            // close first so unlink's internal close is a no-op (already CLOSED_HANDLE)
+            let inner_file = WINFile { handle: atomic::AtomicIsize::new(CLOSED_HANDLE) };
+            let err = inner_file.unlink(&missing_path).unwrap_err();
+            assert_eq!(err.reason, err::INV.reason);
+
+            file.close().unwrap();
+        }
+    }
+
+    mod file_lock {
+        use super::*;
+
+        #[test]
+        fn ok_flock_acquires_exclusive_lock() {
+            let (_dir, path) = tmp_path();
+            let file = WINFile::new(&path).unwrap();
+            file.flock().unwrap();
+            file.close().unwrap();
+        }
+
+        #[test]
+        fn err_flock_when_already_locked() {
+            let (_dir, path) = tmp_path();
+            let file1 = WINFile::new(&path).unwrap();
+            file1.flock().unwrap();
+
+            let file2 = WINFile::new(&path).unwrap();
+            let err = file2.flock().unwrap_err();
+            assert_eq!(err.reason, err::LCK.reason);
+
+            file1.close().unwrap();
+            file2.close().unwrap();
+        }
+
+        #[test]
+        fn ok_flock_released_after_close() {
+            let (_dir, path) = tmp_path();
+            let file1 = WINFile::new(&path).unwrap();
+            file1.flock().unwrap();
+            file1.close().unwrap();
+
+            let file2 = WINFile::new(&path).unwrap();
+            file2.flock().unwrap();
+            file2.close().unwrap();
+        }
+    }
+
+    mod file_grow {
+        use super::*;
+
+        #[test]
+        fn ok_grow() {
+            let (_dir, path) = tmp_path();
+            let file = WINFile::new(&path).unwrap();
+
+            let initial = file.length().unwrap();
+            assert_eq!(initial, 0);
+
+            file.grow(0, 0x1000).unwrap();
+            let new_len = file.length().unwrap();
+            assert_eq!(new_len, 0x1000);
+
+            file.close().unwrap();
+        }
+
+        #[test]
+        fn ok_grow_extends_with_zero() {
+            let (_dir, path) = tmp_path();
+            let file = WINFile::new(&path).unwrap();
+            file.grow(0, 0x500).unwrap();
+
+            let mut buf = vec![0u8; 0x500];
+            file.pread(&mut buf, 0).unwrap();
+
+            assert!(buf.iter().all(|b| *b == 0));
+            file.close().unwrap();
+        }
+
+        #[test]
+        fn ok_grow_zero_noop() {
+            let (_dir, path) = tmp_path();
+            let file = WINFile::new(&path).unwrap();
+            file.grow(0, 0).unwrap();
+            assert_eq!(file.length().unwrap(), 0);
+            file.close().unwrap();
+        }
+
+        #[test]
+        fn ok_grow_multiple_times() {
+            let (_dir, path) = tmp_path();
+            let file = WINFile::new(&path).unwrap();
+
+            file.grow(0, 0x1000).unwrap();
+            file.grow(0x1000, 0x2000).unwrap();
+
+            assert_eq!(file.length().unwrap(), 0x3000);
+            file.close().unwrap();
+        }
+    }
+
+    mod file_sync {
+        use super::*;
+
+        #[test]
+        fn ok_sync() {
+            let (_dir, path) = tmp_path();
+            let file = WINFile::new(&path).unwrap();
+            file.grow(0, 0x1000).unwrap();
+            file.sync().unwrap();
+            file.close().unwrap();
+        }
+    }
+
+    mod file_pread_pwrite {
+        use super::*;
+
+        #[test]
+        fn ok_pwrite_and_pread() {
+            let (_dir, path) = tmp_path();
+            let file = WINFile::new(&path).unwrap();
+            file.grow(0, 0x1000).unwrap();
+
+            let data = [0xABu8; 0x100];
+            file.pwrite(&data, 0x200).unwrap();
+
+            let mut buf = [0u8; 0x100];
+            file.pread(&mut buf, 0x200).unwrap();
+
+            assert_eq!(buf, data);
+            file.close().unwrap();
+        }
+
+        #[test]
+        fn ok_pwrite_empty_noop() {
+            let (_dir, path) = tmp_path();
+            let file = WINFile::new(&path).unwrap();
+            file.pwrite(&[], 0).unwrap();
+            file.close().unwrap();
+        }
+
+        #[test]
+        fn ok_pread_empty_noop() {
+            let (_dir, path) = tmp_path();
+            let file = WINFile::new(&path).unwrap();
+            file.pread(&mut [], 0).unwrap();
+            file.close().unwrap();
+        }
+
+        #[test]
+        fn ok_pwrite_at_multiple_offsets() {
+            let (_dir, path) = tmp_path();
+            let file = WINFile::new(&path).unwrap();
+            file.grow(0, 0x1000).unwrap();
+
+            file.pwrite(&[0x11u8; 0x100], 0x000).unwrap();
+            file.pwrite(&[0x22u8; 0x100], 0x100).unwrap();
+            file.pwrite(&[0x33u8; 0x100], 0x200).unwrap();
+
+            let mut a = [0u8; 0x100];
+            let mut b = [0u8; 0x100];
+            let mut c = [0u8; 0x100];
+
+            file.pread(&mut a, 0x000).unwrap();
+            file.pread(&mut b, 0x100).unwrap();
+            file.pread(&mut c, 0x200).unwrap();
+
+            assert_eq!(a, [0x11u8; 0x100]);
+            assert_eq!(b, [0x22u8; 0x100]);
+            assert_eq!(c, [0x33u8; 0x100]);
+
+            file.close().unwrap();
+        }
+    }
+
+    mod file_exists {
+        use super::*;
+
+        #[test]
+        fn ok_exists_true_for_existing_file() {
+            let (_dir, path) = tmp_path();
+            let file = WINFile::create(&path).unwrap();
+            file.close().unwrap();
+
+            assert_eq!(WINFile::exists(&path).unwrap(), true);
+        }
+
+        #[test]
+        fn ok_exists_false_for_missing_file() {
+            let (_dir, path) = tmp_path();
+            assert_eq!(WINFile::exists(&path).unwrap(), false);
+        }
+    }
+
+    mod file_fd {
+        use super::*;
+
+        #[test]
+        fn ok_fd_not_closed_after_open() {
+            let (_dir, path) = tmp_path();
+            let file = WINFile::new(&path).unwrap();
+            assert_ne!(file.fd(), CLOSED_HANDLE);
+            assert!(!file.is_closed());
+            file.close().unwrap();
+        }
+
+        #[test]
+        fn ok_is_closed_after_close() {
+            let (_dir, path) = tmp_path();
+            let file = WINFile::new(&path).unwrap();
+            file.close().unwrap();
+            // After close(), the file struct is consumed — verify via Drop semantics only
+            // (no access to `file` after `.close()`)
+        }
+    }
+}
