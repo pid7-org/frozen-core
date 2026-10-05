@@ -1,10 +1,11 @@
 use super::{FileId, err};
 use crate::{error::FrozenResult, hints};
 use libc::{
-    EACCES, EAGAIN, EBADF, EBUSY, EFAULT, EINTR, EINVAL, EIO, EISDIR, ENOENT, ENOLCK, ENOSPC,
-    ENOTDIR, EOPNOTSUPP, EPERM, EROFS, ESPIPE, EWOULDBLOCK, F_OK, LOCK_EX, LOCK_NB, O_CLOEXEC,
-    O_CREAT, O_DIRECTORY, O_RDONLY, O_RDWR, S_IRUSR, S_IWUSR, access, c_int, c_uint, c_void, close,
-    flock, fstat, ftruncate, off_t, open, pread, pwrite, size_t, stat, unlink,
+    EACCES, EAGAIN, EBADF, EBUSY, EEXIST, EFAULT, EINTR, EINVAL, EIO, EISDIR, ENOENT, ENOLCK,
+    ENOSPC, ENOTDIR, EOPNOTSUPP, EPERM, EROFS, ESPIPE, EWOULDBLOCK, F_OK, LOCK_EX, LOCK_NB,
+    O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_RDONLY, O_RDWR, S_IRUSR, S_IWUSR, access, c_int,
+    c_uint, c_void, close, flock, fstat, ftruncate, off_t, open, pread, pwrite, size_t, stat,
+    unlink,
 };
 use std::sync::atomic;
 
@@ -82,6 +83,41 @@ impl POSIXFile {
             let _ = file.close();
             return Err(e);
         }
+
+        // best-effort call to provide a hint to the kernel that the file will be accessed in a random pattern
+        #[cfg(target_os = "linux")]
+        if let Err(e) = f_advise_raw(file.fd()) {
+            let _ = file.close();
+            return Err(e);
+        }
+
+        Ok(file)
+    }
+
+    /// Create a new [`POSIXFile`] atomically w/ `O_CREAT | O_EXCL`
+    pub(super) fn create(path: &std::path::Path) -> FrozenResult<Self> {
+        let fd = open_raw(path, create_flags())?;
+        let file = Self { fd: atomic::AtomicI32::new(fd) };
+
+        if let Err(e) = sync_parent_dir(path) {
+            let _ = file.close();
+            return Err(e);
+        }
+
+        // best-effort call to provide a hint to the kernel that the file will be accessed in a random pattern
+        #[cfg(target_os = "linux")]
+        if let Err(e) = f_advise_raw(file.fd()) {
+            let _ = file.close();
+            return Err(e);
+        }
+
+        Ok(file)
+    }
+
+    /// Open an existing [`POSIXFile`] w/o `O_CREAT`
+    pub(super) fn open(path: &std::path::Path) -> FrozenResult<Self> {
+        let fd = open_raw(path, open_flags())?;
+        let file = Self { fd: atomic::AtomicI32::new(fd) };
 
         // best-effort call to provide a hint to the kernel that the file will be accessed in a random pattern
         #[cfg(target_os = "linux")]
@@ -550,6 +586,9 @@ fn open_raw(path: &std::path::Path, flags: c_int) -> FrozenResult<FileId> {
                 EISDIR | ENOENT | ENOTDIR => {
                     return err::raw_error(err::INV, err_msg);
                 }
+
+                // file already exists (O_CREAT | O_EXCL)
+                EEXIST => return err::raw_error(err::EXS, err_msg),
 
                 // permission denied or read-only fs
                 EACCES | EPERM | EROFS => {
@@ -1168,9 +1207,42 @@ const fn prep_flags() -> c_int {
 }
 
 /// preps flags for `open()` syscall
+///
+/// ## Why no `O_NOATIME` on macOS?
+///
+/// Unlike Linux, Darwin (macOS/XNU) does not support or even define the `O_NOATIME` flag for
+/// `open()` syscall
+///
+/// In macOS, `atime` updates can only be disabled globally at mount-time (`mount -o noatime`),
+/// and Apple's POSIX layer does not provide any per-descriptor flag to bypass access time writes,
+/// so we simply omit it
 #[cfg(target_os = "macos")]
 const fn prep_flags() -> c_int {
     return O_RDWR | O_CLOEXEC | O_CREAT;
+}
+
+/// preps flags for atomic file creation (`O_CREAT | O_EXCL`)
+#[cfg(target_os = "linux")]
+const fn create_flags() -> c_int {
+    O_RDWR | O_CLOEXEC | libc::O_NOATIME | O_CREAT | O_EXCL
+}
+
+/// preps flags for atomic file creation (`O_CREAT | O_EXCL`)
+#[cfg(target_os = "macos")]
+const fn create_flags() -> c_int {
+    return O_RDWR | O_CLOEXEC | O_CREAT | O_EXCL;
+}
+
+/// preps flags for opening existing file (without `O_CREAT`)
+#[cfg(target_os = "linux")]
+const fn open_flags() -> c_int {
+    O_RDWR | O_CLOEXEC | libc::O_NOATIME
+}
+
+/// preps flags for opening existing file (without `O_CREAT`)
+#[cfg(target_os = "macos")]
+const fn open_flags() -> c_int {
+    return O_RDWR | O_CLOEXEC;
 }
 
 /// convert a `std::path::Path` into `std::ffi::CString`
