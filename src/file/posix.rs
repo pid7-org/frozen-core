@@ -21,7 +21,6 @@ pub(super) struct POSIXFile {
     fd: atomic::AtomicI32,
 }
 
-#[allow(unused)]
 impl POSIXFile {
     /// Read file descriptor of [`POSIXFile`]
     pub(super) fn fd(&self) -> FileId {
@@ -74,6 +73,7 @@ impl POSIXFile {
     ///
     /// In our case, when a new [`FrozenFile`] is created, we zero-extend it using `ftruncate()`, and perform
     /// `fdatasync()` or `fcntl(F_FULLSYNC)`, which in result provides us the crash safe durability we need
+    #[allow(unused)]
     pub(super) fn new(path: &std::path::Path) -> FrozenResult<Self> {
         let fd = open_raw(path, prep_flags())?;
         let file = Self { fd: atomic::AtomicI32::new(fd) };

@@ -349,11 +349,46 @@ impl File {
         self.current_length.load(atomic::Ordering::Acquire)
     }
 
+    /// Check if [`File`] exists on storage device or not
+    ///
+    /// ## Access Semantics
+    ///
+    /// Uses `access(path, F_OK)` to verify the existence of the file
+    #[inline]
+    pub fn exists(&self) -> FrozenResult<bool> {
+        posix::POSIXFile::exists(&self.cfg.path)
+    }
+
+    /// Deletes the [`File`] entry from the storage device
+    ///
+    /// Consumes `self` by value to prevent any concurrent or post-deletion operations
+    ///
+    /// Unlinks the file at `path`, closes the underlying descriptor, and syncs the parent directory to
+    /// guarantee crash-safe durability
+    pub fn delete(self) -> FrozenResult<()> {
+        let this = core::mem::ManuallyDrop::new(self);
+        let cfg = unsafe { core::ptr::read(&this.cfg) };
+        let file = unsafe { core::ptr::read(&this.file) };
+
+        file.unlink(&cfg.path)
+    }
+
     /// Get file descriptor for [`File`]
     #[inline]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub fn fd(&self) -> FileId {
         self.file.fd()
+    }
+}
+
+impl Drop for File {
+    fn drop(&mut self) {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if self.fd() == posix::CLOSED_FD {
+            return;
+        }
+
+        let _ = self.sync();
     }
 }
 
