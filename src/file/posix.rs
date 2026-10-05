@@ -1409,6 +1409,66 @@ mod tests {
         }
     }
 
+    mod file_create_open {
+        use super::*;
+
+        #[test]
+        fn ok_create_close_cycle() {
+            let (_dir, path) = tmp_path();
+            let file = POSIXFile::create(&path).unwrap();
+            assert!(path.exists());
+            file.close().unwrap();
+        }
+
+        #[test]
+        fn err_create_when_already_exists() {
+            let (_dir, path) = tmp_path();
+            let file = POSIXFile::create(&path).unwrap();
+            let err = POSIXFile::create(&path).unwrap_err();
+            assert_eq!(err.reason, err::EXS.reason);
+            file.close().unwrap();
+        }
+
+        #[test]
+        fn err_create_on_missing_parent_dir() {
+            let (_dir, path) = tmp_path();
+            let missing = path.join("missing/sub/dir/file");
+            let err = POSIXFile::create(&missing).unwrap_err();
+            assert_eq!(err.reason, err::INV.reason);
+        }
+
+        #[test]
+        fn err_create_on_directory() {
+            let dir = tempfile::tempdir().unwrap();
+            let err = POSIXFile::create(dir.path()).unwrap_err();
+            assert_eq!(err.reason, err::EXS.reason);
+        }
+
+        #[test]
+        fn ok_open_existing_file() {
+            let (_dir, path) = tmp_path();
+            let file = POSIXFile::create(&path).unwrap();
+            file.close().unwrap();
+
+            let opened = POSIXFile::open(&path).unwrap();
+            opened.close().unwrap();
+        }
+
+        #[test]
+        fn err_open_on_missing_file() {
+            let (_dir, path) = tmp_path();
+            let err = POSIXFile::open(&path).unwrap_err();
+            assert_eq!(err.reason, err::INV.reason);
+        }
+
+        #[test]
+        fn err_open_on_directory() {
+            let dir = tempfile::tempdir().unwrap();
+            let err = POSIXFile::open(dir.path()).unwrap_err();
+            assert_eq!(err.reason, err::INV.reason);
+        }
+    }
+
     mod file_unlink {
         use super::*;
 
