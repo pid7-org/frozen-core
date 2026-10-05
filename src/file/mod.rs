@@ -941,4 +941,146 @@ mod tests {
             assert_eq!(buf, data);
         }
     }
+
+    mod file_delete_exists {
+        use super::*;
+
+        #[test]
+        fn ok_exists_true_on_created_file() {
+            let (_dir, cfg) = tmp_path();
+            let file = File::new(cfg.clone()).unwrap();
+
+            assert!(file.exists().unwrap());
+            assert!(cfg.path.exists());
+        }
+
+        #[test]
+        fn ok_delete_removes_file() {
+            let (_dir, cfg) = tmp_path();
+            let file = File::new(cfg.clone()).unwrap();
+            let path = cfg.path.clone();
+
+            assert!(file.exists().unwrap());
+            file.delete().unwrap();
+
+            assert!(!path.exists());
+            // Re-creating the file at the unlinked path should succeed
+            assert!(File::new(cfg).is_ok());
+        }
+
+        #[test]
+        fn ok_open_and_delete() {
+            let (_dir, cfg) = tmp_path();
+            let file = File::new(cfg.clone()).unwrap();
+            drop(file);
+
+            let opened = File::open(cfg.clone()).unwrap();
+            assert!(opened.exists().unwrap());
+            opened.delete().unwrap();
+
+            assert!(!cfg.path.exists());
+        }
+
+        #[test]
+        fn ok_exists_false_after_external_removal() {
+            let (_dir, cfg) = tmp_path();
+            let file = File::new(cfg.clone()).unwrap();
+            assert!(file.exists().unwrap());
+
+            std::fs::remove_file(&cfg.path).unwrap();
+            assert!(!file.exists().unwrap());
+        }
+
+        #[test]
+        fn err_delete_when_unlinked_externally() {
+            let (_dir, cfg) = tmp_path();
+            let file = File::new(cfg.clone()).unwrap();
+
+            std::fs::remove_file(&cfg.path).unwrap();
+            let err = file.delete().unwrap_err();
+            assert_eq!(err.reason, err::INV.reason);
+        }
+
+        #[test]
+        fn err_delete_permission_denied() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let dir = tempfile::tempdir().unwrap();
+            let sub_dir = dir.path().join("readonly_dir");
+            std::fs::create_dir(&sub_dir).unwrap();
+
+            let path = sub_dir.join("victim.db");
+            let cfg = FileCfg {
+                module_id: MID,
+                path,
+                buffer_size: BUFFER_SIZE,
+                initial_available_buffers: INIT_BUFFERS,
+            };
+
+            let file = File::new(cfg).unwrap();
+
+            std::fs::set_permissions(&sub_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+            let err = file.delete().unwrap_err();
+
+            std::fs::set_permissions(&sub_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            assert_eq!(err.reason, err::PRM.reason);
+        }
+
+        #[test]
+        fn ok_delete_and_recreate_cycle() {
+            let (_dir, cfg) = tmp_path();
+
+            for i in 0..3 {
+                let file = File::new(cfg.clone()).unwrap();
+                let data = [i as u8; BUFFER_SIZE];
+                file.write(&data, 0).unwrap();
+                assert!(file.exists().unwrap());
+
+                file.delete().unwrap();
+                assert!(!cfg.path.exists());
+            }
+        }
+    }
+
+    mod file_drop {
+        use super::*;
+
+        #[test]
+        fn ok_drop_persists_written_data() {
+            let (_dir, cfg) = tmp_path();
+            let data = [0x7Au8; BUFFER_SIZE * 2];
+
+            {
+                let file = File::new(cfg.clone()).unwrap();
+                file.write(&data, 0).unwrap();
+                // drop file without explicit file.sync()
+                drop(file);
+            }
+
+            {
+                let opened = File::open(cfg).unwrap();
+                let mut buf = [0u8; BUFFER_SIZE * 2];
+                opened.read(&mut buf, 0).unwrap();
+                assert_eq!(buf, data);
+            }
+        }
+
+        #[test]
+        fn ok_drop_releases_exclusive_lock() {
+            let (_dir, cfg) = tmp_path();
+
+            let file = File::new(cfg.clone()).unwrap();
+            // Opening another instance while locked fails with LCK
+            let err = File::open(cfg.clone()).unwrap_err();
+            assert_eq!(err.reason, err::LCK.reason);
+
+            drop(file);
+
+            // Once dropped, the exclusive lock is released and open succeeds
+            let opened = File::open(cfg);
+            assert!(opened.is_ok());
+        }
+    }
 }
