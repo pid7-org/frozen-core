@@ -1,10 +1,16 @@
 //!
 
-use crate::error::{ErrCode, FrozenError, FrozenResult};
-use std::sync::atomic;
+mod interface;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod posix;
+
+use crate::error::{ErrCode, FrozenError, FrozenResult};
+use interface::FileInterface;
+use std::sync::atomic;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(in crate::file) type PlatformFile = posix::POSIXFile;
 
 /// Error codes for [`File`] module
 pub(in crate::file) mod err {
@@ -92,6 +98,10 @@ pub(in crate::file) mod err {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub type FileId = libc::c_int;
 
+/// File handle of [`File`]
+#[cfg(target_os = "windows")]
+pub type FileId = *mut core::ffi::c_void;
+
 /// Configurations for [`frozen_core::file::File`]
 #[derive(Debug, Clone)]
 pub struct FileCfg {
@@ -124,9 +134,7 @@ pub struct FileCfg {
 pub struct File {
     cfg: FileCfg,
     current_length: atomic::AtomicUsize,
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    file: posix::POSIXFile,
+    file: PlatformFile,
 }
 
 unsafe impl Send for File {}
@@ -154,7 +162,7 @@ impl File {
             None => return err::default_error(err::GRW),
         };
 
-        let file = posix::POSIXFile::create(&cfg.path)?;
+        let file = PlatformFile::create(&cfg.path)?;
 
         if let Err(e) = file.flock() {
             let _ = file.close();
@@ -196,7 +204,7 @@ impl File {
             None => return err::default_error(err::CPT),
         };
 
-        let file = posix::POSIXFile::open(&cfg.path)?;
+        let file = PlatformFile::open(&cfg.path)?;
 
         if let Err(e) = file.flock() {
             let _ = file.close();
@@ -356,7 +364,7 @@ impl File {
     /// Uses `access(path, F_OK)` to verify the existence of the file
     #[inline]
     pub fn exists(&self) -> FrozenResult<bool> {
-        posix::POSIXFile::exists(&self.cfg.path)
+        PlatformFile::exists(&self.cfg.path)
     }
 
     /// Deletes the [`File`] entry from the storage device
@@ -373,9 +381,8 @@ impl File {
         file.unlink(&cfg.path)
     }
 
-    /// Get file descriptor for [`File`]
+    /// Get file descriptor or handle for [`File`]
     #[inline]
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub fn fd(&self) -> FileId {
         self.file.fd()
     }
@@ -383,8 +390,7 @@ impl File {
 
 impl Drop for File {
     fn drop(&mut self) {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        if self.fd() == posix::CLOSED_FD {
+        if self.file.is_closed() {
             return;
         }
 
@@ -425,7 +431,7 @@ mod tests {
             let expected_len = BUFFER_SIZE * INIT_BUFFERS;
             assert_eq!(file.length(), expected_len);
             assert_eq!(file.cfg().buffer_size, BUFFER_SIZE);
-            assert_ne!(file.fd(), posix::CLOSED_FD);
+            assert_ne!(file.fd(), PlatformFile::CLOSED_ID);
             assert!(cfg.path.exists());
         }
 

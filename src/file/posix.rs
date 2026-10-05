@@ -1,4 +1,4 @@
-use super::{FileId, err};
+use super::{err, interface::FileInterface};
 use crate::{error::FrozenResult, hints};
 use libc::{
     EACCES, EAGAIN, EBADF, EBUSY, EEXIST, EFAULT, EINTR, EINVAL, EIO, EISDIR, ENOENT, ENOLCK,
@@ -8,6 +8,9 @@ use libc::{
     unlink,
 };
 use std::sync::atomic;
+
+/// File descriptor type for POSIX systems
+pub(super) type FileId = c_int;
 
 /// Placeholder value for when current fd is closed
 pub(in crate::file) const CLOSED_FD: FileId = FileId::MIN;
@@ -21,9 +24,12 @@ pub(super) struct POSIXFile {
     fd: atomic::AtomicI32,
 }
 
-impl POSIXFile {
+impl FileInterface for POSIXFile {
+    type Id = FileId;
+    const CLOSED_ID: Self::Id = CLOSED_FD;
+
     /// Read file descriptor of [`POSIXFile`]
-    pub(super) fn fd(&self) -> FileId {
+    fn fd(&self) -> FileId {
         self.fd.load(atomic::Ordering::Acquire)
     }
 
@@ -32,7 +38,7 @@ impl POSIXFile {
     /// ## Access Semantics
     ///
     /// Uses `access(path, F_OK)` to verify the existence of the file
-    pub(super) fn exists(path: &std::path::Path) -> FrozenResult<bool> {
+    fn exists(path: &std::path::Path) -> FrozenResult<bool> {
         let cpath = path_to_cstring(path)?;
         let res = unsafe { access(cpath.as_ptr(), F_OK) };
 
@@ -60,42 +66,8 @@ impl POSIXFile {
         }
     }
 
-    /// Create a new or open an existing [`POSIXFile`]
-    ///
-    /// ## Crash safe durability
-    ///
-    /// In POSIX systems, `open(O_CREATE)` only creates the directory entry in memory, it may be visible
-    /// immediately, but the file entry is not crash durable on many fs
-    ///
-    /// On some linux systems, journaling fs (ext4, xfs, etc) often replay their journal on mount after a crash is
-    /// observed, which usually restores recent directory updates, i.e. our newly created file entry, as a result
-    /// newly created file often survive the crash
-    ///
-    /// In our case, when a new [`FrozenFile`] is created, we zero-extend it using `ftruncate()`, and perform
-    /// `fdatasync()` or `fcntl(F_FULLSYNC)`, which in result provides us the crash safe durability we need
-    #[allow(unused)]
-    pub(super) fn new(path: &std::path::Path) -> FrozenResult<Self> {
-        let fd = open_raw(path, prep_flags())?;
-        let file = Self { fd: atomic::AtomicI32::new(fd) };
-
-        // Ensure newly created directory entries are persisted to disk
-        if let Err(e) = sync_parent_dir(path) {
-            let _ = file.close();
-            return Err(e);
-        }
-
-        // best-effort call to provide a hint to the kernel that the file will be accessed in a random pattern
-        #[cfg(target_os = "linux")]
-        if let Err(e) = f_advise_raw(file.fd()) {
-            let _ = file.close();
-            return Err(e);
-        }
-
-        Ok(file)
-    }
-
     /// Create a new [`POSIXFile`] atomically w/ `O_CREAT | O_EXCL`
-    pub(super) fn create(path: &std::path::Path) -> FrozenResult<Self> {
+    fn create(path: &std::path::Path) -> FrozenResult<Self> {
         let fd = open_raw(path, create_flags())?;
         let file = Self { fd: atomic::AtomicI32::new(fd) };
 
@@ -115,7 +87,7 @@ impl POSIXFile {
     }
 
     /// Open an existing [`POSIXFile`] w/o `O_CREAT`
-    pub(super) fn open(path: &std::path::Path) -> FrozenResult<Self> {
+    fn open(path: &std::path::Path) -> FrozenResult<Self> {
         let fd = open_raw(path, open_flags())?;
         let file = Self { fd: atomic::AtomicI32::new(fd) };
 
@@ -149,7 +121,7 @@ impl POSIXFile {
     ///
     /// POSIX syscalls are interruptible by signals, and may fail w/ `EINTR`, in such cases no progress is guaranteed,
     /// so the syscall must be retried
-    pub(super) fn flock(&self) -> FrozenResult<()> {
+    fn flock(&self) -> FrozenResult<()> {
         flock_raw(self.fd())
     }
 
@@ -167,7 +139,7 @@ impl POSIXFile {
     ///
     /// this provides strong durability for the storage engine, and if `EIO` occurs, anyhow, we treat it as `err::HCF`
     /// i.e. impl failure
-    pub(super) fn close(self) -> FrozenResult<()> {
+    fn close(self) -> FrozenResult<()> {
         let fd = self.fd.swap(CLOSED_FD, atomic::Ordering::AcqRel);
         if fd == CLOSED_FD {
             return Ok(());
@@ -185,7 +157,7 @@ impl POSIXFile {
     /// might recreate or replace the file at `path` in the window between `close` and `unlink`.
     /// The filesystem reclaims the file's data blocks and inode once all active handles
     /// (including `self`) are closed.
-    pub(super) fn unlink(self, path: &std::path::Path) -> FrozenResult<()> {
+    fn unlink(self, path: &std::path::Path) -> FrozenResult<()> {
         let cpath = path_to_cstring(path)?;
 
         let res = unsafe { unlink(cpath.as_ptr()) };
@@ -221,7 +193,7 @@ impl POSIXFile {
     }
 
     /// Read current length of [`POSIXFile`] using file metadata (w/ `fstat` syscall)
-    pub(super) fn length(&self) -> FrozenResult<usize> {
+    fn length(&self) -> FrozenResult<usize> {
         let mut st = unsafe { core::mem::zeroed::<stat>() };
         let res = unsafe { fstat(self.fd(), &mut st) };
 
@@ -263,7 +235,7 @@ impl POSIXFile {
     /// our future write ops will work fine. This is mainly because `fallocate` and `f_preallocate` are
     /// best-effort physical extent reservations to guarantee disk space and reduce write latency.
     #[inline(always)]
-    pub(super) fn grow(&self, curr_len: usize, len_to_add: usize) -> FrozenResult<()> {
+    fn grow(&self, curr_len: usize, len_to_add: usize) -> FrozenResult<()> {
         if len_to_add == 0 {
             return Ok(());
         }
@@ -328,7 +300,7 @@ impl POSIXFile {
     /// To guard this, we fallback to `fsync()`, which does not guarantee durability for sudden crash or
     /// power loss, which is acceptable when strong durability is simply not available or allowed
     #[cfg(target_os = "macos")]
-    pub(super) fn sync(&self) -> FrozenResult<()> {
+    fn sync(&self) -> FrozenResult<()> {
         f_fullsync_raw(self.fd())
     }
 
@@ -347,32 +319,13 @@ impl POSIXFile {
     /// With combination of `O_NOATIME` and `fdatasync()`, we avoid non-essential metadata updates, such as
     /// access time (`atime`), modification time (`mtime`), and other bookkeeping info
     #[cfg(target_os = "linux")]
-    pub(super) fn sync(&self) -> FrozenResult<()> {
+    fn sync(&self) -> FrozenResult<()> {
         fdatasync_raw(self.fd())
-    }
-
-    /// Initiates writeback (best-effort) of dirty pages in the specified range
-    ///
-    /// ## Purpose
-    ///
-    /// In our case, `sync_range` is used as a prompt for the kernel to start flushing dirty pages in the
-    /// specified range, which result in reduced latency for `fdatasync` and `fcntl(F_FULLSYNC)` syscalls
-    ///
-    /// This syscall, by itself, does not guarantee any kind of durability, and must always be paired with
-    /// strong sync call i.e. `fdatasync()`
-    ///
-    /// ## Why do we retry?
-    ///
-    /// POSIX syscalls are interruptible by signals, and may fail w/ `EINTR`, in such cases no progress is
-    /// guaranteed, so the syscall must be retried
-    #[cfg(target_os = "linux")]
-    pub(super) fn sync_range(&self, offset: usize, len: usize) -> FrozenResult<()> {
-        sync_file_range_raw(self.fd(), offset, len)
     }
 
     /// Read into given `buf` from specified `offset` w/ `pread` syscall
     #[inline(always)]
-    pub(super) fn pread(&self, buf: &mut [u8], offset: usize) -> FrozenResult<()> {
+    fn pread(&self, buf: &mut [u8], offset: usize) -> FrozenResult<()> {
         if buf.is_empty() {
             return Ok(());
         }
@@ -440,7 +393,7 @@ impl POSIXFile {
 
     /// Write given `buf` at specified `offset` w/ `pwrite` syscall
     #[inline(always)]
-    pub(super) fn pwrite(&self, buf: &[u8], offset: usize) -> FrozenResult<()> {
+    fn pwrite(&self, buf: &[u8], offset: usize) -> FrozenResult<()> {
         if buf.is_empty() {
             return Ok(());
         }
@@ -514,6 +467,61 @@ impl POSIXFile {
         }
 
         Ok(())
+    }
+}
+
+impl POSIXFile {
+    /// Create a new or open an existing [`POSIXFile`]
+    ///
+    /// ## Crash safe durability
+    ///
+    /// In POSIX systems, `open(O_CREATE)` only creates the directory entry in memory, it may be visible
+    /// immediately, but the file entry is not crash durable on many fs
+    ///
+    /// On some linux systems, journaling fs (ext4, xfs, etc) often replay their journal on mount after a crash is
+    /// observed, which usually restores recent directory updates, i.e. our newly created file entry, as a result
+    /// newly created file often survive the crash
+    ///
+    /// In our case, when a new [`FrozenFile`] is created, we zero-extend it using `ftruncate()`, and perform
+    /// `fdatasync()` or `fcntl(F_FULLSYNC)`, which in result provides us the crash safe durability we need
+    #[allow(unused)]
+    pub(super) fn new(path: &std::path::Path) -> FrozenResult<Self> {
+        let fd = open_raw(path, prep_flags())?;
+        let file = Self { fd: atomic::AtomicI32::new(fd) };
+
+        // Ensure newly created directory entries are persisted to disk
+        if let Err(e) = sync_parent_dir(path) {
+            let _ = file.close();
+            return Err(e);
+        }
+
+        // best-effort call to provide a hint to the kernel that the file will be accessed in a random pattern
+        #[cfg(target_os = "linux")]
+        if let Err(e) = f_advise_raw(file.fd()) {
+            let _ = file.close();
+            return Err(e);
+        }
+
+        Ok(file)
+    }
+
+    /// Initiates writeback (best-effort) of dirty pages in the specified range
+    ///
+    /// ## Purpose
+    ///
+    /// In our case, `sync_range` is used as a prompt for the kernel to start flushing dirty pages in the
+    /// specified range, which result in reduced latency for `fdatasync` and `fcntl(F_FULLSYNC)` syscalls
+    ///
+    /// This syscall, by itself, does not guarantee any kind of durability, and must always be paired with
+    /// strong sync call i.e. `fdatasync()`
+    ///
+    /// ## Why do we retry?
+    ///
+    /// POSIX syscalls are interruptible by signals, and may fail w/ `EINTR`, in such cases no progress is
+    /// guaranteed, so the syscall must be retried
+    #[cfg(target_os = "linux")]
+    pub(super) fn sync_range(&self, offset: usize, len: usize) -> FrozenResult<()> {
+        sync_file_range_raw(self.fd(), offset, len)
     }
 }
 
