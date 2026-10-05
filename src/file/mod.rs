@@ -5,12 +5,18 @@ mod interface;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod posix;
 
+#[cfg(target_os = "windows")]
+mod windows;
+
 use crate::error::{ErrCode, FrozenError, FrozenResult};
 use interface::FileInterface;
 use std::sync::atomic;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(in crate::file) type PlatformFile = posix::POSIXFile;
+
+#[cfg(target_os = "windows")]
+pub(in crate::file) type PlatformFile = windows::WINFile;
 
 /// Error codes for [`File`] module
 pub(in crate::file) mod err {
@@ -99,8 +105,13 @@ pub(in crate::file) mod err {
 pub type FileId = libc::c_int;
 
 /// File handle of [`File`]
+///
+/// ## NOTE
+///
+/// On Windows, kernel HANDLE's are pointer sized but are stored as `isize` for atomic access; while the
+/// `INVALID_HANDLE_VALUE` maps to `-1isize`, which is [`windows::CLOSED_HANDLE`]
 #[cfg(target_os = "windows")]
-pub type FileId = *mut core::ffi::c_void;
+pub type FileId = isize;
 
 /// Configurations for [`frozen_core::file::File`]
 #[derive(Debug, Clone)]
@@ -133,8 +144,8 @@ pub struct FileCfg {
 #[derive(Debug)]
 pub struct File {
     cfg: FileCfg,
-    current_length: atomic::AtomicUsize,
     file: PlatformFile,
+    current_length: atomic::AtomicUsize,
 }
 
 unsafe impl Send for File {}
@@ -1008,6 +1019,7 @@ mod tests {
         }
 
         #[test]
+        #[cfg(unix)]
         fn err_delete_permission_denied() {
             use std::os::unix::fs::PermissionsExt;
 
@@ -1024,12 +1036,29 @@ mod tests {
             };
 
             let file = File::new(cfg).unwrap();
-
             std::fs::set_permissions(&sub_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
 
             let err = file.delete().unwrap_err();
-
             std::fs::set_permissions(&sub_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            assert_eq!(err.reason, err::PRM.reason);
+        }
+
+        #[test]
+        #[cfg(windows)]
+        fn err_delete_permission_denied() {
+            let (_dir, cfg) = tmp_path();
+            let file = File::new(cfg.clone()).unwrap();
+
+            let mut perms = std::fs::metadata(&cfg.path).unwrap().permissions();
+            perms.set_readonly(true);
+            std::fs::set_permissions(&cfg.path, perms).unwrap();
+
+            let err = file.delete().unwrap_err();
+
+            let mut perms = std::fs::metadata(&cfg.path).unwrap().permissions();
+            perms.set_readonly(false);
+            let _ = std::fs::set_permissions(&cfg.path, perms);
 
             assert_eq!(err.reason, err::PRM.reason);
         }
