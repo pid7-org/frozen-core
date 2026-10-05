@@ -66,7 +66,7 @@ pub(in crate::file) mod err {
 
     /// Initialize the module identifier used for [`File`] error propagation.
     ///
-    /// Returns `Ok(())` if set successfully, or `Err(already_set_id)` if it was already initialized.
+    /// Returns `Ok(())` if set successfully, or `Err(already_set_id)` if it was already initialized
     pub(in crate::file) fn init_mid(id: u8) -> Result<(), u8> {
         MID.set(id)
     }
@@ -118,7 +118,7 @@ pub struct FileCfg {
     pub initial_available_buffers: usize,
 }
 
-/// Custom implementation of file handle for [`frozen_core`]
+///
 #[derive(Debug)]
 pub struct File {
     cfg: FileCfg,
@@ -235,5 +235,302 @@ impl File {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub fn fd(&self) -> FileId {
         self.file.fd()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+
+    const MID: u8 = 0;
+    const BUFFER_SIZE: usize = 0x10;
+    const INIT_BUFFERS: usize = 4;
+
+    fn tmp_path() -> (tempfile::TempDir, FileCfg) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tmp_file");
+        let cfg = FileCfg {
+            module_id: MID,
+            path,
+            buffer_size: BUFFER_SIZE,
+            initial_available_buffers: INIT_BUFFERS,
+        };
+
+        (dir, cfg)
+    }
+
+    mod file_new {
+        use super::*;
+
+        #[test]
+        fn ok_new_creates_file_with_correct_length() {
+            let (_dir, cfg) = tmp_path();
+            let file = File::new(cfg.clone()).unwrap();
+
+            let expected_len = BUFFER_SIZE * INIT_BUFFERS;
+            assert_eq!(file.length(), expected_len);
+            assert_eq!(file.cfg().buffer_size, BUFFER_SIZE);
+            assert_ne!(file.fd(), posix::CLOSED_FD);
+            assert!(cfg.path.exists());
+        }
+
+        #[test]
+        fn err_new_when_already_exists() {
+            let (_dir, cfg) = tmp_path();
+            let file = File::new(cfg.clone()).unwrap();
+            drop(file);
+
+            // Attempting to create again on an existing path must fail w/ EXS
+            let err = File::new(cfg).unwrap_err();
+            assert_eq!(err.reason, err::EXS.reason);
+        }
+
+        #[test]
+        fn err_new_invalid_cfg() {
+            let (_dir, mut cfg) = tmp_path();
+
+            cfg.buffer_size = 0;
+            let err = File::new(cfg.clone()).unwrap_err();
+            assert_eq!(err.reason, err::INV.reason);
+
+            cfg.buffer_size = BUFFER_SIZE;
+            cfg.initial_available_buffers = 0;
+            let err = File::new(cfg).unwrap_err();
+            assert_eq!(err.reason, err::INV.reason);
+        }
+
+        #[test]
+        fn err_new_missing_parent_dir() {
+            let (_dir, mut cfg) = tmp_path();
+            cfg.path = cfg.path.join("missing/sub/dir/file.db");
+
+            let err = File::new(cfg).unwrap_err();
+            assert_eq!(err.reason, err::INV.reason);
+        }
+    }
+
+    mod file_open {
+        use super::*;
+
+        #[test]
+        fn ok_open_existing_valid_file() {
+            let (_dir, cfg) = tmp_path();
+
+            {
+                let file = File::new(cfg.clone()).unwrap();
+                assert_eq!(file.length(), BUFFER_SIZE * INIT_BUFFERS);
+            }
+
+            let file = File::open(cfg).unwrap();
+            assert_eq!(file.length(), BUFFER_SIZE * INIT_BUFFERS);
+        }
+
+        #[test]
+        fn err_open_missing_file() {
+            let (_dir, cfg) = tmp_path();
+
+            let err = File::open(cfg).unwrap_err();
+            assert_eq!(err.reason, err::INV.reason);
+        }
+
+        #[test]
+        fn err_open_invalid_cfg() {
+            let (_dir, mut cfg) = tmp_path();
+
+            cfg.buffer_size = 0;
+            let err = File::open(cfg.clone()).unwrap_err();
+            assert_eq!(err.reason, err::INV.reason);
+
+            cfg.buffer_size = BUFFER_SIZE;
+            cfg.initial_available_buffers = 0;
+            let err = File::open(cfg).unwrap_err();
+            assert_eq!(err.reason, err::INV.reason);
+        }
+
+        #[test]
+        fn err_open_when_file_smaller_than_init_len() {
+            let (_dir, cfg) = tmp_path();
+
+            // Create an empty file (size 0 < init_len)
+            std::fs::write(&cfg.path, []).unwrap();
+
+            let err = File::open(cfg).unwrap_err();
+            assert_eq!(err.reason, err::CPT.reason);
+        }
+
+        #[test]
+        fn err_open_when_file_not_buffer_multiple() {
+            let (_dir, cfg) = tmp_path();
+
+            // Create a file with size larger than init_len, but not a multiple of buffer_size
+            let non_aligned_len = (BUFFER_SIZE * INIT_BUFFERS) + 3;
+            std::fs::write(&cfg.path, vec![0u8; non_aligned_len]).unwrap();
+
+            let err = File::open(cfg).unwrap_err();
+            assert_eq!(err.reason, err::CPT.reason);
+        }
+    }
+
+    mod file_toctou_and_concurrency {
+        use super::*;
+
+        #[test]
+        fn err_concurrent_new_exact_same_path() {
+            let (_dir, cfg) = tmp_path();
+            let barrier = Arc::new(Barrier::new(2));
+
+            let t1 = {
+                let cfg = cfg.clone();
+                let b = barrier.clone();
+                std::thread::spawn(move || {
+                    b.wait();
+                    File::new(cfg)
+                })
+            };
+
+            let t2 = {
+                let cfg = cfg;
+                let b = barrier;
+                std::thread::spawn(move || {
+                    b.wait();
+                    File::new(cfg)
+                })
+            };
+
+            let r1 = t1.join().unwrap();
+            let r2 = t2.join().unwrap();
+
+            // Due to atomic O_CREAT | O_EXCL, exactly one MUST succeed and the other MUST fail with EXS
+            match (r1, r2) {
+                (Ok(f), Err(e)) | (Err(e), Ok(f)) => {
+                    assert_eq!(e.reason, err::EXS.reason);
+                    assert_eq!(f.length(), BUFFER_SIZE * INIT_BUFFERS);
+                }
+                (Ok(_), Ok(_)) => {
+                    panic!("TOCTOU violation: both concurrent File::new succeeded on same path!");
+                }
+                (Err(e1), Err(e2)) => {
+                    panic!("Unexpected failure of both threads: {:?}, {:?}", e1, e2);
+                }
+            }
+        }
+
+        #[test]
+        fn err_concurrent_new_and_open() {
+            let (_dir, cfg) = tmp_path();
+            let barrier = Arc::new(Barrier::new(2));
+
+            let t_new = {
+                let cfg = cfg.clone();
+                let b = barrier.clone();
+                std::thread::spawn(move || {
+                    b.wait();
+                    File::new(cfg)
+                })
+            };
+
+            let t_open = {
+                let cfg = cfg;
+                let b = barrier;
+                std::thread::spawn(move || {
+                    b.wait();
+                    File::open(cfg)
+                })
+            };
+
+            let r_new = t_new.join().unwrap();
+            let r_open = t_open.join().unwrap();
+
+            // File::new must always succeed
+            let _file = r_new.expect("File::new should succeed");
+
+            // File::open either ran before creation (INV) or while lock was held (LCK)
+            if let Err(e) = r_open {
+                assert!(
+                    e.reason == err::INV.reason || e.reason == err::LCK.reason,
+                    "unexpected error: {:?}",
+                    e
+                );
+            }
+        }
+
+        #[test]
+        fn err_concurrent_open_same_file() {
+            let (_dir, cfg) = tmp_path();
+
+            // First create the valid file
+            {
+                let file = File::new(cfg.clone()).unwrap();
+                assert_eq!(file.length(), BUFFER_SIZE * INIT_BUFFERS);
+            }
+
+            let barrier = Arc::new(Barrier::new(2));
+
+            let t1 = {
+                let cfg = cfg.clone();
+                let b = barrier.clone();
+                std::thread::spawn(move || {
+                    b.wait();
+                    File::open(cfg)
+                })
+            };
+
+            let t2 = {
+                let cfg = cfg;
+                let b = barrier;
+                std::thread::spawn(move || {
+                    b.wait();
+                    File::open(cfg)
+                })
+            };
+
+            let r1 = t1.join().unwrap();
+            let r2 = t2.join().unwrap();
+
+            // Exactly one must acquire exclusive flock and succeed, the other fails with LCK
+            match (r1, r2) {
+                (Ok(_), Err(e)) | (Err(e), Ok(_)) => {
+                    assert_eq!(e.reason, err::LCK.reason, "error must be LCK: {:?}", e);
+                }
+                (Ok(_), Ok(_)) => {
+                    panic!(
+                        "Locking violation: both concurrent File::open acquired exclusive lock!"
+                    );
+                }
+                (Err(e1), Err(e2)) => {
+                    panic!("Unexpected failure of both threads: {:?}, {:?}", e1, e2);
+                }
+            }
+        }
+
+        #[test]
+        fn err_new_while_file_open() {
+            let (_dir, cfg) = tmp_path();
+            let file = File::new(cfg.clone()).unwrap();
+
+            // Calling File::new while open must fail with EXS
+            let err = File::new(cfg).unwrap_err();
+            assert_eq!(err.reason, err::EXS.reason);
+
+            drop(file);
+        }
+
+        #[test]
+        fn ok_reopen_after_drop() {
+            let (_dir, cfg) = tmp_path();
+            let file = File::new(cfg.clone()).unwrap();
+            drop(file);
+
+            // Once dropped, File::open must succeed
+            let reopened = File::open(cfg).unwrap();
+            assert_eq!(reopened.length(), BUFFER_SIZE * INIT_BUFFERS);
+        }
+
+        #[test]
+        fn ok_file_send_and_sync() {
+            fn assert_send_sync<T: Send + Sync>() {}
+            assert_send_sync::<File>();
+        }
     }
 }
