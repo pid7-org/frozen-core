@@ -52,6 +52,9 @@ impl FileInterface for POSIXFile {
         let err_msg = err_msg(errno);
 
         match errno {
+            // File or one of the path components does not exist
+            ENOENT | ENOTDIR => Ok(false),
+
             // Lack of search or read permission on path components
             EACCES | EPERM => err::raw_error(err::PRM, err_msg),
 
@@ -59,7 +62,7 @@ impl FileInterface for POSIXFile {
             EINVAL => err::raw_error(err::HCF, err_msg),
 
             // Path syntax, invalid parent directory or resolution errors (e.g. symlink cycle, path too long)
-            ENOENT | ENOTDIR | ELOOP | ENAMETOOLONG => err::raw_error(err::INV, err_msg),
+            ELOOP | ENAMETOOLONG => err::raw_error(err::INV, err_msg),
 
             // EIO (i.e. Hardware I/O or storage failure) or other failures
             _ => err::raw_error(err::UNK, err_msg),
