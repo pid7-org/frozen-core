@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -e
+
+TARGETS=(
+  "x86_64-unknown-linux-gnu"
+  "aarch64-unknown-linux-gnu"
+  "x86_64-pc-windows-msvc"
+  "aarch64-pc-windows-msvc"
+  "x86_64-apple-darwin"
+  "aarch64-apple-darwin"
+)
+
+echo "Running pre-commit checks..."
+
+echo "==> Running cargo check across all 6 targets (Linux, Windows, macOS x x86_64, aarch64)..."
+for target in "${TARGETS[@]}"; do
+  echo "    Checking target: $target"
+  cargo check --all-features --release --target "$target"
+done
+
+echo "==> cargo fmt --check"
+cargo fmt --check
+
+echo "==> Running cargo clippy across all 6 targets..."
+for target in "${TARGETS[@]}"; do
+  echo "    Clippy target: $target"
+  cargo clippy --all-features --release --target "$target" -- -D warnings
+done
+
+echo "All pre-commit checks passed!"
