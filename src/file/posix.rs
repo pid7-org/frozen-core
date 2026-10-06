@@ -1226,7 +1226,7 @@ const fn prep_flags() -> c_int {
 /// so we simply omit it
 #[cfg(target_os = "macos")]
 const fn prep_flags() -> c_int {
-    return O_RDWR | O_CLOEXEC | O_CREAT;
+    O_RDWR | O_CLOEXEC | O_CREAT
 }
 
 /// preps flags for atomic file creation (`O_CREAT | O_EXCL`)
@@ -1238,7 +1238,7 @@ const fn create_flags() -> c_int {
 /// preps flags for atomic file creation (`O_CREAT | O_EXCL`)
 #[cfg(target_os = "macos")]
 const fn create_flags() -> c_int {
-    return O_RDWR | O_CLOEXEC | O_CREAT | O_EXCL;
+    O_RDWR | O_CLOEXEC | O_CREAT | O_EXCL
 }
 
 /// preps flags for opening existing file (without `O_CREAT`)
@@ -1250,7 +1250,7 @@ const fn open_flags() -> c_int {
 /// preps flags for opening existing file (without `O_CREAT`)
 #[cfg(target_os = "macos")]
 const fn open_flags() -> c_int {
-    return O_RDWR | O_CLOEXEC;
+    O_RDWR | O_CLOEXEC
 }
 
 /// convert a `std::path::Path` into `std::ffi::CString`
