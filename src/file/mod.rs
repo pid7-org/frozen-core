@@ -1,4 +1,4 @@
-//!
+//! NA
 
 mod interface;
 
@@ -140,7 +140,7 @@ pub struct FileCfg {
     pub initial_available_buffers: usize,
 }
 
-/// Custom implementation of file handle for [`frozen_core`]
+/// Custom implementation of `std::fs::File`
 #[derive(Debug)]
 pub struct File {
     cfg: FileCfg,
@@ -263,7 +263,7 @@ impl File {
             None => return err::default_error(err::INV),
         };
 
-        if offset.checked_add(buf.len()).map_or(true, |end| end > self.length()) {
+        if offset.checked_add(buf.len()).is_none_or(|end| end > self.length()) {
             return err::default_error(err::HCF);
         }
 
@@ -295,7 +295,7 @@ impl File {
             None => return err::default_error(err::INV),
         };
 
-        if offset.checked_add(buf.len()).map_or(true, |end| end > self.length()) {
+        if offset.checked_add(buf.len()).is_none_or(|end| end > self.length()) {
             return err::default_error(err::HCF);
         }
 
