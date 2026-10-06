@@ -56,7 +56,10 @@ jobs:
       - name: Cargo check (benches)
         run: cargo check --benches --release --all-features
 
-      - name: Cargo test
+      - name: Cargo test (debug)
+        run: cargo test --all-features -- --nocapture
+
+      - name: Cargo test (release)
         run: cargo test --all-features --release -- --nocapture
 
   linux:
@@ -85,7 +88,10 @@ jobs:
         with:
           key: rust-${{ runner.os }}-${{ matrix.arch }}-stable
 
-      - name: Run tests
+      - name: Run tests (debug)
+        run: cargo test --all-features -- --nocapture
+
+      - name: Run tests (release)
         run: cargo test --all-features --release -- --nocapture
 
   windows:
@@ -112,7 +118,10 @@ jobs:
         with:
           key: rust-${{ runner.os }}-${{ matrix.arch }}-stable
 
-      - name: Run tests
+      - name: Run tests (debug)
+        run: cargo test --all-features -- --nocapture
+
+      - name: Run tests (release)
         run: cargo test --all-features --release -- --nocapture
 
   macos:
@@ -139,7 +148,10 @@ jobs:
         with:
           key: rust-${{ runner.os }}-${{ matrix.arch }}-stable
 
-      - name: Run tests
+      - name: Run tests (debug)
+        run: cargo test --all-features -- --nocapture
+
+      - name: Run tests (release)
         run: cargo test --all-features --release -- --nocapture
 
   macos_intel:
@@ -196,5 +208,8 @@ jobs:
       - name: Cargo check (benches)
         run: cargo check --benches --release --all-features
 
-      - name: Run tests
+      - name: Run tests (debug)
+        run: cargo test --all-features -- --nocapture
+
+      - name: Run tests (release)
         run: cargo test --all-features --release -- --nocapture
