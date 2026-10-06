@@ -175,18 +175,24 @@ impl File {
 
         let file = PlatformFile::create(&cfg.path)?;
 
-        if let Err(e) = file.flock() {
-            let _ = file.close();
+        if let Err(mut e) = file.flock() {
+            if let Err(close_err) = file.close() {
+                e.add_suppressed(close_err);
+            }
             return Err(e);
         }
 
-        if let Err(e) = file.grow(0, init_len) {
-            let _ = file.close();
+        if let Err(mut e) = file.grow(0, init_len) {
+            if let Err(close_err) = file.close() {
+                e.add_suppressed(close_err);
+            }
             return Err(e);
         }
 
-        if let Err(e) = file.sync() {
-            let _ = file.close();
+        if let Err(mut e) = file.sync() {
+            if let Err(close_err) = file.close() {
+                e.add_suppressed(close_err);
+            }
             return Err(e);
         }
 
@@ -217,22 +223,29 @@ impl File {
 
         let file = PlatformFile::open(&cfg.path)?;
 
-        if let Err(e) = file.flock() {
-            let _ = file.close();
+        if let Err(mut e) = file.flock() {
+            if let Err(close_err) = file.close() {
+                e.add_suppressed(close_err);
+            }
             return Err(e);
         }
 
         let curr_len = match file.length() {
             Ok(len) => len,
-            Err(e) => {
-                let _ = file.close();
+            Err(mut e) => {
+                if let Err(close_err) = file.close() {
+                    e.add_suppressed(close_err);
+                }
                 return Err(e);
             }
         };
 
         if curr_len < init_len || curr_len % cfg.buffer_size != 0 {
-            let _ = file.close();
-            return err::default_error(err::CPT);
+            let mut e = err::default_error::<Self>(err::CPT).unwrap_err();
+            if let Err(close_err) = file.close() {
+                e.add_suppressed(close_err);
+            }
+            return Err(e);
         }
 
         Ok(Self { cfg, file, current_length: atomic::AtomicUsize::new(curr_len) })

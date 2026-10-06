@@ -139,8 +139,10 @@ impl FileInterface for WINFile {
         let handle = create_file_raw(path, CREATE_NEW)?;
         let file = Self { handle: atomic::AtomicIsize::new(handle) };
 
-        if let Err(e) = sync_parent_dir(path) {
-            let _ = file.close();
+        if let Err(mut e) = sync_parent_dir(path) {
+            if let Err(close_err) = file.close() {
+                e.add_suppressed(close_err);
+            }
             return Err(e);
         }
 
@@ -217,7 +219,7 @@ impl FileInterface for WINFile {
     /// Deferred I/O failures surface on the preceding `WriteFile` call or on `FlushFileBuffers`
     ///
     /// Our durability model enforces `FlushFileBuffers` after every write batch, so by the time `close` is called,
-    /// all data is already confirmed durable and `CloseHandle` is a kernel-object teardown with no I/O side-effects
+    /// all data is already confirmed durable and `CloseHandle` is a kernel-object teardown with no I/O side ffects
     fn close(self) -> FrozenResult<()> {
         let h = self.handle.swap(CLOSED_HANDLE, atomic::Ordering::AcqRel);
         if h == CLOSED_HANDLE {
@@ -241,14 +243,15 @@ impl FileInterface for WINFile {
     /// or fail to lock (if it raced ahead of the delete), making practical exploitation of this window impossible
     ///
     /// An alternative is `FILE_FLAG_DELETE_ON_CLOSE` set at open time, but that requires knowing at creation that
-    /// the file will be deleted, which does not fit our create-then-conditionally delete lifecycle
+    /// the file will be deleted, which does not fit our create-and-then-conditionally-or-as-needed delete lifecycle
     ///
     /// ## Parent Directory Sync
     ///
     /// Unlike ext4/XFS, NTFS filesystems journals the directory operations by default, so a parent
     /// `FlushFileBuffers` after delete is advisory
     ///
-    /// We still call `sync_parent_dir` for consistency with the POSIX path and for ReFS/non-default-journal config
+    /// We still call `sync_parent_dir` for consistency with the POSIX path and for ReFS and/or non-default-journal
+    /// config
     fn unlink(self, path: &std::path::Path) -> FrozenResult<()> {
         // NOTE: close first so DeleteFileW is not blocked by our own open handle
         //
@@ -612,8 +615,10 @@ impl WINFile {
         let handle = create_file_raw(path, OPEN_ALWAYS)?;
         let file = Self { handle: atomic::AtomicIsize::new(handle) };
 
-        if let Err(e) = sync_parent_dir(path) {
-            let _ = file.close();
+        if let Err(mut e) = sync_parent_dir(path) {
+            if let Err(close_err) = file.close() {
+                e.add_suppressed(close_err);
+            }
             return Err(e);
         }
 
