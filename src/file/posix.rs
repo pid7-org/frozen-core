@@ -74,6 +74,13 @@ impl FileInterface for POSIXFile {
         let fd = open_raw(path, create_flags())?;
         let file = Self { fd: atomic::AtomicI32::new(fd) };
 
+        if let Err(mut e) = file.flock() {
+            if let Err(close_err) = file.close() {
+                e.add_suppressed(close_err);
+            }
+            return Err(e);
+        }
+
         if let Err(mut e) = sync_parent_dir(path) {
             if let Err(close_err) = file.close() {
                 e.add_suppressed(close_err);

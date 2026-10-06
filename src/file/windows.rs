@@ -139,6 +139,13 @@ impl FileInterface for WINFile {
         let handle = create_file_raw(path, CREATE_NEW)?;
         let file = Self { handle: atomic::AtomicIsize::new(handle) };
 
+        if let Err(mut e) = file.flock() {
+            if let Err(close_err) = file.close() {
+                e.add_suppressed(close_err);
+            }
+            return Err(e);
+        }
+
         if let Err(mut e) = sync_parent_dir(path) {
             if let Err(close_err) = file.close() {
                 e.add_suppressed(close_err);

@@ -175,13 +175,6 @@ impl File {
 
         let file = PlatformFile::create(&cfg.path)?;
 
-        if let Err(mut e) = file.flock() {
-            if let Err(close_err) = file.close() {
-                e.add_suppressed(close_err);
-            }
-            return Err(e);
-        }
-
         if let Err(mut e) = file.grow(0, init_len) {
             if let Err(close_err) = file.close() {
                 e.add_suppressed(close_err);
