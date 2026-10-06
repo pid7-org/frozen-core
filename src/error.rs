@@ -48,6 +48,9 @@ pub struct FrozenError {
 
     /// Error context for the [`FrozenError`]
     pub context: Box<str>,
+
+    /// Secondary errors that occurred during best-effort cleanup or rollback
+    pub suppressed: Option<Box<Vec<FrozenError>>>,
 }
 
 impl FrozenError {
@@ -74,6 +77,7 @@ impl FrozenError {
             domain,
             reason: code.reason,
             context: format!("[{}] {}", code.detail, errmsg).into_boxed_str(),
+            suppressed: None,
         }
     }
 
@@ -101,27 +105,118 @@ impl FrozenError {
             module,
             reason: code.reason,
             context: format!("[{}] {}", code.detail, err).into_boxed_str(),
+            suppressed: None,
         }
+    }
+
+    /// Attach a secondary error that occurred during best-effort cleanup or rollback
+    pub fn add_suppressed(&mut self, err: FrozenError) {
+        let list = self.suppressed.get_or_insert_with(|| Box::new(Vec::new()));
+        list.push(err);
+    }
+
+    /// Builder-style helper to attach a suppressed error
+    #[must_use]
+    pub fn with_suppressed(mut self, err: FrozenError) -> Self {
+        self.add_suppressed(err);
+        self
+    }
+
+    /// Returns a slice of suppressed errors attached to this error
+    #[inline]
+    pub fn suppressed(&self) -> &[FrozenError] {
+        match &self.suppressed {
+            Some(list) => list.as_slice(),
+            None => &[],
+        }
+    }
+}
+
+impl FrozenError {
+    fn fmt_tree(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+        prefix: &str,
+        is_tail: bool,
+        is_root: bool,
+    ) -> std::fmt::Result {
+        if is_root {
+            writeln!(
+                f,
+                "[{:#04x}:{:#04x}:{:#04x}] {}",
+                self.module, self.domain, self.reason, self.context
+            )?;
+        } else {
+            let branch = if is_tail { "└── " } else { "├── " };
+            writeln!(
+                f,
+                "{}{}[{:#04x}:{:#04x}:{:#04x}] {}",
+                prefix, branch, self.module, self.domain, self.reason, self.context
+            )?;
+        }
+
+        if let Some(suppressed) = &self.suppressed {
+            let next_prefix = if is_root {
+                String::new()
+            } else if is_tail {
+                format!("{prefix}    ")
+            } else {
+                format!("{prefix}│   ")
+            };
+
+            let count = suppressed.len();
+            for (idx, sub_err) in suppressed.iter().enumerate() {
+                let is_last = idx + 1 == count;
+                sub_err.fmt_tree(f, &next_prefix, is_last, false)?;
+            }
+        }
+
+        Ok(())
     }
 }
 
 impl std::fmt::Debug for FrozenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "FrozenError {{ module: {:#04x}, domain: {:#04x}, reason: {:#04x}, context: {:?} }}",
-            self.module, self.domain, self.reason, self.context
-        )
+        match &self.suppressed {
+            None => write!(
+                f,
+                "FrozenError {{ module: {:#04x}, domain: {:#04x}, reason: {:#04x}, context: {:?} }}",
+                self.module, self.domain, self.reason, self.context
+            ),
+            Some(suppressed) => write!(
+                f,
+                "FrozenError {{ module: {:#04x}, domain: {:#04x}, reason: {:#04x}, context: {:?}, suppressed: {:?} }}",
+                self.module, self.domain, self.reason, self.context, suppressed
+            ),
+        }
     }
 }
 
 impl std::fmt::Display for FrozenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "[{:#04x}:{:#04x}:{:#04x}] {}",
-            self.module, self.domain, self.reason, self.context
-        )
+        if self.suppressed.is_none() {
+            write!(
+                f,
+                "[{:#04x}:{:#04x}:{:#04x}] {}",
+                self.module, self.domain, self.reason, self.context
+            )
+        } else {
+            // Write tree format, stripping the trailing newline so Display behaves well in format!("{err}")
+            let mut formatted = String::new();
+            // Using a helper struct or formatting directly to a String buffer
+            struct TreeHelper<'a>(&'a FrozenError);
+            impl std::fmt::Display for TreeHelper<'_> {
+                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    self.0.fmt_tree(f, "", true, true)
+                }
+            }
+            use std::fmt::Write as _;
+            let _ = write!(formatted, "{}", TreeHelper(self));
+            if formatted.ends_with('\n') {
+                formatted.pop();
+            }
+            write!(f, "{formatted}")
+        }
     }
 }
 
@@ -263,5 +358,37 @@ mod tests {
         fn assert_is_error<E: std::error::Error>(_: &E) {}
         let err = FrozenError::new(1, 2, ErrCode::new(3, "io"), "fail");
         assert_is_error(&err);
+    }
+
+    #[test]
+    fn ok_suppressed_tree_display() {
+        let mut root = FrozenError::new(0x01, 0x10, ErrCode::new(0x20, "posix"), "f_advise failed");
+        let sub1 = FrozenError::new(0x01, 0x10, ErrCode::new(0x30, "posix"), "close failed");
+        let mut sub2 = FrozenError::new(0x01, 0x10, ErrCode::new(0x40, "posix"), "flush failed");
+        let sub2_nested = FrozenError::new(0x01, 0x10, ErrCode::new(0x50, "posix"), "sync failed");
+
+        sub2.add_suppressed(sub2_nested);
+        root.add_suppressed(sub1);
+        root.add_suppressed(sub2);
+
+        assert_eq!(root.suppressed().len(), 2);
+
+        let displayed = format!("{root}");
+        let expected = "\
+[0x01:0x10:0x20] [posix] f_advise failed
+├── [0x01:0x10:0x30] [posix] close failed
+└── [0x01:0x10:0x40] [posix] flush failed
+    └── [0x01:0x10:0x50] [posix] sync failed";
+
+        assert_eq!(displayed, expected);
+    }
+
+    #[test]
+    fn ok_with_suppressed_builder() {
+        let err = FrozenError::new(1, 2, ErrCode::new(3, "io"), "parent")
+            .with_suppressed(FrozenError::new(1, 2, ErrCode::new(4, "io"), "cleanup"));
+
+        assert_eq!(err.suppressed().len(), 1);
+        assert_eq!(err.suppressed()[0].reason, 4);
     }
 }
