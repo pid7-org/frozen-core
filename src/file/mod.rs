@@ -999,6 +999,7 @@ mod tests {
         }
 
         #[test]
+        #[cfg(unix)]
         fn ok_exists_false_after_external_removal() {
             let (_dir, cfg) = tmp_path();
             let file = File::new(cfg.clone()).unwrap();
@@ -1009,6 +1010,19 @@ mod tests {
         }
 
         #[test]
+        #[cfg(windows)]
+        fn ok_exists_false_after_external_removal() {
+            let (_dir, cfg) = tmp_path();
+            let file = File::new(cfg.clone()).unwrap();
+            assert!(file.exists().unwrap());
+            drop(file);
+
+            std::fs::remove_file(&cfg.path).unwrap();
+            assert!(!PlatformFile::exists(&cfg.path).unwrap());
+        }
+
+        #[test]
+        #[cfg(unix)]
         fn err_delete_when_unlinked_externally() {
             let (_dir, cfg) = tmp_path();
             let file = File::new(cfg.clone()).unwrap();
@@ -1016,6 +1030,21 @@ mod tests {
             std::fs::remove_file(&cfg.path).unwrap();
             let err = file.delete().unwrap_err();
             assert_eq!(err.reason, err::INV.reason);
+        }
+
+        #[test]
+        #[cfg(windows)]
+        fn err_delete_when_unlinked_externally() {
+            let (_dir, cfg) = tmp_path();
+            let file = File::new(cfg.clone()).unwrap();
+
+            // On Windows without FILE_SHARE_DELETE, external deletion while open fails with ERROR_SHARING_VIOLATION (32)
+            let err = std::fs::remove_file(&cfg.path).unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(32));
+
+            // File can still be cleanly deleted by its owner
+            file.delete().unwrap();
+            assert!(!cfg.path.exists());
         }
 
         #[test]
