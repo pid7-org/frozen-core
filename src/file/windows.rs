@@ -11,7 +11,7 @@ use windows_sys::Win32::{
         HANDLE, INVALID_HANDLE_VALUE,
     },
     Storage::FileSystem::{
-        CREATE_NEW, CreateFileW, DeleteFileW, FILE_ALLOCATION_INFO, FILE_ATTRIBUTE_NORMAL,
+        CREATE_NEW, CreateFileW, DELETE, DeleteFileW, FILE_ALLOCATION_INFO, FILE_ATTRIBUTE_NORMAL,
         FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO,
         FILE_DISPOSITION_INFO_EX, FILE_END_OF_FILE_INFO, FILE_FLAG_BACKUP_SEMANTICS,
         FILE_FLAG_RANDOM_ACCESS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
@@ -703,7 +703,7 @@ fn create_file_raw(path: &std::path::Path, disposition: u32) -> FrozenResult<Fil
         let h = unsafe {
             CreateFileW(
                 wide.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
+                GENERIC_READ | GENERIC_WRITE | DELETE,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 core::ptr::null(),
                 disposition,
