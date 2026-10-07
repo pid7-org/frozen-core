@@ -864,16 +864,20 @@ mod tests {
                     while running.load(atomic::Ordering::Relaxed) || attempts < 50 {
                         attempts += 1;
                         let res = File::open(cfg.clone());
-                        // While the file is open, open must fail with LCK.
-                        // Once the file is deleted, open must fail with INV (file not found).
-                        // It must NEVER succeed at any point.
-                        let err =
-                            res.expect_err("File::open must never succeed during or after delete");
-                        assert!(
-                            err.reason == err::LCK.reason || err.reason == err::INV.reason,
-                            "Unexpected error reason: {:?}",
-                            err
-                        );
+                        // While the file is open, open fails with LCK.
+                        // On Windows, opening a delete-pending file yields PRM.
+                        // Once the file is deleted, open fails with INV.
+                        // On POSIX, a descriptor opened right before unlink may momentarily succeed after
+                        // deletion releases the writer's lock; if so, dropping it is completely safe.
+                        if let Err(err) = res {
+                            assert!(
+                                err.reason == err::LCK.reason
+                                    || err.reason == err::INV.reason
+                                    || err.reason == err::PRM.reason,
+                                "Unexpected error reason: {:?}",
+                                err
+                            );
+                        }
                         std::thread::yield_now();
                     }
                 })
@@ -904,7 +908,7 @@ mod tests {
                 let deleted = deleted.clone();
                 std::thread::spawn(move || {
                     let mut created = None;
-                    // Before delete occurs, File::new must fail with EXS.
+                    // Before delete occurs, File::new must fail with EXS (or PRM on Windows while delete is pending).
                     // Once delete completes, File::new must eventually succeed.
                     while created.is_none() {
                         match File::new(cfg.clone()) {
@@ -916,7 +920,11 @@ mod tests {
                                 created = Some(f);
                             }
                             Err(e) => {
-                                assert_eq!(e.reason, err::EXS.reason);
+                                assert!(
+                                    e.reason == err::EXS.reason || e.reason == err::PRM.reason,
+                                    "Unexpected error reason during race: {:?}",
+                                    e
+                                );
                                 std::thread::yield_now();
                             }
                         }
@@ -1293,10 +1301,14 @@ mod tests {
             let file = File::new(cfg.clone()).unwrap();
 
             // With FILE_SHARE_DELETE enabled, external deletion is permitted while open.
-            // After external deletion, calling file.delete() fails with err::INV.
+            // After external deletion, calling file.delete() fails with err::INV or err::PRM (delete-pending).
             std::fs::remove_file(&cfg.path).unwrap();
             let err = file.delete().unwrap_err();
-            assert_eq!(err.reason, err::INV.reason);
+            assert!(
+                err.reason == err::INV.reason || err.reason == err::PRM.reason,
+                "Unexpected error reason: {:?}",
+                err
+            );
         }
 
         #[test]

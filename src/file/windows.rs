@@ -1376,11 +1376,11 @@ mod tests {
                     while running.load(atomic::Ordering::Relaxed) || attempts < 50 {
                         attempts += 1;
                         let res = WINFile::open(&path);
-                        // Once unlinked, open must fail with INV (file not found).
+                        // Once unlinked, open must fail with INV (file not found) or PRM (delete-pending).
                         // It must never succeed after unlink.
                         if let Err(e) = res {
                             assert!(
-                                e.reason == err::INV.reason,
+                                e.reason == err::INV.reason || e.reason == err::PRM.reason,
                                 "Unexpected error reason: {:?}",
                                 e
                             );
@@ -1415,7 +1415,7 @@ mod tests {
                 let unlinked = unlinked.clone();
                 std::thread::spawn(move || {
                     let mut created = None;
-                    // Before unlink occurs, WINFile::create must fail with EXS.
+                    // Before unlink occurs, WINFile::create must fail with EXS (or PRM while delete is pending).
                     // Once unlink completes, WINFile::create must eventually succeed.
                     while created.is_none() {
                         match WINFile::create(&path) {
@@ -1427,7 +1427,11 @@ mod tests {
                                 created = Some(f);
                             }
                             Err(e) => {
-                                assert_eq!(e.reason, err::EXS.reason);
+                                assert!(
+                                    e.reason == err::EXS.reason || e.reason == err::PRM.reason,
+                                    "Unexpected error reason during race: {:?}",
+                                    e
+                                );
                                 std::thread::yield_now();
                             }
                         }
