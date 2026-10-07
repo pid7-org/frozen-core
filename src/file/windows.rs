@@ -1213,7 +1213,7 @@ fn overlapped_at(offset_lo: u32, offset_hi: u32) -> OVERLAPPED {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::{path::PathBuf, sync::Arc};
 
     fn tmp_path() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -1327,6 +1327,24 @@ mod tests {
         }
 
         #[test]
+        fn err_open_after_unlink_grown_file() {
+            let (_dir, path) = tmp_path();
+            let file = WINFile::new(&path).unwrap();
+
+            // Grow the file first
+            file.grow(0, 0x2000).unwrap();
+            assert_eq!(file.length().unwrap(), 0x2000);
+
+            // Unlink the file
+            file.unlink(&path).unwrap();
+            assert!(!path.exists());
+
+            // Attempting to open the deleted file must fail
+            let err = WINFile::open(&path).unwrap_err();
+            assert_eq!(err.reason, err::INV.reason);
+        }
+
+        #[test]
         fn ok_unlink_concurrent_reader_handles() {
             let (_dir, path) = tmp_path();
             let file = WINFile::new(&path).unwrap();
@@ -1340,6 +1358,92 @@ mod tests {
             // Reader can still close cleanly
             reader.close().unwrap();
             assert!(!path.exists());
+        }
+
+        #[test]
+        fn err_concurrent_open_during_and_after_unlink() {
+            let (_dir, path) = tmp_path();
+            let file = WINFile::new(&path).unwrap();
+            file.grow(0, 0x1000).unwrap();
+
+            let running = Arc::new(atomic::AtomicBool::new(true));
+
+            // Thread 2 constantly attempts WINFile::open
+            let opener = {
+                let path = path.clone();
+                let running = running.clone();
+                std::thread::spawn(move || {
+                    let mut attempts = 0;
+                    while running.load(atomic::Ordering::Relaxed) || attempts < 50 {
+                        attempts += 1;
+                        let res = WINFile::open(&path);
+                        // Once unlinked, open must fail with INV (file not found).
+                        // It must never succeed after unlink.
+                        if let Err(e) = res {
+                            assert!(
+                                e.reason == err::INV.reason,
+                                "Unexpected error reason: {:?}",
+                                e
+                            );
+                        }
+                        std::thread::yield_now();
+                    }
+                })
+            };
+
+            // Thread 1 unlinks the file
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            file.unlink(&path).unwrap();
+            running.store(false, atomic::Ordering::Relaxed);
+
+            opener.join().unwrap();
+
+            // After unlink, opening must consistently fail with INV
+            let err = WINFile::open(&path).unwrap_err();
+            assert_eq!(err.reason, err::INV.reason);
+        }
+
+        #[test]
+        fn ok_concurrent_new_fails_before_unlink_and_succeeds_after() {
+            let (_dir, path) = tmp_path();
+            let file = WINFile::create(&path).unwrap();
+            file.grow(0, 0x1000).unwrap();
+
+            let unlinked = Arc::new(atomic::AtomicBool::new(false));
+
+            let creator = {
+                let path = path.clone();
+                let unlinked = unlinked.clone();
+                std::thread::spawn(move || {
+                    let mut created = None;
+                    // Before unlink occurs, WINFile::create must fail with EXS.
+                    // Once unlink completes, WINFile::create must eventually succeed.
+                    while created.is_none() {
+                        match WINFile::create(&path) {
+                            Ok(f) => {
+                                assert!(
+                                    unlinked.load(atomic::Ordering::Acquire),
+                                    "WINFile::create succeeded before file.unlink completed!"
+                                );
+                                created = Some(f);
+                            }
+                            Err(e) => {
+                                assert_eq!(e.reason, err::EXS.reason);
+                                std::thread::yield_now();
+                            }
+                        }
+                    }
+                    created.unwrap()
+                })
+            };
+
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            unlinked.store(true, atomic::Ordering::Release);
+            file.unlink(&path).unwrap();
+
+            let new_file = creator.join().unwrap();
+            assert!(WINFile::exists(&path).unwrap());
+            new_file.close().unwrap();
         }
 
         #[test]

@@ -705,6 +705,93 @@ mod tests {
         }
 
         #[test]
+        fn err_concurrent_open_during_and_after_delete() {
+            let (_dir, cfg) = tmp_path();
+            let file = File::new(cfg.clone()).unwrap();
+            file.grow(2).unwrap();
+
+            let running = Arc::new(atomic::AtomicBool::new(true));
+
+            // Thread 2 constantly attempts File::open
+            let opener = {
+                let cfg = cfg.clone();
+                let running = running.clone();
+                std::thread::spawn(move || {
+                    let mut attempts = 0;
+                    while running.load(atomic::Ordering::Relaxed) || attempts < 50 {
+                        attempts += 1;
+                        let res = File::open(cfg.clone());
+                        // While the file is open, open must fail with LCK.
+                        // Once the file is deleted, open must fail with INV (file not found).
+                        // It must NEVER succeed at any point.
+                        let err =
+                            res.expect_err("File::open must never succeed during or after delete");
+                        assert!(
+                            err.reason == err::LCK.reason || err.reason == err::INV.reason,
+                            "Unexpected error reason: {:?}",
+                            err
+                        );
+                        std::thread::yield_now();
+                    }
+                })
+            };
+
+            // Thread 1 deletes the file
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            file.delete().unwrap();
+            running.store(false, atomic::Ordering::Relaxed);
+
+            opener.join().unwrap();
+
+            // After delete, opening must consistently fail with INV
+            let err = File::open(cfg).unwrap_err();
+            assert_eq!(err.reason, err::INV.reason);
+        }
+
+        #[test]
+        fn ok_concurrent_new_fails_before_delete_and_succeeds_after() {
+            let (_dir, cfg) = tmp_path();
+            let file = File::new(cfg.clone()).unwrap();
+            file.grow(2).unwrap();
+
+            let deleted = Arc::new(atomic::AtomicBool::new(false));
+
+            let creator = {
+                let cfg = cfg.clone();
+                let deleted = deleted.clone();
+                std::thread::spawn(move || {
+                    let mut created = None;
+                    // Before delete occurs, File::new must fail with EXS.
+                    // Once delete completes, File::new must eventually succeed.
+                    while created.is_none() {
+                        match File::new(cfg.clone()) {
+                            Ok(f) => {
+                                assert!(
+                                    deleted.load(atomic::Ordering::Acquire),
+                                    "File::new succeeded before file.delete completed!"
+                                );
+                                created = Some(f);
+                            }
+                            Err(e) => {
+                                assert_eq!(e.reason, err::EXS.reason);
+                                std::thread::yield_now();
+                            }
+                        }
+                    }
+                    created.unwrap()
+                })
+            };
+
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            deleted.store(true, atomic::Ordering::Release);
+            file.delete().unwrap();
+
+            let new_file = creator.join().unwrap();
+            assert!(new_file.exists().unwrap());
+            new_file.delete().unwrap();
+        }
+
+        #[test]
         fn ok_file_send_and_sync() {
             fn assert_send_sync<T: Send + Sync>() {}
             assert_send_sync::<File>();
@@ -1002,6 +1089,24 @@ mod tests {
             opened.delete().unwrap();
 
             assert!(!cfg.path.exists());
+        }
+
+        #[test]
+        fn err_open_after_delete_grown_file() {
+            let (_dir, cfg) = tmp_path();
+            let file = File::new(cfg.clone()).unwrap();
+
+            // Grow the file
+            file.grow(2).unwrap();
+            assert_eq!(file.length(), (INIT_BUFFERS + 2) * BUFFER_SIZE);
+
+            // Delete the file
+            file.delete().unwrap();
+            assert!(!cfg.path.exists());
+
+            // Open must fail with err::INV (file not found)
+            let err = File::open(cfg).unwrap_err();
+            assert_eq!(err.reason, err::INV.reason);
         }
 
         #[test]
