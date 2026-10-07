@@ -533,7 +533,6 @@ mod tests {
             let file = File::new(cfg.clone()).unwrap();
             drop(file);
 
-            // Attempting to create again on an existing path must fail w/ EXS
             let err = File::new(cfg).unwrap_err();
             assert_eq!(err.reason, err::EXS.reason);
         }
@@ -604,7 +603,6 @@ mod tests {
         fn err_open_when_file_smaller_than_init_len() {
             let (_dir, cfg) = tmp_path();
 
-            // Create an empty file (size 0 < init_len)
             std::fs::write(&cfg.path, []).unwrap();
 
             let err = File::open(cfg).unwrap_err();
@@ -615,7 +613,6 @@ mod tests {
         fn err_open_when_file_not_buffer_multiple() {
             let (_dir, cfg) = tmp_path();
 
-            // Create a file with size larger than init_len, but not a multiple of buffer_size
             let non_aligned_len = (BUFFER_SIZE * INIT_BUFFERS) + 3;
             std::fs::write(&cfg.path, vec![0u8; non_aligned_len]).unwrap();
 
@@ -641,14 +638,12 @@ mod tests {
         #[test]
         fn ok_opens_when_existing() {
             let (_dir, cfg) = tmp_path();
-            // First create and populate
             let file = File::new(cfg.clone()).unwrap();
             let data = [0x5Au8; BUFFER_SIZE];
             file.write(&data, 0).unwrap();
             file.sync().unwrap();
             drop(file);
 
-            // Now open_or_create should open the existing file
             let opened = File::open_or_create(cfg.clone()).unwrap();
             assert_eq!(opened.length(), BUFFER_SIZE * INIT_BUFFERS);
             let mut buf = [0u8; BUFFER_SIZE];
@@ -672,7 +667,6 @@ mod tests {
         #[test]
         fn err_open_or_create_corrupt_existing() {
             let (_dir, cfg) = tmp_path();
-            // Write a corrupt non-aligned size file
             let non_aligned = (BUFFER_SIZE * INIT_BUFFERS) + 1;
             std::fs::write(&cfg.path, vec![0u8; non_aligned]).unwrap();
 
@@ -685,7 +679,6 @@ mod tests {
             let (_dir, cfg) = tmp_path();
             let file = File::open_or_create(cfg.clone()).unwrap();
 
-            // Opening another instance while locked fails with LCK
             let err = File::open_or_create(cfg).unwrap_err();
             assert_eq!(err.reason, err::LCK.reason);
             drop(file);
@@ -721,7 +714,9 @@ mod tests {
             let r1 = t1.join().unwrap();
             let r2 = t2.join().unwrap();
 
-            // Due to atomic O_CREAT | O_EXCL, exactly one MUST succeed and the other MUST fail with EXS
+            // NOTE:
+            //
+            // Due to atomic `O_CREAT | O_EXCL`, exactly one MUST succeed and the other MUST fail with EXS
             match (r1, r2) {
                 (Ok(f), Err(e)) | (Err(e), Ok(f)) => {
                     assert_eq!(e.reason, err::EXS.reason);
@@ -762,7 +757,6 @@ mod tests {
             let r_new = t_new.join().unwrap();
             let r_open = t_open.join().unwrap();
 
-            // File::new must always succeed
             let _file = r_new.expect("File::new should succeed");
 
             // File::open either ran before creation (INV) or while lock was held (LCK)
@@ -779,7 +773,6 @@ mod tests {
         fn err_concurrent_open_same_file() {
             let (_dir, cfg) = tmp_path();
 
-            // First create the valid file
             {
                 let file = File::new(cfg.clone()).unwrap();
                 assert_eq!(file.length(), BUFFER_SIZE * INIT_BUFFERS);
@@ -808,6 +801,8 @@ mod tests {
             let r1 = t1.join().unwrap();
             let r2 = t2.join().unwrap();
 
+            // NOTE:
+            //
             // Exactly one must acquire exclusive flock and succeed, the other fails with LCK
             match (r1, r2) {
                 (Ok(_), Err(e)) | (Err(e), Ok(_)) => {
@@ -829,7 +824,6 @@ mod tests {
             let (_dir, cfg) = tmp_path();
             let file = File::new(cfg.clone()).unwrap();
 
-            // Calling File::new while open must fail with EXS
             let err = File::new(cfg).unwrap_err();
             assert_eq!(err.reason, err::EXS.reason);
 
@@ -842,7 +836,6 @@ mod tests {
             let file = File::new(cfg.clone()).unwrap();
             drop(file);
 
-            // Once dropped, File::open must succeed
             let reopened = File::open(cfg).unwrap();
             assert_eq!(reopened.length(), BUFFER_SIZE * INIT_BUFFERS);
         }
@@ -855,7 +848,7 @@ mod tests {
 
             let running = Arc::new(atomic::AtomicBool::new(true));
 
-            // Thread 2 constantly attempts File::open
+            // Thread 2: constantly attempts File::open
             let opener = {
                 let cfg = cfg.clone();
                 let running = running.clone();
@@ -864,11 +857,12 @@ mod tests {
                     while running.load(atomic::Ordering::Relaxed) || attempts < 50 {
                         attempts += 1;
                         let res = File::open(cfg.clone());
-                        // While the file is open, open fails with LCK.
-                        // On Windows, opening a delete-pending file yields PRM.
-                        // Once the file is deleted, open fails with INV.
+                        // While the file is open, open fails with LCK
+                        // On Windows, opening a delete-pending file yields PRM
+                        // Once the file is deleted, open fails with INV
+                        //
                         // On POSIX, a descriptor opened right before unlink may momentarily succeed after
-                        // deletion releases the writer's lock; if so, dropping it is completely safe.
+                        // deletion releases the writer's lock; if so, dropping it is completely safe
                         if let Err(err) = res {
                             assert!(
                                 err.reason == err::LCK.reason
@@ -883,7 +877,7 @@ mod tests {
                 })
             };
 
-            // Thread 1 deletes the file
+            // Thread 1: deletes the file
             std::thread::sleep(std::time::Duration::from_millis(5));
             file.delete().unwrap();
             running.store(false, atomic::Ordering::Relaxed);
@@ -908,8 +902,8 @@ mod tests {
                 let deleted = deleted.clone();
                 std::thread::spawn(move || {
                     let mut created = None;
-                    // Before delete occurs, File::new must fail with EXS (or PRM on Windows while delete is pending).
-                    // Once delete completes, File::new must eventually succeed.
+                    // Before delete occurs, File::new must fail with EXS (or PRM on Windows while delete is pending)
+                    // Once delete completes, File::new must eventually succeed
                     while created.is_none() {
                         match File::new(cfg.clone()) {
                             Ok(f) => {
@@ -971,7 +965,6 @@ mod tests {
             let (_dir, cfg) = tmp_path();
             let file = File::new(cfg).unwrap();
 
-            // Span across 2 buffers in a single write and read call
             let multi_buf_data = [0x77u8; BUFFER_SIZE * 2];
             file.write(&multi_buf_data, 1).unwrap();
             file.sync().unwrap();
@@ -980,7 +973,6 @@ mod tests {
             file.read(&mut read_buf, 1).unwrap();
             assert_eq!(read_buf, multi_buf_data);
 
-            // Verify individual buffers also match
             let mut chunk1 = [0u8; BUFFER_SIZE];
             let mut chunk2 = [0u8; BUFFER_SIZE];
             file.read(&mut chunk1, 1).unwrap();
@@ -1035,7 +1027,6 @@ mod tests {
             let err = file.read(&mut buf, INIT_BUFFERS).unwrap_err();
             assert_eq!(err.reason, err::HCF.reason);
 
-            // Multi-buffer read exceeding available chunks
             let mut multi_buf = [0u8; BUFFER_SIZE * 2];
             let err = file.read(&mut multi_buf, INIT_BUFFERS - 1).unwrap_err();
             assert_eq!(err.reason, err::HCF.reason);
@@ -1050,7 +1041,6 @@ mod tests {
             let err = file.write(&data, INIT_BUFFERS).unwrap_err();
             assert_eq!(err.reason, err::HCF.reason);
 
-            // Multi-buffer write exceeding available chunks
             let multi_data = [1u8; BUFFER_SIZE * 2];
             let err = file.write(&multi_data, INIT_BUFFERS - 1).unwrap_err();
             assert_eq!(err.reason, err::HCF.reason);
@@ -1225,7 +1215,6 @@ mod tests {
             file.delete().unwrap();
 
             assert!(!path.exists());
-            // Re-creating the file at the unlinked path should succeed
             assert!(File::new(cfg).is_ok());
         }
 
@@ -1247,15 +1236,12 @@ mod tests {
             let (_dir, cfg) = tmp_path();
             let file = File::new(cfg.clone()).unwrap();
 
-            // Grow the file
             file.grow(2).unwrap();
             assert_eq!(file.length(), (INIT_BUFFERS + 2) * BUFFER_SIZE);
 
-            // Delete the file
             file.delete().unwrap();
             assert!(!cfg.path.exists());
 
-            // Open must fail with err::INV (file not found)
             let err = File::open(cfg).unwrap_err();
             assert_eq!(err.reason, err::INV.reason);
         }
@@ -1300,8 +1286,11 @@ mod tests {
             let (_dir, cfg) = tmp_path();
             let file = File::new(cfg.clone()).unwrap();
 
-            // With FILE_SHARE_DELETE enabled, external deletion is permitted while open.
-            // After external deletion, calling file.delete() fails with err::INV or err::PRM (delete-pending).
+            // NOTE:
+            //
+            // With `FILE_SHARE_DELETE` enabled, external deletion is permitted while open
+            //
+            // After external deletion, calling `file.delete()` fails with `err::INV` or `err::PRM` (delete-pending)
             std::fs::remove_file(&cfg.path).unwrap();
             let err = file.delete().unwrap_err();
             assert!(
@@ -1383,7 +1372,6 @@ mod tests {
             {
                 let file = File::new(cfg.clone()).unwrap();
                 file.write(&data, 0).unwrap();
-                // drop file without explicit file.sync()
                 drop(file);
             }
 
@@ -1400,13 +1388,11 @@ mod tests {
             let (_dir, cfg) = tmp_path();
 
             let file = File::new(cfg.clone()).unwrap();
-            // Opening another instance while locked fails with LCK
             let err = File::open(cfg.clone()).unwrap_err();
             assert_eq!(err.reason, err::LCK.reason);
 
             drop(file);
 
-            // Once dropped, the exclusive lock is released and open succeeds
             let opened = File::open(cfg);
             assert!(opened.is_ok());
         }

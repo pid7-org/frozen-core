@@ -353,7 +353,9 @@ mod tests {
 
     #[test]
     fn ok_is_std_error() {
-        // NOTE: FrozenError must satisfy `std::error::Error` so it can be used with `?` into Box<dyn Error>
+        // NOTE:
+        //
+        // `FrozenError` must satisfy `std::error::Error` so it can be used with `?` into `Box<dyn Error>`
         // and ecosystem tooling
         fn assert_is_error<E: std::error::Error>(_: &E) {}
         let err = FrozenError::new(1, 2, ErrCode::new(3, "io"), "fail");

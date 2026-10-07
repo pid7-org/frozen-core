@@ -1315,11 +1315,9 @@ mod tests {
             let file = WINFile::new(&path).unwrap();
             file.flock().unwrap();
 
-            // Unlink while locked
             file.unlink(&path).unwrap();
             assert!(!path.exists());
 
-            // Immediate recreate succeeds (no leftover lock or sharing violation)
             let new_file = WINFile::create(&path).unwrap();
             assert!(path.exists());
             new_file.close().unwrap();
@@ -1330,15 +1328,12 @@ mod tests {
             let (_dir, path) = tmp_path();
             let file = WINFile::new(&path).unwrap();
 
-            // Grow the file first
             file.grow(0, 0x2000).unwrap();
             assert_eq!(file.length().unwrap(), 0x2000);
 
-            // Unlink the file
             file.unlink(&path).unwrap();
             assert!(!path.exists());
 
-            // Attempting to open the deleted file must fail
             let err = WINFile::open(&path).unwrap_err();
             assert_eq!(err.reason, err::INV.reason);
         }
@@ -1348,13 +1343,11 @@ mod tests {
             let (_dir, path) = tmp_path();
             let file = WINFile::new(&path).unwrap();
 
-            // Open another handle with FILE_SHARE_DELETE
             let reader = WINFile::open(&path).unwrap();
 
-            // Deleting while reader is open succeeds due to FILE_SHARE_DELETE + POSIX/disposition semantics
+            // NOTE: deleting while reader is open succeeds due to FILE_SHARE_DELETE + POSIX disposition semantics
             file.unlink(&path).unwrap();
 
-            // Reader can still close cleanly
             reader.close().unwrap();
             assert!(!path.exists());
         }
@@ -1367,7 +1360,7 @@ mod tests {
 
             let running = Arc::new(atomic::AtomicBool::new(true));
 
-            // Thread 2 constantly attempts WINFile::open
+            // Thread 2: constantly attempts WINFile::open
             let opener = {
                 let path = path.clone();
                 let running = running.clone();
@@ -1376,8 +1369,8 @@ mod tests {
                     while running.load(atomic::Ordering::Relaxed) || attempts < 50 {
                         attempts += 1;
                         let res = WINFile::open(&path);
-                        // Once unlinked, open must fail with INV (file not found) or PRM (delete-pending).
-                        // It must never succeed after unlink.
+                        // Once unlinked, open must fail with INV (file not found) or PRM (delete-pending)
+                        // It must never succeed after unlink
                         if let Err(e) = res {
                             assert!(
                                 e.reason == err::INV.reason || e.reason == err::PRM.reason,
@@ -1390,7 +1383,7 @@ mod tests {
                 })
             };
 
-            // Thread 1 unlinks the file
+            // Thread 1: unlinks the file
             std::thread::sleep(std::time::Duration::from_millis(5));
             file.unlink(&path).unwrap();
             running.store(false, atomic::Ordering::Relaxed);
@@ -1415,8 +1408,8 @@ mod tests {
                 let unlinked = unlinked.clone();
                 std::thread::spawn(move || {
                     let mut created = None;
-                    // Before unlink occurs, WINFile::create must fail with EXS (or PRM while delete is pending).
-                    // Once unlink completes, WINFile::create must eventually succeed.
+                    // Before unlink occurs, WINFile::create must fail with EXS (or PRM while delete is pending)
+                    // Once unlink completes, WINFile::create must eventually succeed
                     while created.is_none() {
                         match WINFile::create(&path) {
                             Ok(f) => {
@@ -1453,11 +1446,10 @@ mod tests {
         fn err_unlink_missing() {
             let (_dir, path) = tmp_path();
 
-            // Create a dummy file just to get a valid fd, then unlink a non-existent path
             let file = WINFile::create(&path).unwrap();
             let missing_path = path.with_file_name("definitely_does_not_exist.db");
 
-            // close first so unlink's internal close is a no-op (already CLOSED_HANDLE)
+            // NOTE: constructing with CLOSED_HANDLE so unlink's internal close is a no-op
             let inner_file = WINFile { handle: atomic::AtomicIsize::new(CLOSED_HANDLE) };
             let err = inner_file.unlink(&missing_path).unwrap_err();
             assert_eq!(err.reason, err::INV.reason);

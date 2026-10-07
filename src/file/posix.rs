@@ -1531,7 +1531,6 @@ mod tests {
             let target = sub_dir.join("forbidden.db");
             let err = POSIXFile::new(&target).unwrap_err();
 
-            // Restore directory permissions for tempdir cleanup
             std::fs::set_permissions(&sub_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 
             assert_eq!(err.reason, err::PRM.reason);
@@ -1638,12 +1637,10 @@ mod tests {
             let target = sub_dir.join("victim.db");
             let file = POSIXFile::new(&target).unwrap();
 
-            // Revoke write permission on directory so unlinking fails with EACCES
             std::fs::set_permissions(&sub_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
 
             let err = file.unlink(&target).unwrap_err();
 
-            // Restore directory permissions for tempdir cleanup
             std::fs::set_permissions(&sub_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 
             assert_eq!(err.reason, err::PRM.reason);
@@ -1959,7 +1956,6 @@ mod tests {
             let target = inaccessible_dir.join("secret.db");
             let res = POSIXFile::exists(&target);
 
-            // Restore directory permissions for tempdir cleanup
             std::fs::set_permissions(&inaccessible_dir, std::fs::Permissions::from_mode(0o755))
                 .unwrap();
 
@@ -2026,10 +2022,9 @@ mod tests {
                 let fd = file.fd();
                 assert_ne!(fd, CLOSED_FD);
                 fd
-                // file dropped here
             };
 
-            // Calling close on already dropped fd should return EBADF
+            // NOTE: calling libc::close on the fd after Drop must return EBADF since Drop already closed it
             let res = unsafe { libc::close(fd) };
             assert_eq!(res, -1);
             let errno = last_errno();
