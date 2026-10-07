@@ -1044,14 +1044,11 @@ mod tests {
             let (_dir, cfg) = tmp_path();
             let file = File::new(cfg.clone()).unwrap();
 
-            // On Windows without FILE_SHARE_DELETE, external deletion while open fails with ERROR_SHARING_VIOLATION
-            // (32)
-            let err = std::fs::remove_file(&cfg.path).unwrap_err();
-            assert_eq!(err.raw_os_error(), Some(32));
-
-            // File can still be cleanly deleted by its owner
-            file.delete().unwrap();
-            assert!(!cfg.path.exists());
+            // With FILE_SHARE_DELETE enabled, external deletion is permitted while open.
+            // After external deletion, calling file.delete() fails with err::INV.
+            std::fs::remove_file(&cfg.path).unwrap();
+            let err = file.delete().unwrap_err();
+            assert_eq!(err.reason, err::INV.reason);
         }
 
         #[test]

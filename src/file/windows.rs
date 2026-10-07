@@ -12,11 +12,13 @@ use windows_sys::Win32::{
     },
     Storage::FileSystem::{
         CREATE_NEW, CreateFileW, DeleteFileW, FILE_ALLOCATION_INFO, FILE_ATTRIBUTE_NORMAL,
-        FILE_END_OF_FILE_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_RANDOM_ACCESS,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, FileAllocationInfo, FileEndOfFileInfo, FlushFileBuffers,
-        GetFileAttributesW, GetFileSizeEx, INVALID_FILE_ATTRIBUTES, LOCKFILE_EXCLUSIVE_LOCK,
-        LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, OPEN_ALWAYS, OPEN_EXISTING, ReadFile,
-        SetFileInformationByHandle, WriteFile,
+        FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO,
+        FILE_DISPOSITION_INFO_EX, FILE_END_OF_FILE_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_RANDOM_ACCESS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FileAllocationInfo, FileDispositionInfo, FileDispositionInfoEx, FileEndOfFileInfo,
+        FlushFileBuffers, GetFileAttributesW, GetFileSizeEx, INVALID_FILE_ATTRIBUTES,
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, OPEN_ALWAYS, OPEN_EXISTING,
+        ReadFile, SetFileInformationByHandle, WriteFile,
     },
     System::IO::{OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0},
 };
@@ -129,8 +131,9 @@ impl FileInterface for WINFile {
     ///
     /// ## Exclusive Lock
     ///
-    /// We open with `FILE_SHARE_READ | FILE_SHARE_WRITE` so that process-level metadata readers (e.g. monitoring
-    /// tools) can still open the file
+    /// We open with `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE` so that process-level metadata readers
+    /// (e.g. monitoring tools) can still open the file, while still being able to perform handle-based deletion (and
+    /// to not have the handle closed before trying to delete)
     ///
     /// Exclusive access for our engine is enforced by `LockFileEx` in [`flock`](WINFile::flock), mirroring the
     /// POSIX advisory lock model exactly
@@ -239,61 +242,81 @@ impl FileInterface for WINFile {
     ///
     /// ## Win32 Delete Semantics vs POSIX `unlink`
     ///
-    /// Unlike POSIX, Win32 `DeleteFileW` cannot remove a file that is open with the default share
-    /// mode (`FILE_SHARE_DELETE` not set)
+    /// To eliminate TOCTOU races, we delete the file directly through our open `HANDLE` while keeping our exclusive
+    /// advisory byte-range lock active, rather than closing our handle first and racing `DeleteFileW`
     ///
-    /// We work around this by closing our handle first then deleting
+    /// We attempt POSIX delete semantics via `SetFileInformationByHandle` with `FileDispositionInfoEx` and
+    /// `FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS` (supported on Windows 10 1607+ /
+    /// Windows Server 2016+ on NTFS/ReFS)
     ///
-    /// This creates a narrow TOCTOU window, but in our model only a single [`File`](super::File) instance
-    /// ever holds the handle (enforced by `LockFileEx`), so another opener would either fail to open (no handle)
-    /// or fail to lock (if it raced ahead of the delete), making practical exploitation of this window impossible
+    /// This immediately unlinks the file from the directory namespace upon return, matching POSIX `unlink(2)`
+    /// semantics
     ///
-    /// An alternative is `FILE_FLAG_DELETE_ON_CLOSE` set at open time, but that requires knowing at creation that
-    /// the file will be deleted, which does not fit our create-and-then-conditionally-or-as-needed delete lifecycle
+    /// On older Windows systems or filesystems that do not support `FileDispositionInfoEx`, we fall back to
+    /// `FileDispositionInfo` (`FILE_DISPOSITION_INFO { DeleteFile: 1 }`)
+    ///
+    /// If both handle-based dispositions fail, as a final fallback we close the handle and call `DeleteFileW(path)`
     ///
     /// ## Parent Directory Sync
     ///
-    /// Unlike ext4/XFS, NTFS filesystems journals the directory operations by default, so a parent
-    /// `FlushFileBuffers` after delete is advisory
+    /// Unlike ext4/XFS, NTFS filesystems journal directory operations by default, so a parent `FlushFileBuffers`
+    /// after delete is advisory
     ///
     /// We still call `sync_parent_dir` for consistency with the POSIX path and for ReFS and/or non-default-journal
     /// config
     fn unlink(self, path: &std::path::Path) -> FrozenResult<()> {
-        // NOTE: close first so DeleteFileW is not blocked by our own open handle
-        //
-        // On Windows, even with FILE_SHARE_DELETE in the share mode, the underlying NtSetInformationFile
-        // call that DeleteFileW wraps still requires FILE_DELETE_CHILD access on the parent directory and
-        // that the file itself is not marked non-deletable
-        //
-        // Closing first avoids the sharing-mode complication entirely
-        self.close()?;
-
-        let wide = path_to_wide(path)?;
-        let ok = unsafe { DeleteFileW(wide.as_ptr()) };
-
-        if ok != 0 {
-            // NOTE: NTFS journals directory metadata, but we still sync the parent for correctness on ReFS and any
-            // non-journaling volumes that might be mounted
-            return sync_parent_dir(path);
+        let h = self.handle.swap(CLOSED_HANDLE, atomic::Ordering::AcqRel);
+        if h == CLOSED_HANDLE {
+            // Already closed handle cannot be unlinked via handle
+            return err::raw_error(err::INV, "file handle is already closed");
         }
+        let handle = h as usize as HANDLE;
 
-        let code = last_error();
-        let err_msg = err_msg(code);
+        // Attempt for handle-based deletion while lock is held
+        let disposition_res = set_disposition_raw(handle);
+        let close_res = close_raw(handle);
 
-        match code {
-            // File or path component does not exist
-            ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => err::raw_error(err::INV, err_msg),
+        match disposition_res {
+            Ok(()) => {
+                close_res?;
+                sync_parent_dir(path)
+            }
+            Err(e) => {
+                // If the error was due to lack of support or invalid parameter, we must fallback to `DeleteFileW`
+                if e.reason == err::INV.reason || e.reason == err::UNK.reason {
+                    let wide = path_to_wide(path)?;
+                    let ok = unsafe { DeleteFileW(wide.as_ptr()) };
 
-            // Another process holds the file open without FILE_SHARE_DELETE
-            ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION => err::raw_error(err::LCK, err_msg),
+                    if ok != 0 {
+                        let _ = close_res;
+                        return sync_parent_dir(path);
+                    }
 
-            // Lack of permission or read-only volume
-            ERROR_ACCESS_DENIED => err::raw_error(err::PRM, err_msg),
+                    let code = last_error();
+                    let err_msg = err_msg(code);
 
-            // Syntactically invalid path
-            ERROR_INVALID_NAME | ERROR_BAD_PATHNAME => err::raw_error(err::INV, err_msg),
+                    match code {
+                        ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => {
+                            err::raw_error(err::INV, err_msg)
+                        }
+                        ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION => {
+                            err::raw_error(err::LCK, err_msg)
+                        }
+                        ERROR_ACCESS_DENIED => err::raw_error(err::PRM, err_msg),
+                        ERROR_INVALID_NAME | ERROR_BAD_PATHNAME => {
+                            err::raw_error(err::INV, err_msg)
+                        }
+                        _ => err::raw_error(err::UNK, err_msg),
+                    }
+                } else {
+                    let mut err = e;
+                    if let Err(c_err) = close_res {
+                        err.add_suppressed(c_err);
+                    }
 
-            _ => err::raw_error(err::UNK, err_msg),
+                    Err(err)
+                }
+            }
         }
     }
 
@@ -649,9 +672,11 @@ impl Drop for WINFile {
 ///
 /// ## Share Mode
 ///
-/// We always request `FILE_SHARE_READ | FILE_SHARE_WRITE`
+/// We always request `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`
 ///
-/// This allows other processes to open the file (for monitoring, backup, etc.) while we hold the handle
+/// This allows other processes to open the file (for monitoring, backup, etc.) while we hold the handle, and allows
+/// safe handle-based deletion without closing first
+///
 /// Exclusive I/O ownership is enforced at the advisory layer by `LockFileEx`, mirroring the POSIX `flock`
 /// model
 ///
@@ -680,7 +705,7 @@ fn create_file_raw(path: &std::path::Path, disposition: u32) -> FrozenResult<Fil
             CreateFileW(
                 wide.as_ptr(),
                 GENERIC_READ | GENERIC_WRITE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 core::ptr::null(),
                 disposition,
                 FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS,
@@ -802,8 +827,8 @@ fn flush_raw(handle: HANDLE) -> FrozenResult<()> {
 ///
 /// `LockFileEx` requires an `OVERLAPPED` pointer even in synchronous mode
 ///
-/// The struct's `hEvent` field is `NULL`, which is valid cause Win32 only signals the event if the
-/// lock request is async (i.e. `LOCKFILE_FAIL_IMMEDIATELY` not set)
+/// The struct's `hEvent` field is `NULL`, which is valid cause Win32 only signals the event if the lock request
+/// is async (i.e. `LOCKFILE_FAIL_IMMEDIATELY` not set)
 ///
 /// Since we always use `LOCKFILE_FAIL_IMMEDIATELY`, the event is never triggered
 ///
@@ -847,8 +872,7 @@ fn lock_raw(handle: HANDLE) -> FrozenResult<()> {
 
 /// Extend the logical file size (EOF pointer) to `new_len` bytes
 ///
-/// NTFS zeroes any bytes between the previous EOF and the new EOF, satisfying our zero-fill
-/// guarantee
+/// NTFS zeroes any bytes between the previous EOF and the new EOF, satisfying our zero-fill guarantee
 ///
 /// This is the Win32 equivalent of `ftruncate(fd, new_len)`
 fn set_eof_raw(handle: HANDLE, new_len: i64) -> FrozenResult<()> {
@@ -892,8 +916,8 @@ fn set_eof_raw(handle: HANDLE, new_len: i64) -> FrozenResult<()> {
 ///
 /// ## Best-effort
 ///
-/// Some filesystem drivers (network shares, older CIFS/SMB drivers, some third-party antivirus filter drivers)
-/// return `ERROR_NOT_SUPPORTED` or `ERROR_INVALID_PARAMETER` for `FileAllocationInfo`
+/// Some filesystem drivers (network shares, older CIFS/SMB drivers, some third-party antivirus filter drivers) return
+/// `ERROR_NOT_SUPPORTED` or `ERROR_INVALID_PARAMETER` for `FileAllocationInfo`
 ///
 /// We treat those as non-fatal and let the caller fall through to `set_eof_raw`
 ///
@@ -937,6 +961,75 @@ fn set_alloc_raw(handle: HANDLE, new_len: i64) -> FrozenResult<()> {
     }
 }
 
+/// Mark a file for deletion through its open handle
+///
+/// We first attempt POSIX delete semantics via `FileDispositionInfoEx` with
+/// `FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS`
+///
+/// This is supported on Windows 10 (version 1607+) / Windows Server 2016+ on NTFS and ReFS volumes, immediately
+/// removing the file from the directory namespace upon return while keeping the file data intact until all
+/// handles close (matching POSIX `unlink(2)`)
+///
+/// If `FileDispositionInfoEx` is not supported (older Windows versions, e.g. Windows 7/8/Server 2012, or filesystems
+/// that return `ERROR_NOT_SUPPORTED` / `ERROR_INVALID_PARAMETER`), we fall back to classic `FileDispositionInfo`
+fn set_disposition_raw(handle: HANDLE) -> FrozenResult<()> {
+    // FileDispositionInfoEx similar to POSIX semantics (Win 10 1607+)
+    let info_ex = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+    };
+
+    let ok = unsafe {
+        SetFileInformationByHandle(
+            handle,
+            FileDispositionInfoEx,
+            &info_ex as *const _ as *const core::ffi::c_void,
+            core::mem::size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
+        )
+    };
+
+    if ok != 0 {
+        return Ok(());
+    }
+
+    // INFO: If not supported by the OS or filesystem driver, we must fall back to FileDispositionInfo
+
+    let code = last_error();
+    if code == ERROR_NOT_SUPPORTED || code == ERROR_INVALID_PARAMETER {
+        let info = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+        let ok_classic = unsafe {
+            SetFileInformationByHandle(
+                handle,
+                FileDispositionInfo,
+                &info as *const _ as *const core::ffi::c_void,
+                core::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        };
+
+        if ok_classic != 0 {
+            return Ok(());
+        }
+
+        let code_classic = last_error();
+        let err_msg = err_msg(code_classic);
+
+        return match code_classic {
+            ERROR_ACCESS_DENIED => err::raw_error(err::PRM, err_msg),
+            ERROR_INVALID_HANDLE => err::raw_error(err::HCF, err_msg),
+            ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION => err::raw_error(err::LCK, err_msg),
+            ERROR_NOT_SUPPORTED | ERROR_INVALID_PARAMETER => err::raw_error(err::INV, err_msg),
+            _ => err::raw_error(err::UNK, err_msg),
+        };
+    }
+
+    let err_msg = err_msg(code);
+    match code {
+        ERROR_ACCESS_DENIED => err::raw_error(err::PRM, err_msg),
+        ERROR_INVALID_HANDLE => err::raw_error(err::HCF, err_msg),
+        ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION => err::raw_error(err::LCK, err_msg),
+        _ => err::raw_error(err::UNK, err_msg),
+    }
+}
+
 /// Query the current logical file length via `GetFileSizeEx`
 ///
 /// Returns a `LARGE_INTEGER` (i64); negative values indicate severe NTFS corruption
@@ -969,8 +1062,8 @@ fn get_size_raw(handle: HANDLE) -> FrozenResult<usize> {
 ///
 /// ## Why Sync the Parent Directory on Windows?
 ///
-/// NTFS with default settings journals directory updates, so a `DeleteFileW` or `CreateFileW` followed by
-/// a crash will typically be replayed correctly on the next mount
+/// NTFS with default settings journals directory updates, so a `DeleteFileW` or `CreateFileW` followed by a crash
+/// will typically be replayed correctly on the next mount
 ///
 /// However,
 ///
@@ -984,13 +1077,13 @@ fn get_size_raw(handle: HANDLE) -> FrozenResult<usize> {
 /// We open the parent directory with `FILE_FLAG_BACKUP_SEMANTICS` (which is required to open directories) and
 /// call `FlushFileBuffers`
 ///
-/// On NTFS this is a no-op most of the time (journal replay handles it), but on the filesystems above it
-/// provides an actual durability guarantee
+/// On NTFS this is a no-op most of the time (journal replay handles it), but on the filesystems above it provides
+/// an actual durability guarantee
 ///
 /// ## Best-effort
 ///
-/// If the parent directory cannot be opened (permission denied, path resolution failure), we silently continue
-/// the worst outcome is that a crash loses the directory entry, which is recoverable by the caller's higher-level
+/// If the parent directory cannot be opened (permission denied, path resolution failure), we silently continue the
+/// worst outcome is that a crash loses the directory entry, which is recoverable by the caller's higher-level
 /// recovery logic
 fn sync_parent_dir(path: &std::path::Path) -> FrozenResult<()> {
     let parent = extract_parent_dir(path);
@@ -1021,13 +1114,12 @@ fn sync_parent_dir(path: &std::path::Path) -> FrozenResult<()> {
     //
     // We intentionally ignore flush errors on the directory handle
     //
-    // On NTFS, directory flushes are almost always a no-op because the journal already protects directory
-    // metadata
+    // On NTFS, directory flushes are almost always a no-op because the journal already protects directory metadata
     //
     // On ReFS/exFAT the flush is best-effort due to driver limitations
     //
-    // In neither case does a failed directory flush constitute a data loss event for the file itself; only
-    // for the directory entry, which is recoverable
+    // In neither case does a failed directory flush constitute a data loss event for the file itself; only for
+    // the directory entry, which is recoverable
     let _ = flush_raw(h);
 
     // INFO:
@@ -1088,8 +1180,8 @@ fn err_msg(code: u32) -> String {
 
 /// Build the parent directory path from `path`
 ///
-/// If `path` has no parent component (e.g. a bare filename), returns `"."` so that `sync_parent_dir` operates
-/// on the current working directory
+/// If `path` has no parent component (e.g. a bare filename), returns `"."` so that `sync_parent_dir` operates on
+/// the current working directory
 fn extract_parent_dir(path: &std::path::Path) -> std::path::PathBuf {
     match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
@@ -1099,8 +1191,8 @@ fn extract_parent_dir(path: &std::path::Path) -> std::path::PathBuf {
 
 /// Construct a zeroed `OVERLAPPED` with the I/O offset pre filled
 ///
-/// Win32 decomposes the 64-bit file offset into two 32-bit fields (`Offset` and `OffsetHigh`) stored inside
-/// the `Anonymous.Anonymous` union within `OVERLAPPED`
+/// Win32 decomposes the 64-bit file offset into two 32-bit fields (`Offset` and `OffsetHigh`) stored inside the
+/// `Anonymous.Anonymous` union within `OVERLAPPED`
 ///
 /// We zero the struct first (satisfying any reserved-field requirements) and then set the two offset fields
 ///
@@ -1215,6 +1307,38 @@ mod tests {
             assert!(path.exists());
 
             file.unlink(&path).unwrap();
+            assert!(!path.exists());
+        }
+
+        #[test]
+        fn ok_unlink_while_locked_and_immediate_recreate() {
+            let (_dir, path) = tmp_path();
+            let file = WINFile::new(&path).unwrap();
+            file.flock().unwrap();
+
+            // Unlink while locked
+            file.unlink(&path).unwrap();
+            assert!(!path.exists());
+
+            // Immediate recreate succeeds (no leftover lock or sharing violation)
+            let new_file = WINFile::create(&path).unwrap();
+            assert!(path.exists());
+            new_file.close().unwrap();
+        }
+
+        #[test]
+        fn ok_unlink_concurrent_reader_handles() {
+            let (_dir, path) = tmp_path();
+            let file = WINFile::new(&path).unwrap();
+
+            // Open another handle with FILE_SHARE_DELETE
+            let reader = WINFile::open(&path).unwrap();
+
+            // Deleting while reader is open succeeds due to FILE_SHARE_DELETE + POSIX/disposition semantics
+            file.unlink(&path).unwrap();
+
+            // Reader can still close cleanly
+            reader.close().unwrap();
             assert!(!path.exists());
         }
 
@@ -1435,9 +1559,8 @@ mod tests {
         fn ok_is_closed_after_close() {
             let (_dir, path) = tmp_path();
             let file = WINFile::new(&path).unwrap();
+
             file.close().unwrap();
-            // After close(), the file struct is consumed — verify via Drop semantics only
-            // (no access to `file` after `.close()`)
         }
     }
 }
