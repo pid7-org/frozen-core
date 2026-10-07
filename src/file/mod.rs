@@ -1044,7 +1044,8 @@ mod tests {
             let (_dir, cfg) = tmp_path();
             let file = File::new(cfg.clone()).unwrap();
 
-            // On Windows without FILE_SHARE_DELETE, external deletion while open fails with ERROR_SHARING_VIOLATION (32)
+            // On Windows without FILE_SHARE_DELETE, external deletion while open fails with ERROR_SHARING_VIOLATION
+            // (32)
             let err = std::fs::remove_file(&cfg.path).unwrap_err();
             assert_eq!(err.raw_os_error(), Some(32));
 

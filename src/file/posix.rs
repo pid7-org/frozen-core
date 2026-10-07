@@ -291,7 +291,8 @@ impl FileInterface for POSIXFile {
     ///
     /// in all these scenarios, either the `st_size` is correctly updated or not updated at all (in an atomic op sense)
     ///
-    /// If either of `fallocate` or `f_preallocate` has failed or is not supported by fs, as long as `ftruncate` succeeds,
+    /// If either of `fallocate` or `f_preallocate` has failed or is not supported by fs, as long as `ftruncate`
+    /// succeeds,
     /// our future write ops will work fine
     ///
     /// This is mainly because `fallocate` and `f_preallocate` are best-effort physical extent reservations to
@@ -365,7 +366,8 @@ impl FileInterface for POSIXFile {
     /// The supposed best os, i.e. mac, does not provide strong durability via `fsync()`, hence the data writes/updates
     /// may be lost on crash or power failure
     ///
-    /// Ref -> [https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fsync.2.html]
+    /// Ref ->
+    /// https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fsync.2.html
     ///
     /// To achieve true crash durability (including protection against power loss, sudden crash), we have to use the
     /// `fcntl(fd, F_FULLFSYNC)` syscall
@@ -983,7 +985,8 @@ fn sync_file_range_raw(fd: FileId, offset: usize, len: usize) -> FrozenResult<()
 /// ## Filesystem Support
 ///
 /// Not all filesystems (e.g. NFS, older CIFS, or non-extent-based filesystems) support block allocation
-/// (`fallocate`), while `EOPNOTSUPP` and `ENOSYS` are treated as non-fatal because preallocation is a latency and `ENOSPC`
+/// (`fallocate`), while `EOPNOTSUPP` and `ENOSYS` are treated as non-fatal because preallocation is a latency and
+/// `ENOSPC`
 /// avoidance optimization
 ///
 /// standard zero-fill or `ftruncate()` will handle subsequent space growth
@@ -1265,7 +1268,8 @@ fn flock_raw(fd: FileId) -> FrozenResult<()> {
 ///
 /// ## Purpose
 ///
-/// In POSIX systems, syscalls like `open(path)`, `close(fd)` and `unlink(path)`, does not provide crash safe durability,
+/// In POSIX systems, syscalls like `open(path)`, `close(fd)` and `unlink(path)`, does not provide crash safe
+/// durability,
 /// hence after a sudden crash or power loss, the operation may reverse, resulting in catastrophic consequences
 ///
 /// we must `fsync(parent_dir)`, for crash safe durability
@@ -1416,7 +1420,8 @@ fn extract_parent_dir(path: &std::path::Path) -> std::path::PathBuf {
 ///
 /// ## Why do we retry?
 ///
-/// POSIX syscalls are interruptible by signals, and may fail w/ `EINTR`, in such cases no progress is guaranteed, so the
+/// POSIX syscalls are interruptible by signals, and may fail w/ `EINTR`, in such cases no progress is guaranteed, so
+/// the
 /// syscall must be retried
 ///
 /// ## Failure Management
