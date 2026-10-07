@@ -639,7 +639,6 @@ impl WINFile {
     ///
     /// We still sync the parent directory via `sync_parent_dir` for correctness on ReFS and non-journaling
     /// volumes (e.g. exFAT)
-    #[allow(unused)]
     pub(super) fn new(path: &std::path::Path) -> FrozenResult<Self> {
         let handle = create_file_raw(path, OPEN_ALWAYS)?;
         let file = Self { handle: atomic::AtomicIsize::new(handle) };

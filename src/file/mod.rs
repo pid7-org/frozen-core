@@ -244,6 +244,81 @@ impl File {
         Ok(Self { cfg, file, current_length: atomic::AtomicUsize::new(curr_len) })
     }
 
+    /// Open an existing [`File`] or create it if it does not yet exist
+    ///
+    /// ## Semantics
+    ///
+    /// Uses idempotent open-or-create (`OPEN_ALWAYS` on Windows, `O_CREAT` without `O_EXCL` on POSIX)
+    ///
+    /// If the file is newly created, it is grown to `buffer_size * initial_available_buffers` and synced; and if
+    /// the file already exists, it is opened and its layout invariants are validated
+    ///
+    /// In both cases, an exclusive advisory lock is acquired on the file
+    pub fn open_or_create(cfg: FileCfg) -> FrozenResult<Self> {
+        let _ = err::init_mid(cfg.module_id);
+
+        if cfg.buffer_size == 0 || cfg.initial_available_buffers == 0 {
+            return err::default_error(err::INV);
+        }
+
+        let init_len = match cfg.buffer_size.checked_mul(cfg.initial_available_buffers) {
+            Some(len) => len,
+            None => return err::default_error(err::INV),
+        };
+
+        let file = PlatformFile::new(&cfg.path)?;
+
+        if let Err(mut e) = file.flock() {
+            if let Err(close_err) = file.close() {
+                e.add_suppressed(close_err);
+            }
+
+            return Err(e);
+        }
+
+        let curr_len = match file.length() {
+            Ok(len) => len,
+            Err(mut e) => {
+                if let Err(close_err) = file.close() {
+                    e.add_suppressed(close_err);
+                }
+
+                return Err(e);
+            }
+        };
+
+        if curr_len == 0 {
+            if let Err(mut e) = file.grow(0, init_len) {
+                if let Err(close_err) = file.close() {
+                    e.add_suppressed(close_err);
+                }
+
+                return Err(e);
+            }
+
+            if let Err(mut e) = file.sync() {
+                if let Err(close_err) = file.close() {
+                    e.add_suppressed(close_err);
+                }
+
+                return Err(e);
+            }
+
+            Ok(Self { cfg, file, current_length: atomic::AtomicUsize::new(init_len) })
+        } else {
+            if curr_len < init_len || curr_len % cfg.buffer_size != 0 {
+                let mut e = err::default_error::<Self>(err::CPT).unwrap_err();
+                if let Err(close_err) = file.close() {
+                    e.add_suppressed(close_err);
+                }
+
+                return Err(e);
+            }
+
+            Ok(Self { cfg, file, current_length: atomic::AtomicUsize::new(curr_len) })
+        }
+    }
+
     /// Read bytes starting from buffer `index` into `buf` w/ `pread` syscall
     ///
     /// ## Multiple Buffers
@@ -546,6 +621,74 @@ mod tests {
 
             let err = File::open(cfg).unwrap_err();
             assert_eq!(err.reason, err::CPT.reason);
+        }
+    }
+
+    mod file_open_or_create {
+        use super::*;
+
+        #[test]
+        fn ok_creates_when_missing() {
+            let (_dir, cfg) = tmp_path();
+            assert!(!cfg.path.exists());
+
+            let file = File::open_or_create(cfg.clone()).unwrap();
+            assert!(cfg.path.exists());
+            assert_eq!(file.length(), BUFFER_SIZE * INIT_BUFFERS);
+            assert!(file.exists().unwrap());
+        }
+
+        #[test]
+        fn ok_opens_when_existing() {
+            let (_dir, cfg) = tmp_path();
+            // First create and populate
+            let file = File::new(cfg.clone()).unwrap();
+            let data = [0x5Au8; BUFFER_SIZE];
+            file.write(&data, 0).unwrap();
+            file.sync().unwrap();
+            drop(file);
+
+            // Now open_or_create should open the existing file
+            let opened = File::open_or_create(cfg.clone()).unwrap();
+            assert_eq!(opened.length(), BUFFER_SIZE * INIT_BUFFERS);
+            let mut buf = [0u8; BUFFER_SIZE];
+            opened.read(&mut buf, 0).unwrap();
+            assert_eq!(buf, data);
+        }
+
+        #[test]
+        fn err_open_or_create_invalid_cfg() {
+            let (_dir, mut cfg) = tmp_path();
+            cfg.buffer_size = 0;
+            let err = File::open_or_create(cfg.clone()).unwrap_err();
+            assert_eq!(err.reason, err::INV.reason);
+
+            cfg.buffer_size = BUFFER_SIZE;
+            cfg.initial_available_buffers = 0;
+            let err = File::open_or_create(cfg).unwrap_err();
+            assert_eq!(err.reason, err::INV.reason);
+        }
+
+        #[test]
+        fn err_open_or_create_corrupt_existing() {
+            let (_dir, cfg) = tmp_path();
+            // Write a corrupt non-aligned size file
+            let non_aligned = (BUFFER_SIZE * INIT_BUFFERS) + 1;
+            std::fs::write(&cfg.path, vec![0u8; non_aligned]).unwrap();
+
+            let err = File::open_or_create(cfg).unwrap_err();
+            assert_eq!(err.reason, err::CPT.reason);
+        }
+
+        #[test]
+        fn err_open_or_create_when_locked() {
+            let (_dir, cfg) = tmp_path();
+            let file = File::open_or_create(cfg.clone()).unwrap();
+
+            // Opening another instance while locked fails with LCK
+            let err = File::open_or_create(cfg).unwrap_err();
+            assert_eq!(err.reason, err::LCK.reason);
+            drop(file);
         }
     }
 
