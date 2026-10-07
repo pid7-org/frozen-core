@@ -25,35 +25,35 @@ use windows_sys::Win32::{
 ///
 /// ## NOTES
 ///
-/// We store the Win32 `HANDLE` (a pointer sized kernel object reference) as `isize` rather than
-/// `*mut c_void` mainly for two reasons,
+/// We store the Win32 file handle as `isize` rather than `*mut c_void` mainly for two reasons,
 ///
-/// - `isize` maps directly to `AtomicIsize`, giving us lock-free atomic handle swaps (same reasoning
-///   as `AtomicI32` for POSIX `c_int` descriptors)
-/// - Raw pointers are `!Send + !Sync`, which would leak into the public `FileId` type alias, creating a
-///   pervasive `unsafe impl` burden for callers
+/// - `isize` maps directly to `AtomicIsize`, giving lock free atomic handle swaps (same reasoning as `AtomicI32`
+///   for POSIX `c_int` descriptors)
+/// - Raw pointers are `!Send + !Sync`, which would leak into the public `FileId` type alias, creating a pervasive
+///   `unsafe impl` burden for callers
 ///
-/// At every Win32 callsite we convert the `handle as usize as HANDLE`;  on x86-64 and AArch64 (our only
-/// supported targets), `isize` and `HANDLE` have identical bit representations
+/// At every Win32 callsite we convert the `handle as usize as HANDLE`;  on x86-64 and AArch64 (our only supported
+/// targets), `isize` and `HANDLE` have identical bit representations
 pub(super) type FileId = isize;
 
 /// Sentinel representing a closed or never opened handle
 ///
 /// ## NOTES
 ///
-/// Win32 defines `INVALID_HANDLE_VALUE` as `(HANDLE)(LONG_PTR)-1`, which is `-1isize` on all
-/// 64-bit Windows targets.  We deliberately avoid `0` (NULL) because some Win32 calls, such as
-/// `CreateFileW` on the NUL device, legitimately return `0x0` as a valid handle
+/// Win32 defines `INVALID_HANDLE_VALUE` as `(HANDLE)(LONG_PTR)-1`, which is `-1isize` on all 64-bit Windows targets
+///
+/// We deliberately avoid `0` (NULL) because some Win32 calls, such as `CreateFileW` on the NULL device,
+/// legitimately return `0x0` as a valid handle
 pub(in crate::file) const CLOSED_HANDLE: FileId = -1isize;
 
 /// Maximum retries for transient `ERROR_SHARING_VIOLATION` / `ERROR_LOCK_VIOLATION` races
 ///
 /// ## NOTES
 ///
-/// Win32 does not have a signal-interruption model equivalent to POSIX `EINTR`, but file-share
-/// and lock-violation errors can appear transiently when another process is in the middle of
-/// opening or releasing a file handle.  Twelve retries with no explicit sleep keeps us responsive
-/// while tolerating short storms
+/// Win32 does not have a signal interruption model equivalent to POSIX `EINTR`, but file share and lock violation
+/// errors can appear transiently when another process is in the middle of opening or releasing a file handle
+///
+/// Twelve retries with no explicit sleep keeps us responsive while tolerating short storms
 const MAX_RETRIES: usize = 0x0C;
 
 /// Custom implementation of `std::fs::File` for Windows 64-bit systems
@@ -78,11 +78,10 @@ impl FileInterface for WINFile {
     ///
     /// `GetFileAttributesW` is a single, documented kernel32 call with well defined error codes
     ///
-    /// It does not require linking `shlwapi.dll` (where `PathFileExistsW` lives) and is available
-    /// on all Win32 versions we target
+    /// It does not require linking `shlwapi.dll` (where `PathFileExistsW` lives) and it has better availability
     ///
-    /// It is also the canonical check used by virtually every production grade storage engine on Windows
-    /// such as RocksDB, LMDB, SQLite, etc.
+    /// It is also the canonical check used by virtually every production grade storage engine on Windows such as
+    /// RocksDB, LMDB, SQLite, etc.
     ///
     /// `INVALID_FILE_ATTRIBUTES` (0xFFFF_FFFF) is the sentinel for failure; we then inspect `GetLastError` to
     /// distinguish permission denial from genuine absence
@@ -126,7 +125,7 @@ impl FileInterface for WINFile {
     /// We pass this flag at `CreateFileW` time because Win32 has no `posix_fadvise` equivalent for open handles
     ///
     /// The flag instructs the Cache Manager to bypass sequential read ahead heuristics, which is exactly what
-    /// [`posix::f_advise_raw(FADV_RANDOM)`] does on Linux
+    /// [`posix::f_advise_raw(FADV_RANDOM)`] does on Linux systems
     ///
     /// ## Exclusive Lock
     ///
@@ -183,8 +182,8 @@ impl FileInterface for WINFile {
     ///
     /// This is identical to how SQLite, LMDB and the Chromium leveldb port take whole-file locks on Windows
     ///
-    /// It avoids any partial-lock confusion if `grow()` later extends the file beyond a smaller initial
-    /// lock range
+    /// It avoids any partial lock confusion if `grow()` later extends the file beyond a smaller initial lock
+    /// range
     ///
     /// ## Advisory Semantics
     ///
@@ -214,8 +213,8 @@ impl FileInterface for WINFile {
     ///
     /// ## Lock Release
     ///
-    /// Win32 byte range locks acquired via `LockFileEx` are automatically released when the last
-    /// handle to the file is closed
+    /// Win32 byte range locks acquired via `LockFileEx` are automatically released when the last handle to the
+    /// file is closed
     ///
     /// We do not need a matching `UnlockFileEx` call here
     ///
