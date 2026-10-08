@@ -50,7 +50,7 @@ mod windows;
 
 use crate::{
     ack::{AckTicket, Completion, SyncTrigger, TEpoch},
-    error::{ErrCode, FrozenError, FrozenResult},
+    error::{BindModule, ErrCode, FrozenError, FrozenResult},
 };
 use interface::FileInterface;
 use std::sync::{Arc, Condvar, Mutex, RwLock, atomic};
@@ -67,9 +67,6 @@ pub(in crate::file) mod err {
 
     /// Domain Id for [`File`] is **8**
     const ERRDOMAIN: u8 = 0x08;
-
-    /// module id used for [`FrozenError`]
-    static MID: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
 
     /// internal fuck up (hault and catch fire)
     pub const HCF: ErrCode = ErrCode::new(0x02, "hault and catch fire");
@@ -112,39 +109,24 @@ pub(in crate::file) mod err {
     /// file already exists
     pub const EXS: ErrCode = ErrCode::new(0x1E, "file already exists");
 
-    /// Default module id used when [`MID`] is not explicitly initialized
-    const DEFAULT_MID: u8 = 0x00;
-
-    #[inline(always)]
-    fn mid() -> u8 {
-        *MID.get_or_init(|| DEFAULT_MID)
-    }
-
-    /// Initialize the module identifier used for [`File`] error propagation.
-    ///
-    /// Returns `Ok(())` if set successfully, or `Err(already_set_id)` if it was already initialized
-    pub(in crate::file) fn init_mid(id: u8) -> Result<(), u8> {
-        MID.set(id)
-    }
-
     #[inline]
     pub(in crate::file) fn raw_error<R, E: std::fmt::Display>(
         code: ErrCode,
         error: E,
     ) -> FrozenResult<R> {
-        let err = FrozenError::new_raw(mid(), ERRDOMAIN, code, error);
+        let err = FrozenError::unbound_raw(ERRDOMAIN, code, error);
         Err(err)
     }
 
     #[inline]
     pub(in crate::file) fn default_error<R>(code: ErrCode) -> FrozenResult<R> {
-        let err = FrozenError::new(mid(), ERRDOMAIN, code, "");
+        let err = FrozenError::unbound(ERRDOMAIN, code, "");
         Err(err)
     }
 
     #[inline]
     pub(in crate::file) fn make_error(code: ErrCode) -> FrozenError {
-        FrozenError::new(mid(), ERRDOMAIN, code, "")
+        FrozenError::unbound(ERRDOMAIN, code, "")
     }
 
     #[inline]
@@ -152,7 +134,7 @@ pub(in crate::file) mod err {
         code: ErrCode,
         error: E,
     ) -> FrozenError {
-        FrozenError::new_raw(mid(), ERRDOMAIN, code, error)
+        FrozenError::unbound_raw(ERRDOMAIN, code, error)
     }
 }
 
@@ -272,6 +254,7 @@ impl FileInner {
                 Ok(())
             }
             Err(e) => {
+                let e = e.with_module(self.cfg.module_id);
                 self.completion.set_err(e.clone());
                 self.completion.notify_all_listeners();
 
@@ -362,10 +345,10 @@ impl File {
                             err.add_suppressed(close_err);
                         }
 
-                        return Err(err);
+                        return Err(err.with_module(cfg.module_id));
                     }
 
-                    return err::raw_error(err::HCF, spawn_err);
+                    return err::raw_error(err::HCF, spawn_err).with_module(cfg.module_id);
                 }
             };
 
@@ -408,23 +391,23 @@ impl File {
     /// assert!(File::new(cfg).is_err());
     /// ```
     pub fn new(cfg: FileCfg) -> FrozenResult<Self> {
-        let _ = err::init_mid(cfg.module_id);
+        let mid = cfg.module_id;
         if cfg.buffer_size == 0 || cfg.initial_available_buffers == 0 {
-            return err::default_error(err::INV);
+            return err::default_error(err::INV).with_module(mid);
         }
 
         let init_len = match cfg.buffer_size.checked_mul(cfg.initial_available_buffers) {
             Some(len) => len,
-            None => return err::default_error(err::GRW),
+            None => return err::default_error(err::GRW).with_module(mid),
         };
 
-        let file = PlatformFile::create(&cfg.path)?;
+        let file = PlatformFile::create(&cfg.path).with_module(mid)?;
         if let Err(mut e) = file.grow(0, init_len) {
             if let Err(unlink_err) = file.unlink(&cfg.path) {
                 e.add_suppressed(unlink_err);
             }
 
-            return Err(e);
+            return Err(e.with_module(mid));
         }
 
         if let Err(mut e) = file.sync() {
@@ -432,7 +415,7 @@ impl File {
                 e.add_suppressed(unlink_err);
             }
 
-            return Err(e);
+            return Err(e.with_module(mid));
         }
 
         Self::from_platform_file(cfg, file, init_len)
@@ -472,25 +455,25 @@ impl File {
     /// assert_eq!(opened.length(), 256);
     /// ```
     pub fn open(cfg: FileCfg) -> FrozenResult<Self> {
-        let _ = err::init_mid(cfg.module_id);
+        let mid = cfg.module_id;
 
         if cfg.buffer_size == 0 || cfg.initial_available_buffers == 0 {
-            return err::default_error(err::INV);
+            return err::default_error(err::INV).with_module(mid);
         }
 
         let init_len = match cfg.buffer_size.checked_mul(cfg.initial_available_buffers) {
             Some(len) => len,
-            None => return err::default_error(err::CPT),
+            None => return err::default_error(err::CPT).with_module(mid),
         };
 
-        let file = PlatformFile::open(&cfg.path)?;
+        let file = PlatformFile::open(&cfg.path).with_module(mid)?;
 
         if let Err(mut e) = file.flock() {
             if let Err(close_err) = file.close() {
                 e.add_suppressed(close_err);
             }
 
-            return Err(e);
+            return Err(e.with_module(mid));
         }
 
         let curr_len = match file.length() {
@@ -500,7 +483,7 @@ impl File {
                     e.add_suppressed(close_err);
                 }
 
-                return Err(e);
+                return Err(e.with_module(mid));
             }
         };
 
@@ -510,7 +493,7 @@ impl File {
                 e.add_suppressed(close_err);
             }
 
-            return Err(e);
+            return Err(e.with_module(mid));
         }
 
         Self::from_platform_file(cfg, file, curr_len)
@@ -552,24 +535,24 @@ impl File {
     /// assert_eq!(reopened.length(), 128);
     /// ```
     pub fn open_or_create(cfg: FileCfg) -> FrozenResult<Self> {
-        let _ = err::init_mid(cfg.module_id);
+        let mid = cfg.module_id;
 
         if cfg.buffer_size == 0 || cfg.initial_available_buffers == 0 {
-            return err::default_error(err::INV);
+            return err::default_error(err::INV).with_module(mid);
         }
 
         let init_len = match cfg.buffer_size.checked_mul(cfg.initial_available_buffers) {
             Some(len) => len,
-            None => return err::default_error(err::INV),
+            None => return err::default_error(err::INV).with_module(mid),
         };
 
-        let file = PlatformFile::new(&cfg.path)?;
+        let file = PlatformFile::new(&cfg.path).with_module(mid)?;
         if let Err(mut e) = file.flock() {
             if let Err(close_err) = file.close() {
                 e.add_suppressed(close_err);
             }
 
-            return Err(e);
+            return Err(e.with_module(mid));
         }
 
         let curr_len = match file.length() {
@@ -579,7 +562,7 @@ impl File {
                     e.add_suppressed(close_err);
                 }
 
-                return Err(e);
+                return Err(e.with_module(mid));
             }
         };
 
@@ -589,7 +572,7 @@ impl File {
                     e.add_suppressed(close_err);
                 }
 
-                return Err(e);
+                return Err(e.with_module(mid));
             }
 
             if let Err(mut e) = file.sync() {
@@ -597,7 +580,7 @@ impl File {
                     e.add_suppressed(close_err);
                 }
 
-                return Err(e);
+                return Err(e.with_module(mid));
             }
 
             Self::from_platform_file(cfg, file, init_len)
@@ -608,7 +591,7 @@ impl File {
                     e.add_suppressed(close_err);
                 }
 
-                return Err(e);
+                return Err(e.with_module(mid));
             }
 
             Self::from_platform_file(cfg, file, curr_len)
@@ -656,30 +639,31 @@ impl File {
     /// ```
     #[inline(always)]
     pub fn read(&self, buf: &mut [u8], index: usize) -> FrozenResult<()> {
+        let mid = self.cfg.module_id;
         if buf.is_empty() {
             return Ok(());
         }
 
         if buf.len() % self.cfg.buffer_size != 0 {
-            return err::default_error(err::INV);
+            return err::default_error(err::INV).with_module(mid);
         }
 
         let offset = match index.checked_mul(self.cfg.buffer_size) {
             Some(off) => off,
-            None => return err::default_error(err::INV),
+            None => return err::default_error(err::INV).with_module(mid),
         };
 
         if offset.checked_add(buf.len()).is_none_or(|end| end > self.length()) {
-            return err::default_error(err::HCF);
+            return err::default_error(err::HCF).with_module(mid);
         }
 
         let guard = self.inner.file.read().unwrap_or_else(|e| e.into_inner());
         let file = match guard.as_ref() {
             Some(f) => f,
-            None => return err::default_error(err::INV),
+            None => return err::default_error(err::INV).with_module(mid),
         };
 
-        file.pread(buf, offset)
+        file.pread(buf, offset).with_module(mid)
     }
 
     /// Write bytes starting at buffer `index` from `buf` w/ `pwrite` syscall
@@ -719,31 +703,32 @@ impl File {
     /// ```
     #[inline(always)]
     pub fn write(&self, buf: &[u8], index: usize) -> FrozenResult<AckTicket> {
+        let mid = self.cfg.module_id;
         if buf.is_empty() {
             let current = self.inner.completion.read_current_epoch();
             return Ok(AckTicket::new(current, self.inner.completion.clone()));
         }
 
         if buf.len() % self.cfg.buffer_size != 0 {
-            return err::default_error(err::INV);
+            return err::default_error(err::INV).with_module(mid);
         }
 
         let offset = match index.checked_mul(self.cfg.buffer_size) {
             Some(off) => off,
-            None => return err::default_error(err::INV),
+            None => return err::default_error(err::INV).with_module(mid),
         };
 
         if offset.checked_add(buf.len()).is_none_or(|end| end > self.length()) {
-            return err::default_error(err::HCF);
+            return err::default_error(err::HCF).with_module(mid);
         }
 
         let guard = self.inner.file.read().unwrap_or_else(|e| e.into_inner());
         let file = match guard.as_ref() {
             Some(f) => f,
-            None => return err::default_error(err::INV),
+            None => return err::default_error(err::INV).with_module(mid),
         };
 
-        file.pwrite(buf, offset)?;
+        file.pwrite(buf, offset).with_module(mid)?;
 
         let epoch = self.inner.completion.increment_current_epoch();
         Ok(AckTicket::new(epoch, self.inner.completion.clone()))
@@ -775,23 +760,24 @@ impl File {
     /// assert_eq!(file.total_buffers().unwrap(), 5);
     /// ```
     pub fn grow(&self, count: usize) -> FrozenResult<()> {
+        let mid = self.cfg.module_id;
         if count == 0 {
             return Ok(());
         }
 
         let len_to_add = match self.cfg.buffer_size.checked_mul(count) {
             Some(len) => len,
-            None => return err::default_error(err::GRW),
+            None => return err::default_error(err::GRW).with_module(mid),
         };
 
         let guard = self.inner.file.write().unwrap_or_else(|e| e.into_inner());
         let file = match guard.as_ref() {
             Some(f) => f,
-            None => return err::default_error(err::INV),
+            None => return err::default_error(err::INV).with_module(mid),
         };
 
         let curr_len = self.inner.current_length.load(atomic::Ordering::Acquire);
-        file.grow(curr_len, len_to_add)?;
+        file.grow(curr_len, len_to_add).with_module(mid)?;
 
         self.inner.current_length.fetch_add(len_to_add, atomic::Ordering::Release);
         self.inner.completion.increment_current_epoch();
@@ -852,22 +838,23 @@ impl File {
     /// ```
     #[cfg(target_os = "linux")]
     pub fn sync_range(&self, index: usize, count: usize) -> FrozenResult<()> {
+        let mid = self.cfg.module_id;
         let offset = match index.checked_mul(self.cfg.buffer_size) {
             Some(off) => off,
-            None => return err::default_error(err::INV),
+            None => return err::default_error(err::INV).with_module(mid),
         };
         let len_to_sync = match count.checked_mul(self.cfg.buffer_size) {
             Some(len) => len,
-            None => return err::default_error(err::INV),
+            None => return err::default_error(err::INV).with_module(mid),
         };
 
         let guard = self.inner.file.read().unwrap_or_else(|e| e.into_inner());
         let file = match guard.as_ref() {
             Some(f) => f,
-            None => return err::default_error(err::INV),
+            None => return err::default_error(err::INV).with_module(mid),
         };
 
-        file.sync_range(offset, len_to_sync)
+        file.sync_range(offset, len_to_sync).with_module(mid)
     }
 
     /// Fetch total available buffers in [`File`]
@@ -895,7 +882,7 @@ impl File {
         let buffer_size = self.cfg.buffer_size;
 
         if crate::hints::unlikely(curr_len % buffer_size != 0) {
-            return err::default_error(err::CPT);
+            return err::default_error(err::CPT).with_module(self.cfg.module_id);
         }
 
         Ok(curr_len / buffer_size)
@@ -1055,7 +1042,7 @@ impl File {
     /// ```
     #[inline]
     pub fn exists(&self) -> FrozenResult<bool> {
-        PlatformFile::exists(&self.cfg.path)
+        PlatformFile::exists(&self.cfg.path).with_module(self.cfg.module_id)
     }
 
     /// Deletes the [`File`] entry from the storage device
@@ -1092,6 +1079,7 @@ impl File {
     /// assert!(!path.exists());
     /// ```
     pub fn delete(mut self) -> FrozenResult<()> {
+        let mid = self.cfg.module_id;
         self.inner.shutdown.store(true, atomic::Ordering::Release);
         {
             let mut guard = self.inner.sync_mutex.lock().unwrap_or_else(|e| e.into_inner());
@@ -1106,10 +1094,10 @@ impl File {
         let mut guard = self.inner.file.write().unwrap_or_else(|e| e.into_inner());
         let file = match guard.take() {
             Some(f) => f,
-            None => return err::default_error(err::INV),
+            None => return err::default_error(err::INV).with_module(mid),
         };
 
-        file.unlink(&self.cfg.path)
+        file.unlink(&self.cfg.path).with_module(mid)
     }
 
     /// Get file descriptor or handle for [`File`]
@@ -2245,6 +2233,60 @@ mod tests {
             epochs.sort();
             epochs.dedup();
             assert_eq!(epochs.len(), num_threads);
+        }
+    }
+
+    mod module_binding {
+        use super::*;
+
+        #[test]
+        fn ok_multiple_files_distinct_module_ids() {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg1 = FileCfg {
+                module_id: 0x11,
+                path: dir.path().join("file1.db"),
+                buffer_size: BUFFER_SIZE,
+                initial_available_buffers: INIT_BUFFERS,
+                sync_interval: None,
+            };
+            let cfg2 = FileCfg {
+                module_id: 0x22,
+                path: dir.path().join("file2.db"),
+                buffer_size: BUFFER_SIZE,
+                initial_available_buffers: INIT_BUFFERS,
+                sync_interval: None,
+            };
+
+            let file1 = File::new(cfg1.clone()).unwrap();
+            let file2 = File::new(cfg2.clone()).unwrap();
+
+            // Operations causing errors on file1 must carry module_id 0x11
+            let mut invalid_buf = [0u8; BUFFER_SIZE - 1];
+            let err1 = file1.read(&mut invalid_buf, 0).unwrap_err();
+            assert_eq!(err1.module, 0x11);
+            assert_eq!(err1.reason, err::INV.reason);
+
+            let err1_oob = file1.read(&mut [0u8; BUFFER_SIZE], 999).unwrap_err();
+            assert_eq!(err1_oob.module, 0x11);
+            assert_eq!(err1_oob.reason, err::HCF.reason);
+
+            // Operations causing errors on file2 must carry module_id 0x22
+            let err2 = file2.read(&mut invalid_buf, 0).unwrap_err();
+            assert_eq!(err2.module, 0x22);
+            assert_eq!(err2.reason, err::INV.reason);
+
+            let err2_oob = file2.write(&[0u8; BUFFER_SIZE], 999).unwrap_err();
+            assert_eq!(err2_oob.module, 0x22);
+            assert_eq!(err2_oob.reason, err::HCF.reason);
+
+            // Existing file error on File::new carries respective module_id
+            let err1_exs = File::new(cfg1).unwrap_err();
+            assert_eq!(err1_exs.module, 0x11);
+            assert_eq!(err1_exs.reason, err::EXS.reason);
+
+            let err2_exs = File::new(cfg2).unwrap_err();
+            assert_eq!(err2_exs.module, 0x22);
+            assert_eq!(err2_exs.reason, err::EXS.reason);
         }
     }
 }
