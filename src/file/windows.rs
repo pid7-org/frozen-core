@@ -1,6 +1,6 @@
 use super::{err, interface::FileInterface};
 use crate::{error::FrozenResult, hints};
-use std::sync::atomic;
+use std::{sync::atomic, time::Duration};
 use windows_sys::Win32::{
     Foundation::{
         CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_BAD_PATHNAME,
@@ -55,8 +55,8 @@ pub(in crate::file) const CLOSED_HANDLE: FileId = -1isize;
 /// Win32 does not have a signal interruption model equivalent to POSIX `EINTR`, but file share and lock violation
 /// errors can appear transiently when another process is in the middle of opening or releasing a file handle
 ///
-/// Twelve retries with no explicit sleep keeps us responsive while tolerating short storms
-const MAX_RETRIES: usize = 0x0C;
+/// A non CPU-blocking sleep between retries keeps us responsive while tolerating concurrent closing races
+const MAX_RETRIES: usize = 0x80;
 
 /// Custom implementation of `std::fs::File` for Windows 64-bit systems
 #[derive(Debug)]
@@ -504,6 +504,7 @@ impl FileInterface for WINFile {
                 ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION => {
                     if retries < MAX_RETRIES {
                         retries += 1;
+                        std::thread::sleep(Duration::from_millis(1));
                         continue;
                     }
 
@@ -578,6 +579,7 @@ impl FileInterface for WINFile {
                     // Rare zero write with no error code, retry bounded times before giving up
                     if retries < MAX_RETRIES {
                         retries += 1;
+                        std::thread::sleep(Duration::from_millis(1));
                         continue;
                     }
 
@@ -597,6 +599,7 @@ impl FileInterface for WINFile {
                 ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION => {
                     if retries < MAX_RETRIES {
                         retries += 1;
+                        std::thread::sleep(Duration::from_millis(1));
                         continue;
                     }
 
@@ -725,6 +728,7 @@ fn create_file_raw(path: &std::path::Path, disposition: u32) -> FrozenResult<Fil
             ERROR_SHARING_VIOLATION => {
                 if retries < MAX_RETRIES {
                     retries += 1;
+                    std::thread::sleep(Duration::from_millis(1));
                     continue;
                 }
 
