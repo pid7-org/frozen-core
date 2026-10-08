@@ -130,6 +130,69 @@ impl FrozenError {
             None => &[],
         }
     }
+
+    /// Sentinel placeholder for an unbound or default module identifier
+    pub const UNBOUND_MODULE: u8 = 0x00;
+
+    /// Construct a [`FrozenError`] where `module_id` is not yet known
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::error::{FrozenError, ErrCode};
+    ///
+    /// let err = FrozenError::unbound(0x08, ErrCode::new(0x10, "inv"), "invalid path");
+    /// assert_eq!(err.module, FrozenError::UNBOUND_MODULE);
+    /// assert_eq!(err.domain, 0x08);
+    /// assert_eq!(err.reason, 0x10);
+    /// ```
+    #[inline(always)]
+    pub fn unbound(domain: u8, code: ErrCode, errmsg: &str) -> Self {
+        Self::new(Self::UNBOUND_MODULE, domain, code, errmsg)
+    }
+
+    /// Construct a [`FrozenError`] from a raw displayable error where `module_id` is not yet known
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::error::{FrozenError, ErrCode};
+    ///
+    /// let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file missing");
+    /// let err = FrozenError::unbound_raw(0x08, ErrCode::new(0x10, "inv"), io_err);
+    /// assert_eq!(err.module, FrozenError::UNBOUND_MODULE);
+    /// assert_eq!(err.domain, 0x08);
+    /// assert_eq!(err.reason, 0x10);
+    /// ```
+    #[inline(always)]
+    pub fn unbound_raw<E: std::fmt::Display>(domain: u8, code: ErrCode, err: E) -> Self {
+        Self::new_raw(Self::UNBOUND_MODULE, domain, code, err)
+    }
+
+    /// Recursively stamps or overrides the 8-bit `module_id` onto this error
+    /// and all attached suppressed errors
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::error::{FrozenError, ErrCode};
+    ///
+    /// let err = FrozenError::unbound(0x08, ErrCode::new(0x10, "inv"), "path error")
+    ///     .with_module(0x05);
+    /// assert_eq!(err.module, 0x05);
+    /// assert_eq!(err.domain, 0x08);
+    /// assert_eq!(err.reason, 0x10);
+    /// ```
+    #[must_use]
+    pub fn with_module(mut self, module: u8) -> Self {
+        self.module = module;
+        if let Some(suppressed) = &mut self.suppressed {
+            for sub in suppressed.iter_mut() {
+                *sub = sub.clone().with_module(module);
+            }
+        }
+        self
+    }
 }
 
 impl FrozenError {
@@ -272,6 +335,32 @@ impl ErrCode {
     }
 }
 
+/// Extension trait for [`FrozenResult`] to bind a `module_id` seamlessly
+///
+/// ## Example
+///
+/// ```
+/// use frozen_core::error::{BindModule, FrozenError, FrozenResult, ErrCode};
+///
+/// fn backend_call() -> FrozenResult<()> {
+///     Err(FrozenError::unbound(0x08, ErrCode::new(0x10, "io"), "failed"))
+/// }
+///
+/// let res = backend_call().with_module(0x02);
+/// assert_eq!(res.unwrap_err().module, 0x02);
+/// ```
+pub trait BindModule<T> {
+    /// Attaches `module_id` to the inner [`FrozenError`] if `self` is `Err`
+    fn with_module(self, module_id: u8) -> FrozenResult<T>;
+}
+
+impl<T> BindModule<T> for FrozenResult<T> {
+    #[inline(always)]
+    fn with_module(self, module_id: u8) -> FrozenResult<T> {
+        self.map_err(|e| e.with_module(module_id))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,5 +481,33 @@ mod tests {
 
         assert_eq!(err.suppressed().len(), 1);
         assert_eq!(err.suppressed()[0].reason, 4);
+    }
+
+    #[test]
+    fn ok_unbound_and_with_module() {
+        let mut err = FrozenError::unbound(0x08, ErrCode::new(0x10, "inv"), "unbound err");
+        assert_eq!(err.module, FrozenError::UNBOUND_MODULE);
+        assert_eq!(err.domain, 0x08);
+        assert_eq!(err.reason, 0x10);
+
+        let suppressed = FrozenError::unbound(0x08, ErrCode::new(0x20, "close"), "suppressed err");
+        err.add_suppressed(suppressed);
+
+        let bound = err.with_module(0x42);
+        assert_eq!(bound.module, 0x42);
+        assert_eq!(bound.domain, 0x08);
+        assert_eq!(bound.reason, 0x10);
+        assert_eq!(bound.suppressed()[0].module, 0x42);
+    }
+
+    #[test]
+    fn ok_bind_module_trait() {
+        let res: FrozenResult<()> =
+            Err(FrozenError::unbound(0x08, ErrCode::new(0x10, "inv"), "fail"));
+        let bound_res = res.with_module(0x07);
+        assert_eq!(bound_res.unwrap_err().module, 0x07);
+
+        let ok_res: FrozenResult<i32> = Ok(10);
+        assert_eq!(ok_res.with_module(0x07).unwrap(), 10);
     }
 }
