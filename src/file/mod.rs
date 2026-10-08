@@ -1494,10 +1494,13 @@ mod tests {
 
             let _file = r_new.expect("File::new should succeed");
 
-            // File::open either ran before creation (INV) or while lock was held (LCK)
+            // File::open either ran before creation (INV), while lock was held (LCK),
+            // or in the brief window between creation and grow/sync (CPT)
             if let Err(e) = r_open {
                 assert!(
-                    e.reason == err::INV.reason || e.reason == err::LCK.reason,
+                    e.reason == err::INV.reason
+                        || e.reason == err::LCK.reason
+                        || e.reason == err::CPT.reason,
                     "unexpected error: {:?}",
                     e
                 );
@@ -1669,6 +1672,44 @@ mod tests {
             let new_file = creator.join().unwrap();
             assert!(new_file.exists().unwrap());
             new_file.delete().unwrap();
+        }
+
+        #[test]
+        fn ok_concurrent_open_or_create_same_file() {
+            let (_dir, cfg) = tmp_path();
+            let num_threads = 8;
+            let barrier = Arc::new(Barrier::new(num_threads));
+            let mut handles = vec![];
+
+            for _ in 0..num_threads {
+                let c = cfg.clone();
+                let b = barrier.clone();
+                handles.push(std::thread::spawn(move || {
+                    b.wait();
+                    File::open_or_create(c)
+                }));
+            }
+
+            let mut successes = 0;
+            let mut lock_failures = 0;
+
+            for h in handles {
+                match h.join().unwrap() {
+                    Ok(f) => {
+                        assert_eq!(f.length(), BUFFER_SIZE * INIT_BUFFERS);
+                        successes += 1;
+                    }
+                    Err(e) => {
+                        assert_eq!(e.reason, err::LCK.reason, "error must be LCK: {:?}", e);
+                        lock_failures += 1;
+                    }
+                }
+            }
+
+            // Exactly one must acquire the exclusive lock while other concurrent callers fail with LCK
+            assert_eq!(successes, 1);
+            assert_eq!(lock_failures, num_threads - 1);
+            assert!(cfg.path.exists());
         }
 
         #[test]
@@ -1934,6 +1975,100 @@ mod tests {
             let file = File::new(cfg).unwrap();
             assert!(file.sync_range(0, 0).is_ok());
             assert!(file.sync_range(5, 0).is_ok());
+        }
+
+        #[test]
+        #[cfg(target_os = "linux")]
+        fn err_sync_range_index_overflow() {
+            let (_dir, cfg) = tmp_path();
+            let file = File::new(cfg).unwrap();
+            let err1 = file.sync_range(usize::MAX, 1).unwrap_err();
+            assert_eq!(err1.reason, err::INV.reason);
+
+            let err2 = file.sync_range(0, usize::MAX).unwrap_err();
+            assert_eq!(err2.reason, err::INV.reason);
+        }
+
+        #[test]
+        fn ok_concurrent_multiple_growers() {
+            let (_dir, cfg) = tmp_path();
+            let file = Arc::new(File::new(cfg).unwrap());
+            let num_threads = 4;
+            let chunks_per_thread = 4;
+            let barrier = Arc::new(Barrier::new(num_threads));
+            let mut handles = vec![];
+
+            for _ in 0..num_threads {
+                let f = file.clone();
+                let b = barrier.clone();
+                handles.push(std::thread::spawn(move || {
+                    b.wait();
+                    f.grow(chunks_per_thread).unwrap();
+                }));
+            }
+
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            let expected_total_chunks = INIT_BUFFERS + (num_threads * chunks_per_thread);
+            assert_eq!(file.length(), BUFFER_SIZE * expected_total_chunks);
+            assert_eq!(file.total_buffers().unwrap(), expected_total_chunks);
+            assert_eq!(file.current_epoch(), num_threads as TEpoch);
+        }
+
+        #[test]
+        fn ok_concurrent_readers_during_grow() {
+            let (_dir, cfg) = tmp_path();
+            let file = Arc::new(File::new(cfg).unwrap());
+            let initial_data = [0x5Au8; BUFFER_SIZE];
+            file.write(&initial_data, 0).unwrap();
+            file.sync().unwrap();
+
+            let running = Arc::new(atomic::AtomicBool::new(true));
+            let num_readers = 4;
+            let mut readers = vec![];
+
+            for _ in 0..num_readers {
+                let f = file.clone();
+                let r = running.clone();
+                let expected = initial_data;
+                readers.push(std::thread::spawn(move || {
+                    let mut buf = [0u8; BUFFER_SIZE];
+                    while r.load(atomic::Ordering::Relaxed) {
+                        f.read(&mut buf, 0).unwrap();
+                        assert_eq!(buf, expected);
+                        std::thread::yield_now();
+                    }
+                }));
+            }
+
+            // Grower thread grows file in multiple increments
+            for _ in 0..5 {
+                file.grow(2).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+
+            running.store(false, atomic::Ordering::Relaxed);
+            for r in readers {
+                r.join().unwrap();
+            }
+
+            assert_eq!(file.length(), BUFFER_SIZE * (INIT_BUFFERS + 10));
+            assert_eq!(file.total_buffers().unwrap(), INIT_BUFFERS + 10);
+        }
+
+        #[test]
+        fn err_total_buffers_unaligned_file() {
+            let (_dir, cfg) = tmp_path();
+            let file = File::new(cfg).unwrap();
+            assert_eq!(file.total_buffers().unwrap(), INIT_BUFFERS);
+
+            // Corrupt file length in-memory to simulate an unaligned layout
+            file.inner.current_length.fetch_add(1, atomic::Ordering::SeqCst);
+
+            let err = file.total_buffers().unwrap_err();
+            assert_eq!(err.reason, err::CPT.reason);
         }
     }
 
@@ -2284,6 +2419,69 @@ mod tests {
             epochs.sort();
             epochs.dedup();
             assert_eq!(epochs.len(), num_threads);
+        }
+
+        #[test]
+        fn err_ticket_wait_when_file_deleted() {
+            let (_dir, cfg) = tmp_path();
+            let file = File::new(cfg).unwrap();
+            let data = [0x11u8; BUFFER_SIZE];
+            let ticket = file.write(&data, 0).unwrap();
+
+            file.delete().unwrap();
+
+            // After delete, the weak SyncTrigger upgrade fails, returning an error on force
+            let res = ticket.force();
+            assert!(res.is_err());
+        }
+
+        #[test]
+        fn err_ticket_wait_surfaces_sync_failure() {
+            let (_dir, cfg) = tmp_path();
+            let file = File::new(cfg).unwrap();
+            let data = [0x22u8; BUFFER_SIZE];
+            let ticket = file.write(&data, 0).unwrap();
+
+            // Inject a synthetic durability error into the completion
+            let sync_err = err::make_error(err::SYN);
+            file.completion().set_err(sync_err.clone());
+            file.completion().notify_all_listeners();
+
+            let err_wait = ticket.wait().unwrap_err();
+            assert_eq!(err_wait.reason, err::SYN.reason);
+
+            let err_force = ticket.force().unwrap_err();
+            assert_eq!(err_force.reason, err::SYN.reason);
+        }
+
+        #[test]
+        fn ok_concurrent_ticket_force_storm() {
+            let (_dir, mut cfg) = tmp_path();
+            cfg.initial_available_buffers = 32;
+            cfg.sync_interval = Some(Duration::from_millis(10));
+            let file = Arc::new(File::new(cfg).unwrap());
+            let num_threads = 16;
+            let barrier = Arc::new(Barrier::new(num_threads));
+            let mut handles = Vec::new();
+
+            for i in 0..num_threads {
+                let f = file.clone();
+                let b = barrier.clone();
+                handles.push(std::thread::spawn(move || {
+                    b.wait();
+                    let data = [i as u8; BUFFER_SIZE];
+                    let ticket = f.write(&data, i).unwrap();
+                    let durable = ticket.force().unwrap();
+                    assert_eq!(durable, ticket.epoch());
+                    assert!(ticket.is_durable());
+                }));
+            }
+
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            assert!(file.durable_epoch() >= num_threads as TEpoch);
         }
     }
 
