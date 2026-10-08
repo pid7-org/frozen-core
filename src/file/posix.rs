@@ -614,6 +614,9 @@ impl POSIXFile {
     /// guaranteed, so the syscall must be retried
     #[cfg(target_os = "linux")]
     pub(super) fn sync_range(&self, offset: usize, len: usize) -> FrozenResult<()> {
+        if len == 0 {
+            return Ok(());
+        }
         sync_file_range_raw(self.fd(), offset, len)
     }
 }
@@ -922,6 +925,10 @@ fn fsync_raw(fd: FileId) -> FrozenResult<()> {
 
 #[cfg(target_os = "linux")]
 fn sync_file_range_raw(fd: FileId, offset: usize, len: usize) -> FrozenResult<()> {
+    if len == 0 {
+        return Ok(());
+    }
+
     let flag = libc::SYNC_FILE_RANGE_WRITE;
     let mut retries = 0; // only for EINTR errors
 
@@ -2067,6 +2074,16 @@ mod tests {
             let mut buf = vec![0u8; 0x100];
             file.pread(&mut buf, 0x200).unwrap();
             assert_eq!(buf, data);
+            file.close().unwrap();
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn ok_sync_range_zero_len() {
+            let (_dir, path) = tmp_path();
+            let file = POSIXFile::new(&path).unwrap();
+            assert!(file.sync_range(0, 0).is_ok());
+            assert!(file.sync_range(0x100, 0).is_ok());
             file.close().unwrap();
         }
 

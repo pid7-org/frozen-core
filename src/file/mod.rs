@@ -815,6 +815,8 @@ impl File {
 
     /// Best-effort call to prompt kernel to start flushing dirty pages in the specified chunk range
     ///
+    /// If `count == 0`, this call is a no-op and returns `Ok(())`
+    ///
     /// ## Example
     ///
     /// ```
@@ -834,10 +836,15 @@ impl File {
     /// let file = File::new(cfg).unwrap();
     /// file.write(&[1u8; 64], 0).unwrap();
     /// assert!(file.sync_range(0, 1).is_ok());
+    /// assert!(file.sync_range(0, 0).is_ok());
     /// # }
     /// ```
     #[cfg(target_os = "linux")]
     pub fn sync_range(&self, index: usize, count: usize) -> FrozenResult<()> {
+        if count == 0 {
+            return Ok(());
+        }
+
         let mid = self.cfg.module_id;
         let offset = match index.checked_mul(self.cfg.buffer_size) {
             Some(off) => off,
@@ -1883,6 +1890,15 @@ mod tests {
             let mut buf = [0u8; BUFFER_SIZE * 2];
             file.read(&mut buf, 0).unwrap();
             assert_eq!(buf, data);
+        }
+
+        #[test]
+        #[cfg(target_os = "linux")]
+        fn ok_sync_range_zero_count() {
+            let (_dir, cfg) = tmp_path();
+            let file = File::new(cfg).unwrap();
+            assert!(file.sync_range(0, 0).is_ok());
+            assert!(file.sync_range(5, 0).is_ok());
         }
     }
 
