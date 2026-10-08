@@ -34,7 +34,7 @@
 /// Custom result type w/ [`FrozenError`] as error type
 pub type FrozenResult<T> = Result<T, FrozenError>;
 
-/// Utility for error propagation used across [`frozen_core`]
+/// Utility for error propagation used across [`frozen_core`](crate)
 #[derive(Clone)]
 pub struct FrozenError {
     /// 8-bit unique identifier to identify the _module_ of [`FrozenError`] object
@@ -81,7 +81,7 @@ impl FrozenError {
         }
     }
 
-    /// Construct a new [`FrozenError`] from raw [`Error`] object
+    /// Construct a new [`FrozenError`] from raw error object implementing [`std::fmt::Display`]
     ///
     /// ## Example
     ///
@@ -244,7 +244,7 @@ impl PartialEq for FrozenError {
 /// ```
 #[derive(Debug, Clone)]
 pub struct ErrCode {
-    /// 8-bit reason code encoded into [`FrozenError::id`]
+    /// 8-bit reason code encoded into [`FrozenError`]
     pub reason: u8,
 
     /// Short subsystem label included in the formatted error context
