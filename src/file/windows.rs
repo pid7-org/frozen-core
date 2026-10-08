@@ -141,13 +141,6 @@ impl FileInterface for WINFile {
         let handle = create_file_raw(path, CREATE_NEW)?;
         let file = Self { handle: atomic::AtomicIsize::new(handle) };
 
-        if let Err(mut e) = file.flock() {
-            if let Err(close_err) = file.close() {
-                e.add_suppressed(close_err);
-            }
-            return Err(e);
-        }
-
         if let Err(mut e) = sync_parent_dir(path) {
             if let Err(close_err) = file.close() {
                 e.add_suppressed(close_err);
@@ -165,6 +158,31 @@ impl FileInterface for WINFile {
     fn open(path: &std::path::Path) -> FrozenResult<Self> {
         let handle = create_file_raw(path, OPEN_EXISTING)?;
         Ok(Self { handle: atomic::AtomicIsize::new(handle) })
+    }
+
+    /// Open an existing [`WINFile`] or create it if missing (`OPEN_ALWAYS`)
+    ///
+    /// The file is never truncated `OPEN_ALWAYS` is the Win32 equivalent of `O_CREAT` without `O_EXCL`
+    ///
+    /// ## Crash-Safe Durability
+    ///
+    /// NTFS journals the new directory entry by default, so crash durability here is stronger than on ext4/XFS
+    /// without the `data=journal` mount option
+    ///
+    /// We still sync the parent directory via `sync_parent_dir` for correctness on ReFS and non-journaling
+    /// volumes (e.g. exFAT)
+    fn new(path: &std::path::Path) -> FrozenResult<Self> {
+        let handle = create_file_raw(path, OPEN_ALWAYS)?;
+        let file = Self { handle: atomic::AtomicIsize::new(handle) };
+
+        if let Err(mut e) = sync_parent_dir(path) {
+            if let Err(close_err) = file.close() {
+                e.add_suppressed(close_err);
+            }
+            return Err(e);
+        }
+
+        Ok(file)
     }
 
     /// Acquire an exclusive, non-blocking advisory lock on [`WINFile`]
@@ -625,35 +643,6 @@ impl FileInterface for WINFile {
         }
 
         Ok(())
-    }
-}
-
-impl WINFile {
-    /// Create or open a [`WINFile`] with `OPEN_ALWAYS` disposition
-    ///
-    /// Used when the caller does not care whether the file already exists (idempotent open or create)
-    ///
-    /// The file is never truncated `OPEN_ALWAYS` is the Win32 equivalent of `O_CREAT` without `O_EXCL`
-    ///
-    /// ## Crash-Safe Durability
-    ///
-    /// NTFS journals the new directory entry by default, so crash durability here is stronger than on ext4/XFS
-    /// without the `data=journal` mount option
-    ///
-    /// We still sync the parent directory via `sync_parent_dir` for correctness on ReFS and non-journaling
-    /// volumes (e.g. exFAT)
-    pub(super) fn new(path: &std::path::Path) -> FrozenResult<Self> {
-        let handle = create_file_raw(path, OPEN_ALWAYS)?;
-        let file = Self { handle: atomic::AtomicIsize::new(handle) };
-
-        if let Err(mut e) = sync_parent_dir(path) {
-            if let Err(close_err) = file.close() {
-                e.add_suppressed(close_err);
-            }
-            return Err(e);
-        }
-
-        Ok(file)
     }
 }
 

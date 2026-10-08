@@ -48,6 +48,13 @@ pub(in crate::file) trait FileInterface: Sized + Send + Sync {
     /// If the file does not exist, the operation must fail and return [`super::err::INV`]
     fn open(path: &Path) -> FrozenResult<Self>;
 
+    /// Opens an existing file or creates it if missing at `path`
+    ///
+    /// ## Semantics
+    ///
+    /// If the file does not exist, it is created. If it already exists, it is opened
+    fn new(path: &Path) -> FrozenResult<Self>;
+
     /// Acquires an exclusive, non-blocking advisory lock on the entire file
     ///
     /// ## Lock Semantics

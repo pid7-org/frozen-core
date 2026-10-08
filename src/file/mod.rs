@@ -402,6 +402,14 @@ impl File {
         };
 
         let file = PlatformFile::create(&cfg.path).with_module(mid)?;
+        if let Err(mut e) = file.flock() {
+            if let Err(unlink_err) = file.unlink(&cfg.path) {
+                e.add_suppressed(unlink_err);
+            }
+
+            return Err(e.with_module(mid));
+        }
+
         if let Err(mut e) = file.grow(0, init_len) {
             if let Err(unlink_err) = file.unlink(&cfg.path) {
                 e.add_suppressed(unlink_err);

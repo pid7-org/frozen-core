@@ -74,13 +74,6 @@ impl FileInterface for POSIXFile {
         let fd = open_raw(path, create_flags())?;
         let file = Self { fd: atomic::AtomicI32::new(fd) };
 
-        if let Err(mut e) = file.flock() {
-            if let Err(close_err) = file.close() {
-                e.add_suppressed(close_err);
-            }
-            return Err(e);
-        }
-
         if let Err(mut e) = sync_parent_dir(path) {
             if let Err(close_err) = file.close() {
                 e.add_suppressed(close_err);
@@ -114,6 +107,53 @@ impl FileInterface for POSIXFile {
     fn open(path: &std::path::Path) -> FrozenResult<Self> {
         let fd = open_raw(path, open_flags())?;
         let file = Self { fd: atomic::AtomicI32::new(fd) };
+
+        // (linux only) best effort call to provide a hint to the kernel that the file will be
+        // accessed in a random pattern
+        #[cfg(target_os = "linux")]
+        {
+            let _res = f_advise_raw(file.fd());
+
+            // INFO: Read the function docs of [`f_advise_raw`] for detailed info on why the error is only
+            // propagated in non-prod env's
+
+            #[cfg(debug_assertions)]
+            if let Err(mut e) = _res {
+                if let Err(close_err) = file.close() {
+                    e.add_suppressed(close_err);
+                }
+
+                return Err(e);
+            }
+        }
+
+        Ok(file)
+    }
+
+    /// Create a new or open an existing [`POSIXFile`]
+    ///
+    /// ## Crash safe durability
+    ///
+    /// In POSIX systems, `open(O_CREATE)` only creates the directory entry in memory, it may be visible
+    /// immediately, but the file entry is not crash durable on many fs
+    ///
+    /// On some linux systems, journaling fs (ext4, xfs, etc) often replay their journal on mount after a crash is
+    /// observed, which usually restores recent directory updates, i.e. our newly created file entry, as a result
+    /// newly created file often survive the crash
+    ///
+    /// In our case, when a new [`FrozenFile`] is created, we zero-extend it using `ftruncate()`, and perform
+    /// `fdatasync()` or `fcntl(F_FULLSYNC)`, which in result provides us the crash safe durability we need
+    fn new(path: &std::path::Path) -> FrozenResult<Self> {
+        let fd = open_raw(path, prep_flags())?;
+        let file = Self { fd: atomic::AtomicI32::new(fd) };
+
+        // Ensure newly created directory entries are persisted to disk
+        if let Err(mut e) = sync_parent_dir(path) {
+            if let Err(close_err) = file.close() {
+                e.add_suppressed(close_err);
+            }
+            return Err(e);
+        }
 
         // (linux only) best effort call to provide a hint to the kernel that the file will be
         // accessed in a random pattern
@@ -551,53 +591,6 @@ impl FileInterface for POSIXFile {
 }
 
 impl POSIXFile {
-    /// Create a new or open an existing [`POSIXFile`]
-    ///
-    /// ## Crash safe durability
-    ///
-    /// In POSIX systems, `open(O_CREATE)` only creates the directory entry in memory, it may be visible
-    /// immediately, but the file entry is not crash durable on many fs
-    ///
-    /// On some linux systems, journaling fs (ext4, xfs, etc) often replay their journal on mount after a crash is
-    /// observed, which usually restores recent directory updates, i.e. our newly created file entry, as a result
-    /// newly created file often survive the crash
-    ///
-    /// In our case, when a new [`FrozenFile`] is created, we zero-extend it using `ftruncate()`, and perform
-    /// `fdatasync()` or `fcntl(F_FULLSYNC)`, which in result provides us the crash safe durability we need
-    pub(super) fn new(path: &std::path::Path) -> FrozenResult<Self> {
-        let fd = open_raw(path, prep_flags())?;
-        let file = Self { fd: atomic::AtomicI32::new(fd) };
-
-        // Ensure newly created directory entries are persisted to disk
-        if let Err(mut e) = sync_parent_dir(path) {
-            if let Err(close_err) = file.close() {
-                e.add_suppressed(close_err);
-            }
-            return Err(e);
-        }
-
-        // (linux only) best effort call to provide a hint to the kernel that the file will be
-        // accessed in a random pattern
-        #[cfg(target_os = "linux")]
-        {
-            let _res = f_advise_raw(file.fd());
-
-            // INFO: Read the function docs of [`f_advise_raw`] for detailed info on why the error is only
-            // propagated in non-prod env's
-
-            #[cfg(debug_assertions)]
-            if let Err(mut e) = _res {
-                if let Err(close_err) = file.close() {
-                    e.add_suppressed(close_err);
-                }
-
-                return Err(e);
-            }
-        }
-
-        Ok(file)
-    }
-
     /// Initiates writeback (best-effort) of dirty pages in the specified range
     ///
     /// ## Purpose
