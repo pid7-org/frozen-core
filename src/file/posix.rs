@@ -375,21 +375,23 @@ impl FileInterface for POSIXFile {
 
         // NOTE:
         //
-        // On linux, `fallocate` must be called before `ftruncate` to handle `ENOSPC`
+        // Physical allocation must always happen BEFORE logical file size extension (`ftruncate`) to handle
+        // `ENOSPC` safely,
         //
-        // If the order is reversed, the file length may be updated despite the failure to allocate
-        // space on fs, which may fail all future write ops
+        // - On Linux, `fallocate` allocates physical extents upfront
+        // - On mac, `f_preallocate` allocates physical disk extents upfront via `F_PREALLOCATE`
+        //
+        // If allocation fails, the file size is never touched
+        //
+        // If `ftruncate` were called first, an allocation failure would leave the file enlarged as a sparse hole,
+        // causing state desynchronization between in-memory `current_length` and on-disk `st_size`
         #[cfg(target_os = "linux")]
         fallocate_raw(fd, curr_len, len_to_add)?;
 
-        ftruncate_raw(fd, curr_len, len_to_add)?;
-
-        // INFO: On mac, we can hint the kernel to allocate disk space for the added `len_to_add` as it
-        // can reduce the latency of future write ops
-        //
-        // WARN: Must always be called after `ftruncate` on mac
         #[cfg(target_os = "macos")]
         f_preallocate_raw(fd, len_to_add)?;
+
+        ftruncate_raw(fd, curr_len, len_to_add)?;
 
         Ok(())
     }
@@ -2135,6 +2137,23 @@ mod tests {
             let (_dir, path) = tmp_path();
             let file = POSIXFile::new(&path).unwrap();
             sync_parent_dir(&path).unwrap();
+            file.close().unwrap();
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn err_macos_preallocate_failure_preserves_length() {
+            let (_dir, path) = tmp_path();
+            let file = POSIXFile::new(&path).unwrap();
+            let initial_len = 0x1000;
+            file.grow(0, initial_len).unwrap();
+            assert_eq!(file.length().unwrap(), initial_len);
+
+            let impossible_len = (off_t::MAX / 2) as usize;
+            let res = file.grow(initial_len, impossible_len);
+            assert!(res.is_err(), "grow with impossible size must fail");
+
+            assert_eq!(file.length().unwrap(), initial_len);
             file.close().unwrap();
         }
     }

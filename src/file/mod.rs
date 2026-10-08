@@ -39,6 +39,7 @@
 
 // TODO: Tackle durability verification for uncommitted/non-durable reads internally in the future
 // TODO: Tackle coarse-grained RwLock write lock in sync_internal which blocks concurrent pread and pwrite ops during disk flushes
+// CRITICAL: On EIO during sync(), kernel clears dirty bits and consumes writeback errors (f_wb_err). Subsequent sync() calls return Ok(()), causing del_err() to falsely report lost data as durable (ref: PostgreSQL Bug #15096 / fsyncgate). Sync failures must poison the state or panic rather than retrying blindly.
 
 mod interface;
 
