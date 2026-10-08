@@ -8,9 +8,12 @@ mod posix;
 #[cfg(target_os = "windows")]
 mod windows;
 
-use crate::error::{ErrCode, FrozenError, FrozenResult};
+use crate::{
+    ack::{AckTicket, Completion, SyncTrigger, TEpoch},
+    error::{ErrCode, FrozenError, FrozenResult},
+};
 use interface::FileInterface;
-use std::sync::atomic;
+use std::sync::{Arc, Condvar, Mutex, RwLock, atomic};
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(in crate::file) type PlatformFile = posix::POSIXFile;
@@ -98,6 +101,19 @@ pub(in crate::file) mod err {
         let err = FrozenError::new(mid(), ERRDOMAIN, code, "");
         Err(err)
     }
+
+    #[inline]
+    pub(in crate::file) fn make_error(code: ErrCode) -> FrozenError {
+        FrozenError::new(mid(), ERRDOMAIN, code, "")
+    }
+
+    #[inline]
+    pub(in crate::file) fn make_raw_error<E: std::fmt::Display>(
+        code: ErrCode,
+        error: E,
+    ) -> FrozenError {
+        FrozenError::new_raw(mid(), ERRDOMAIN, code, error)
+    }
 }
 
 /// File descriptor of [`File`]
@@ -113,7 +129,7 @@ pub type FileId = libc::c_int;
 #[cfg(target_os = "windows")]
 pub type FileId = isize;
 
-/// Configurations for [`frozen_core::file::File`]
+/// Configurations for [`File`]
 #[derive(Debug, Clone)]
 pub struct FileCfg {
     /// Identifier used while error propagation
@@ -138,32 +154,181 @@ pub struct FileCfg {
     ///
     /// Initial file length will be `buffer_size * initial_available_buffers` (bytes).
     pub initial_available_buffers: usize,
+
+    /// Optional interval for the background sync thread
+    ///
+    /// If `Some(duration)`, a background worker thread is spawned which flushes dirty pages at this interval; and
+    /// if `None`, background sync is disabled and durability advances via manual sync or forced tickets
+    pub sync_interval: Option<std::time::Duration>,
+}
+
+#[derive(Debug)]
+struct FileInner {
+    cfg: FileCfg,
+    file: RwLock<Option<PlatformFile>>,
+    current_length: atomic::AtomicUsize,
+    completion: Arc<Completion>,
+    sync_condvar: Condvar,
+    sync_mutex: Mutex<bool>,
+    shutdown: atomic::AtomicBool,
+}
+
+impl SyncTrigger for FileInner {
+    fn trigger_sync(&self) -> FrozenResult<()> {
+        if self.cfg.sync_interval.is_some() {
+            {
+                let mut guard = self.sync_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                *guard = true;
+            }
+
+            self.sync_condvar.notify_one();
+            Ok(())
+        } else {
+            self.sync_internal()
+        }
+    }
+}
+
+impl FileInner {
+    fn sync_internal(&self) -> FrozenResult<()> {
+        let guard = self.file.write().unwrap_or_else(|e| e.into_inner());
+        let file = match guard.as_ref() {
+            Some(f) => f,
+            None => return Ok(()),
+        };
+
+        let target_epoch = self.completion.read_current_epoch();
+        let durable_epoch = self.completion.read_durable_epoch();
+
+        if target_epoch == durable_epoch {
+            return Ok(());
+        }
+
+        match file.sync() {
+            Ok(()) => {
+                self.completion.mark_epoch_as_durable(target_epoch);
+                self.completion.del_err();
+                self.completion.notify_all_listeners();
+
+                Ok(())
+            }
+            Err(e) => {
+                self.completion.set_err(e.clone());
+                self.completion.notify_all_listeners();
+
+                Err(e)
+            }
+        }
+    }
 }
 
 /// Custom implementation of `std::fs::File`
 #[derive(Debug)]
 pub struct File {
     cfg: FileCfg,
-    file: PlatformFile,
-    current_length: atomic::AtomicUsize,
+    inner: Arc<FileInner>,
+    bg_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 unsafe impl Send for File {}
 unsafe impl Sync for File {}
 
 impl File {
+    fn from_platform_file(
+        cfg: FileCfg,
+        file: PlatformFile,
+        current_length: usize,
+    ) -> FrozenResult<Self> {
+        let completion = Arc::new(Completion::default());
+        let sync_interval = cfg.sync_interval;
+
+        let inner = Arc::new(FileInner {
+            cfg: cfg.clone(),
+            file: RwLock::new(Some(file)),
+            current_length: atomic::AtomicUsize::new(current_length),
+            completion: completion.clone(),
+            sync_condvar: Condvar::new(),
+            sync_mutex: Mutex::new(false),
+            shutdown: atomic::AtomicBool::new(false),
+        });
+
+        let weak_inner: std::sync::Weak<dyn SyncTrigger> =
+            Arc::downgrade(&inner) as std::sync::Weak<dyn SyncTrigger>;
+        completion.set_sync_trigger(weak_inner);
+
+        let bg_thread = if let Some(interval) = sync_interval {
+            let worker_inner = Arc::clone(&inner);
+            let handle =
+                std::thread::Builder::new().name("frozen-sync-worker".into()).spawn(move || {
+                    let mut guard =
+                        worker_inner.sync_mutex.lock().unwrap_or_else(|e| e.into_inner());
+
+                    while !worker_inner.shutdown.load(atomic::Ordering::Acquire) {
+                        if *guard {
+                            *guard = false;
+                            drop(guard);
+
+                            let _ = worker_inner.sync_internal();
+                            guard =
+                                worker_inner.sync_mutex.lock().unwrap_or_else(|e| e.into_inner());
+
+                            continue;
+                        }
+
+                        let (new_guard, _) = worker_inner
+                            .sync_condvar
+                            .wait_timeout(guard, interval)
+                            .unwrap_or_else(|e| e.into_inner());
+
+                        guard = new_guard;
+                        if worker_inner.shutdown.load(atomic::Ordering::Acquire) {
+                            break;
+                        }
+
+                        *guard = false;
+                        drop(guard);
+
+                        let _ = worker_inner.sync_internal();
+                        guard = worker_inner.sync_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                    }
+                });
+
+            let handle = match handle {
+                Ok(h) => h,
+                Err(spawn_err) => {
+                    let mut file_guard = inner.file.write().unwrap_or_else(|e| e.into_inner());
+                    if let Some(f) = file_guard.take() {
+                        let mut err = err::make_raw_error(err::HCF, spawn_err);
+                        if let Err(close_err) = f.close() {
+                            err.add_suppressed(close_err);
+                        }
+
+                        return Err(err);
+                    }
+
+                    return err::raw_error(err::HCF, spawn_err);
+                }
+            };
+
+            Some(handle)
+        } else {
+            None
+        };
+
+        Ok(Self { cfg, inner, bg_thread })
+    }
+
     /// Creates and pre-allocates a new [`File`] at `cfg.path`
     ///
     /// ## TOCTAU Safe
     ///
-    /// If the file already exists, an error w/ [`err::EXS`] is returned to guard against TOCTOU overwrites
+    /// If the file already exists, an error w/ `err::EXS` is returned to guard against TOCTOU overwrites
     ///
     /// ## Exclusive Lock
     ///
     /// Acquires an exclusive advisory lock via `flock(LOCK_EX | LOCK_NB)` immediately after descriptor creation
     pub fn new(cfg: FileCfg) -> FrozenResult<Self> {
         let _ = err::init_mid(cfg.module_id);
-
         if cfg.buffer_size == 0 || cfg.initial_available_buffers == 0 {
             return err::default_error(err::INV);
         }
@@ -174,11 +339,11 @@ impl File {
         };
 
         let file = PlatformFile::create(&cfg.path)?;
-
         if let Err(mut e) = file.grow(0, init_len) {
             if let Err(close_err) = file.close() {
                 e.add_suppressed(close_err);
             }
+
             return Err(e);
         }
 
@@ -186,10 +351,11 @@ impl File {
             if let Err(close_err) = file.close() {
                 e.add_suppressed(close_err);
             }
+
             return Err(e);
         }
 
-        Ok(Self { cfg, file, current_length: atomic::AtomicUsize::new(init_len) })
+        Self::from_platform_file(cfg, file, init_len)
     }
 
     /// Open an existing [`File`] while validating its layout invariants
@@ -201,7 +367,7 @@ impl File {
     /// - Current file length is at least `buffer_size * initial_available_buffers`
     /// - Current file length is a multiple of `buffer_size`
     ///
-    /// If any invariant is violated, the file is closed and [`err::CPT`] is returned
+    /// If any invariant is violated, the file is closed and `err::CPT` is returned
     pub fn open(cfg: FileCfg) -> FrozenResult<Self> {
         let _ = err::init_mid(cfg.module_id);
 
@@ -220,6 +386,7 @@ impl File {
             if let Err(close_err) = file.close() {
                 e.add_suppressed(close_err);
             }
+
             return Err(e);
         }
 
@@ -229,19 +396,21 @@ impl File {
                 if let Err(close_err) = file.close() {
                     e.add_suppressed(close_err);
                 }
+
                 return Err(e);
             }
         };
 
         if curr_len < init_len || curr_len % cfg.buffer_size != 0 {
-            let mut e = err::default_error::<Self>(err::CPT).unwrap_err();
+            let mut e = err::make_error(err::CPT);
             if let Err(close_err) = file.close() {
                 e.add_suppressed(close_err);
             }
+
             return Err(e);
         }
 
-        Ok(Self { cfg, file, current_length: atomic::AtomicUsize::new(curr_len) })
+        Self::from_platform_file(cfg, file, curr_len)
     }
 
     /// Open an existing [`File`] or create it if it does not yet exist
@@ -267,7 +436,6 @@ impl File {
         };
 
         let file = PlatformFile::new(&cfg.path)?;
-
         if let Err(mut e) = file.flock() {
             if let Err(close_err) = file.close() {
                 e.add_suppressed(close_err);
@@ -304,10 +472,10 @@ impl File {
                 return Err(e);
             }
 
-            Ok(Self { cfg, file, current_length: atomic::AtomicUsize::new(init_len) })
+            Self::from_platform_file(cfg, file, init_len)
         } else {
             if curr_len < init_len || curr_len % cfg.buffer_size != 0 {
-                let mut e = err::default_error::<Self>(err::CPT).unwrap_err();
+                let mut e = err::make_error(err::CPT);
                 if let Err(close_err) = file.close() {
                     e.add_suppressed(close_err);
                 }
@@ -315,12 +483,17 @@ impl File {
                 return Err(e);
             }
 
-            Ok(Self { cfg, file, current_length: atomic::AtomicUsize::new(curr_len) })
+            Self::from_platform_file(cfg, file, curr_len)
         }
     }
 
     /// Read bytes starting from buffer `index` into `buf` w/ `pread` syscall
     ///
+    /// ## Durability Guarantee & Caller Responsibility
+    ///
+    /// It is 100% the caller's responsibility to ensure that they do not read newly written data unless the
+    /// older data has been confirmed durable (e.g. by checking or waiting on the write's [`AckTicket`])
+    ///
     /// ## Multiple Buffers
     ///
     /// The input `buf` can span across a single or multiple buffers in memory
@@ -328,9 +501,10 @@ impl File {
     /// ## Constraints
     ///
     /// - `buf.len()` must be a non-zero multiple of `cfg.buffer_size`
-    /// - Reading beyond current file length will return [`err::HCF`]
+    /// - Reading beyond current file length will return `err::HCF`
     #[inline(always)]
     pub fn read(&self, buf: &mut [u8], index: usize) -> FrozenResult<()> {
+        // TODO: Tackle durability verification for uncommitted/non-durable reads internally in the future
         if buf.is_empty() {
             return Ok(());
         }
@@ -348,11 +522,19 @@ impl File {
             return err::default_error(err::HCF);
         }
 
-        self.file.pread(buf, offset)
+        let guard = self.inner.file.read().unwrap_or_else(|e| e.into_inner());
+        let file = match guard.as_ref() {
+            Some(f) => f,
+            None => return err::default_error(err::INV),
+        };
+
+        file.pread(buf, offset)
     }
 
     /// Write bytes starting at buffer `index` from `buf` w/ `pwrite` syscall
     ///
+    /// Returns an [`AckTicket`] representing the durability acknowledgement of this write operation
+    ///
     /// ## Multiple Buffers
     ///
     /// The input `buf` can span across a single or multiple buffers in memory
@@ -360,11 +542,12 @@ impl File {
     /// ## Constraints
     ///
     /// - `buf.len()` must be a non-zero multiple of `cfg.buffer_size`
-    /// - Writing beyond current file length will return [`err::HCF`]
+    /// - Writing beyond current file length will return `err::HCF`
     #[inline(always)]
-    pub fn write(&self, buf: &[u8], index: usize) -> FrozenResult<()> {
+    pub fn write(&self, buf: &[u8], index: usize) -> FrozenResult<AckTicket> {
         if buf.is_empty() {
-            return Ok(());
+            let current = self.inner.completion.read_current_epoch();
+            return Ok(AckTicket::new(current, self.inner.completion.clone()));
         }
 
         if buf.len() % self.cfg.buffer_size != 0 {
@@ -380,7 +563,16 @@ impl File {
             return err::default_error(err::HCF);
         }
 
-        self.file.pwrite(buf, offset)
+        let guard = self.inner.file.read().unwrap_or_else(|e| e.into_inner());
+        let file = match guard.as_ref() {
+            Some(f) => f,
+            None => return err::default_error(err::INV),
+        };
+
+        file.pwrite(buf, offset)?;
+
+        let epoch = self.inner.completion.increment_current_epoch();
+        Ok(AckTicket::new(epoch, self.inner.completion.clone()))
     }
 
     /// Grow file size of [`File`] by given `count` of buffers
@@ -396,9 +588,17 @@ impl File {
             None => return err::default_error(err::GRW),
         };
 
-        let curr_len = self.current_length.load(atomic::Ordering::Acquire);
-        self.file.grow(curr_len, len_to_add)?;
-        self.current_length.fetch_add(len_to_add, atomic::Ordering::Release);
+        let guard = self.inner.file.write().unwrap_or_else(|e| e.into_inner());
+        let file = match guard.as_ref() {
+            Some(f) => f,
+            None => return err::default_error(err::INV),
+        };
+
+        let curr_len = self.inner.current_length.load(atomic::Ordering::Acquire);
+        file.grow(curr_len, len_to_add)?;
+
+        self.inner.current_length.fetch_add(len_to_add, atomic::Ordering::Release);
+        self.inner.completion.increment_current_epoch();
 
         Ok(())
     }
@@ -406,7 +606,7 @@ impl File {
     /// Syncs in-mem data to the storage device
     #[inline]
     pub fn sync(&self) -> FrozenResult<()> {
-        self.file.sync()
+        self.inner.sync_internal()
     }
 
     /// Best-effort call to prompt kernel to start flushing dirty pages in the specified chunk range
@@ -421,7 +621,13 @@ impl File {
             None => return err::default_error(err::INV),
         };
 
-        self.file.sync_range(offset, len_to_sync)
+        let guard = self.inner.file.read().unwrap_or_else(|e| e.into_inner());
+        let file = match guard.as_ref() {
+            Some(f) => f,
+            None => return err::default_error(err::INV),
+        };
+
+        file.sync_range(offset, len_to_sync)
     }
 
     /// Fetch total available buffers in [`File`]
@@ -446,7 +652,25 @@ impl File {
     /// Read current length (in bytes) of [`File`]
     #[inline]
     pub fn length(&self) -> usize {
-        self.current_length.load(atomic::Ordering::Acquire)
+        self.inner.current_length.load(atomic::Ordering::Acquire)
+    }
+
+    /// Fetch the latest assigned durability epoch
+    #[inline]
+    pub fn current_epoch(&self) -> TEpoch {
+        self.inner.completion.read_current_epoch()
+    }
+
+    /// Fetch the latest durable epoch
+    #[inline]
+    pub fn durable_epoch(&self) -> TEpoch {
+        self.inner.completion.read_durable_epoch()
+    }
+
+    /// Fetch reference to underlying durability [`Completion`]
+    #[inline]
+    pub fn completion(&self) -> &Arc<Completion> {
+        &self.inner.completion
     }
 
     /// Check if [`File`] exists on storage device or not
@@ -465,28 +689,64 @@ impl File {
     ///
     /// Unlinks the file at `path`, closes the underlying descriptor, and syncs the parent directory to
     /// guarantee crash-safe durability
-    pub fn delete(self) -> FrozenResult<()> {
-        let this = core::mem::ManuallyDrop::new(self);
-        let cfg = unsafe { core::ptr::read(&this.cfg) };
-        let file = unsafe { core::ptr::read(&this.file) };
+    pub fn delete(mut self) -> FrozenResult<()> {
+        self.inner.shutdown.store(true, atomic::Ordering::Release);
+        {
+            let mut guard = self.inner.sync_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = true;
+        }
+        self.inner.sync_condvar.notify_all();
 
-        file.unlink(&cfg.path)
+        if let Some(handle) = self.bg_thread.take() {
+            let _ = handle.join();
+        }
+
+        let mut guard = self.inner.file.write().unwrap_or_else(|e| e.into_inner());
+        let file = match guard.take() {
+            Some(f) => f,
+            None => return err::default_error(err::INV),
+        };
+
+        file.unlink(&self.cfg.path)
     }
 
     /// Get file descriptor or handle for [`File`]
     #[inline]
     pub fn fd(&self) -> FileId {
-        self.file.fd()
+        let guard = self.inner.file.read().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(f) => f.fd(),
+            None => PlatformFile::CLOSED_ID,
+        }
     }
 }
 
 impl Drop for File {
     fn drop(&mut self) {
-        if self.file.is_closed() {
+        self.inner.shutdown.store(true, atomic::Ordering::Release);
+        {
+            let mut guard = self.inner.sync_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = true;
+        }
+        self.inner.sync_condvar.notify_all();
+
+        if let Some(handle) = self.bg_thread.take() {
+            let _ = handle.join();
+        }
+
+        let is_closed = {
+            let guard = self.inner.file.read().unwrap_or_else(|e| e.into_inner());
+            match guard.as_ref() {
+                Some(f) => f.is_closed(),
+                None => true,
+            }
+        };
+
+        if is_closed {
             return;
         }
 
-        let _ = self.sync();
+        let _ = self.inner.sync_internal();
     }
 }
 
@@ -507,6 +767,7 @@ mod tests {
             path,
             buffer_size: BUFFER_SIZE,
             initial_available_buffers: INIT_BUFFERS,
+            sync_interval: None,
         };
 
         (dir, cfg)
@@ -1315,6 +1576,7 @@ mod tests {
                 path,
                 buffer_size: BUFFER_SIZE,
                 initial_available_buffers: INIT_BUFFERS,
+                sync_interval: None,
             };
 
             let file = File::new(cfg).unwrap();
@@ -1395,6 +1657,150 @@ mod tests {
 
             let opened = File::open(cfg);
             assert!(opened.is_ok());
+        }
+    }
+
+    mod file_sync_and_durability {
+        use super::*;
+        use std::time::{Duration, Instant};
+
+        #[test]
+        fn ok_manual_sync_advances_epoch_and_tickets() {
+            let (_dir, cfg) = tmp_path();
+            let file = File::new(cfg).unwrap();
+            let data = [0x55u8; BUFFER_SIZE];
+
+            assert_eq!(file.current_epoch(), 0);
+            assert_eq!(file.durable_epoch(), 0);
+
+            let t1 = file.write(&data, 0).unwrap();
+            assert_eq!(t1.epoch(), 1);
+            assert!(!t1.is_durable());
+            assert_eq!(file.current_epoch(), 1);
+            assert_eq!(file.durable_epoch(), 0);
+
+            let t2 = file.write(&data, 1).unwrap();
+            assert_eq!(t2.epoch(), 2);
+            assert!(!t2.is_durable());
+            assert_eq!(file.current_epoch(), 2);
+            assert_eq!(file.durable_epoch(), 0);
+
+            file.sync().unwrap();
+            assert!(t1.is_durable());
+            assert!(t2.is_durable());
+            assert_eq!(file.durable_epoch(), 2);
+        }
+
+        #[test]
+        fn ok_ticket_force_without_background_thread() {
+            let (_dir, cfg) = tmp_path();
+            let file = File::new(cfg).unwrap();
+            let data = [0xAAu8; BUFFER_SIZE];
+
+            let ticket = file.write(&data, 0).unwrap();
+            assert!(!ticket.is_durable());
+
+            let durable = ticket.force().unwrap();
+            assert_eq!(durable, ticket.epoch());
+            assert!(ticket.is_durable());
+            assert_eq!(file.durable_epoch(), ticket.epoch());
+        }
+
+        #[test]
+        fn ok_background_sync_advances_epoch() {
+            let (_dir, mut cfg) = tmp_path();
+            cfg.sync_interval = Some(Duration::from_millis(25));
+
+            let file = File::new(cfg).unwrap();
+            let data = [0x33u8; BUFFER_SIZE];
+
+            let ticket = file.write(&data, 0).unwrap();
+            let epoch = ticket.wait().unwrap();
+            assert_eq!(epoch, ticket.epoch());
+            assert!(ticket.is_durable());
+            assert!(file.durable_epoch() >= ticket.epoch());
+        }
+
+        #[test]
+        fn ok_ticket_force_with_background_thread() {
+            let (_dir, mut cfg) = tmp_path();
+            // Long interval to verify force wakes up immediately
+            cfg.sync_interval = Some(Duration::from_secs(10));
+
+            let file = File::new(cfg).unwrap();
+            let data = [0x44u8; BUFFER_SIZE];
+
+            let ticket = file.write(&data, 0).unwrap();
+            assert!(!ticket.is_durable());
+
+            let start = Instant::now();
+            let epoch = ticket.force().unwrap();
+            let elapsed = start.elapsed();
+
+            assert_eq!(epoch, ticket.epoch());
+            assert!(ticket.is_durable());
+            assert!(elapsed < Duration::from_secs(2));
+        }
+
+        #[test]
+        fn ok_drop_with_background_thread_persists_data() {
+            let (_dir, mut cfg) = tmp_path();
+            cfg.sync_interval = Some(Duration::from_secs(30));
+            let data = [0x88u8; BUFFER_SIZE];
+
+            {
+                let file = File::new(cfg.clone()).unwrap();
+                let _ticket = file.write(&data, 0).unwrap();
+                // Drop without waiting for interval to expire
+                drop(file);
+            }
+
+            {
+                let opened = File::open(cfg).unwrap();
+                let mut buf = [0u8; BUFFER_SIZE];
+                opened.read(&mut buf, 0).unwrap();
+                assert_eq!(buf, data);
+            }
+        }
+
+        #[test]
+        fn ok_delete_with_background_thread() {
+            let (_dir, mut cfg) = tmp_path();
+            cfg.sync_interval = Some(Duration::from_millis(20));
+
+            let file = File::new(cfg.clone()).unwrap();
+            let data = [0x99u8; BUFFER_SIZE];
+            let _ = file.write(&data, 0).unwrap();
+
+            assert!(file.exists().unwrap());
+            file.delete().unwrap();
+            assert!(!cfg.path.exists());
+        }
+
+        #[test]
+        fn ok_concurrent_writes_distinct_epochs() {
+            let (_dir, cfg) = tmp_path();
+            let file = Arc::new(File::new(cfg).unwrap());
+            let num_threads = 4;
+            let mut handles = Vec::new();
+
+            for i in 0..num_threads {
+                let f = file.clone();
+                handles.push(std::thread::spawn(move || {
+                    let data = [i as u8; BUFFER_SIZE];
+                    f.write(&data, i).unwrap()
+                }));
+            }
+
+            let mut epochs = Vec::new();
+            for h in handles {
+                let ticket = h.join().unwrap();
+                epochs.push(ticket.epoch());
+            }
+
+            epochs.sort();
+            epochs.dedup();
+            assert_eq!(epochs.len(), num_threads);
         }
     }
 }
