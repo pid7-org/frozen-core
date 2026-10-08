@@ -41,10 +41,15 @@ opt-level = 3
 inherits = "release"
 
 [features]
+ack = [
+    "error",
+    "hints",
+]
 error = []
 hints = []
 isa = []
 file = [
+    "ack",
     "error",
     "libc",
     "windows-sys",
@@ -56,6 +61,7 @@ memmap = [
     "file",
 ]
 default = [
+    "ack",
     "error",
     "hints",
     "isa",
