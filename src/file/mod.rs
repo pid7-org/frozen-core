@@ -37,6 +37,9 @@
 //! assert!(!path.exists());
 //! ```
 
+// TODO: Tackle durability verification for uncommitted/non-durable reads internally in the future
+// TODO: Tackle coarse-grained RwLock write lock in sync_internal which blocks concurrent pread and pwrite ops during disk flushes
+
 mod interface;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -417,16 +420,16 @@ impl File {
 
         let file = PlatformFile::create(&cfg.path)?;
         if let Err(mut e) = file.grow(0, init_len) {
-            if let Err(close_err) = file.close() {
-                e.add_suppressed(close_err);
+            if let Err(unlink_err) = file.unlink(&cfg.path) {
+                e.add_suppressed(unlink_err);
             }
 
             return Err(e);
         }
 
         if let Err(mut e) = file.sync() {
-            if let Err(close_err) = file.close() {
-                e.add_suppressed(close_err);
+            if let Err(unlink_err) = file.unlink(&cfg.path) {
+                e.add_suppressed(unlink_err);
             }
 
             return Err(e);
@@ -653,7 +656,6 @@ impl File {
     /// ```
     #[inline(always)]
     pub fn read(&self, buf: &mut [u8], index: usize) -> FrozenResult<()> {
-        // TODO: Tackle durability verification for uncommitted/non-durable reads internally in the future
         if buf.is_empty() {
             return Ok(());
         }
@@ -1063,6 +1065,11 @@ impl File {
     /// Unlinks the file at `path`, closes the underlying descriptor, and syncs the parent directory to
     /// guarantee crash-safe durability
     ///
+    /// ## Caller Responsibilities
+    ///
+    /// The caller must ensure that when calling `delete`, no write operations are pending for durability
+    /// and no write operations are invoked during or after `delete` is called
+    ///
     /// ## Example
     ///
     /// ```
@@ -1235,6 +1242,27 @@ mod tests {
 
             let err = File::new(cfg).unwrap_err();
             assert_eq!(err.reason, err::INV.reason);
+        }
+
+        #[test]
+        fn err_new_cleans_up_on_grow_failure() {
+            let (_dir, mut cfg) = tmp_path();
+            // On 64-bit systems, setting buffer_size such that buffer_size * initial_buffers exceeds
+            // off_t::MAX / i64::MAX triggers grow failure after successful creation
+            cfg.buffer_size = 1 << 63;
+            cfg.initial_available_buffers = 1;
+
+            let err = File::new(cfg.clone()).unwrap_err();
+            assert_eq!(err.reason, err::GRW.reason);
+
+            // File must be unlinked and not left as an orphan on disk
+            assert!(!cfg.path.exists());
+
+            // A subsequent File::new with valid config must succeed and not fail with EXS
+            cfg.buffer_size = BUFFER_SIZE;
+            cfg.initial_available_buffers = INIT_BUFFERS;
+            let file = File::new(cfg);
+            assert!(file.is_ok());
         }
     }
 
