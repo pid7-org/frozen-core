@@ -18,7 +18,7 @@ pub(super) type FileId = c_int;
 pub(in crate::file) const CLOSED_FD: FileId = FileId::MIN;
 
 /// Max allowed retries for `EINTR`, `EBUSY` and `EAGAIN` errors
-const MAX_RETRIES: usize = 0x0C;
+const MAX_RETRIES: usize = 0x80;
 
 /// Custom implementation of `std::fs::File` for POSIX systems
 #[derive(Debug)]
