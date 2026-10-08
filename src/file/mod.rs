@@ -398,7 +398,7 @@ impl File {
 
         let init_len = match cfg.buffer_size.checked_mul(cfg.initial_available_buffers) {
             Some(len) => len,
-            None => return err::default_error(err::GRW).with_module(mid),
+            None => return err::default_error(err::INV).with_module(mid),
         };
 
         let file = PlatformFile::create(&cfg.path).with_module(mid)?;
@@ -463,7 +463,7 @@ impl File {
 
         let init_len = match cfg.buffer_size.checked_mul(cfg.initial_available_buffers) {
             Some(len) => len,
-            None => return err::default_error(err::CPT).with_module(mid),
+            None => return err::default_error(err::INV).with_module(mid),
         };
 
         let file = PlatformFile::open(&cfg.path).with_module(mid)?;
@@ -1231,6 +1231,15 @@ mod tests {
         }
 
         #[test]
+        fn err_new_cfg_overflow() {
+            let (_dir, mut cfg) = tmp_path();
+            cfg.buffer_size = usize::MAX;
+            cfg.initial_available_buffers = 2;
+            let err = File::new(cfg).unwrap_err();
+            assert_eq!(err.reason, err::INV.reason);
+        }
+
+        #[test]
         fn err_new_missing_parent_dir() {
             let (_dir, mut cfg) = tmp_path();
             cfg.path = cfg.path.join("missing/sub/dir/file.db");
@@ -1300,6 +1309,15 @@ mod tests {
         }
 
         #[test]
+        fn err_open_cfg_overflow() {
+            let (_dir, mut cfg) = tmp_path();
+            cfg.buffer_size = usize::MAX;
+            cfg.initial_available_buffers = 2;
+            let err = File::open(cfg).unwrap_err();
+            assert_eq!(err.reason, err::INV.reason);
+        }
+
+        #[test]
         fn err_open_when_file_smaller_than_init_len() {
             let (_dir, cfg) = tmp_path();
 
@@ -1360,6 +1378,15 @@ mod tests {
 
             cfg.buffer_size = BUFFER_SIZE;
             cfg.initial_available_buffers = 0;
+            let err = File::open_or_create(cfg).unwrap_err();
+            assert_eq!(err.reason, err::INV.reason);
+        }
+
+        #[test]
+        fn err_open_or_create_cfg_overflow() {
+            let (_dir, mut cfg) = tmp_path();
+            cfg.buffer_size = usize::MAX;
+            cfg.initial_available_buffers = 2;
             let err = File::open_or_create(cfg).unwrap_err();
             assert_eq!(err.reason, err::INV.reason);
         }
