@@ -1,4 +1,41 @@
-//! NA
+//! Custom implementation of `std::fs::File` with fixed-size buffer addressing, background synchronization,
+//! and epoch-based durability tracking
+//!
+//! ## Example
+//!
+//! ```
+//! use frozen_core::file::{File, FileCfg};
+//!
+//! const MID: u8 = 0;
+//!
+//! let dir = tempfile::tempdir().unwrap();
+//! let path = dir.path().join("tmp_file");
+//!
+//! let cfg = FileCfg {
+//!     module_id: MID,
+//!     buffer_size: 0x10,
+//!     path: path.clone(),
+//!     initial_available_buffers: 4,
+//!     sync_interval: None,
+//! };
+//!
+//! let file = File::new(cfg.clone()).unwrap();
+//! assert_eq!(file.length(), 0x10 * 4);
+//!
+//! let data = [1u8; 0x10];
+//! let ticket = file.write(&data, 0).unwrap();
+//! file.sync().unwrap();
+//! assert!(ticket.is_durable());
+//!
+//! let mut buf = [0u8; 0x10];
+//! file.read(&mut buf, 0).unwrap();
+//! assert_eq!(buf, data);
+//!
+//! assert!(File::new(cfg.clone()).is_err());
+//!
+//! assert!(file.delete().is_ok());
+//! assert!(!path.exists());
+//! ```
 
 mod interface;
 
@@ -130,6 +167,25 @@ pub type FileId = libc::c_int;
 pub type FileId = isize;
 
 /// Configurations for [`File`]
+///
+/// ## Example
+///
+/// ```
+/// use frozen_core::file::FileCfg;
+/// use std::time::Duration;
+///
+/// let cfg = FileCfg {
+///     module_id: 1,
+///     path: std::path::PathBuf::from("test.db"),
+///     buffer_size: 0x100,
+///     initial_available_buffers: 0x10,
+///     sync_interval: Some(Duration::from_millis(0x64)),
+/// };
+///
+/// assert_eq!(cfg.buffer_size, 0x100);
+/// assert_eq!(cfg.initial_available_buffers, 0x10);
+/// assert_eq!(cfg.sync_interval, Some(Duration::from_millis(0x64)));
+/// ```
 #[derive(Debug, Clone)]
 pub struct FileCfg {
     /// Identifier used while error propagation
@@ -137,22 +193,22 @@ pub struct FileCfg {
 
     /// Absolute path for/of the file
     ///
-    /// *NOTE:* The caller must make sure that the path represents a file and all the parent
-    /// directories included in the path do exists
+    /// *NOTE:* The caller must make sure that the path represents a file and all the parent directories included
+    /// in the path do exists
     pub path: std::path::PathBuf,
 
     /// Size (in bytes) of a single chunk in file
     ///
-    /// A chunk is a small fixed size allocation and addressing unit used by [`File`] for all
-    /// the write/read ops. These ops are operated by index of the chunk and not the offset of the
-    /// byte.
+    /// A chunk is a small fixed size allocation and addressing unit used by [`File`] for all the write/read ops
+    ///
+    /// These ops are operated by index of the chunk and not the offset of the byte
     ///
     /// *NOTE:* Chunk size when power of 2, is cache efficient and good for performance
     pub buffer_size: usize,
 
     /// Number of chunks to pre-allocate on fs when [`File`] is initialized
     ///
-    /// Initial file length will be `buffer_size * initial_available_buffers` (bytes).
+    /// Initial file length will be `buffer_size * initial_available_buffers` (bytes)
     pub initial_available_buffers: usize,
 
     /// Optional interval for the background sync thread
@@ -327,6 +383,27 @@ impl File {
     /// ## Exclusive Lock
     ///
     /// Acquires an exclusive advisory lock via `flock(LOCK_EX | LOCK_NB)` immediately after descriptor creation
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::file::{File, FileCfg};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = FileCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().join("new_file.bin"),
+    ///     buffer_size: 64,
+    ///     initial_available_buffers: 4,
+    ///     sync_interval: None,
+    /// };
+    ///
+    /// let file = File::new(cfg.clone()).unwrap();
+    /// assert_eq!(file.length(), 256);
+    ///
+    /// // Creating another file at the same path fails
+    /// assert!(File::new(cfg).is_err());
+    /// ```
     pub fn new(cfg: FileCfg) -> FrozenResult<Self> {
         let _ = err::init_mid(cfg.module_id);
         if cfg.buffer_size == 0 || cfg.initial_available_buffers == 0 {
@@ -368,6 +445,29 @@ impl File {
     /// - Current file length is a multiple of `buffer_size`
     ///
     /// If any invariant is violated, the file is closed and `err::CPT` is returned
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::file::{File, FileCfg};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = FileCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().join("open_file.bin"),
+    ///     buffer_size: 64,
+    ///     initial_available_buffers: 4,
+    ///     sync_interval: None,
+    /// };
+    ///
+    /// {
+    ///     let file = File::new(cfg.clone()).unwrap();
+    ///     assert_eq!(file.length(), 256);
+    /// }
+    ///
+    /// let opened = File::open(cfg).unwrap();
+    /// assert_eq!(opened.length(), 256);
+    /// ```
     pub fn open(cfg: FileCfg) -> FrozenResult<Self> {
         let _ = err::init_mid(cfg.module_id);
 
@@ -423,6 +523,31 @@ impl File {
     /// the file already exists, it is opened and its layout invariants are validated
     ///
     /// In both cases, an exclusive advisory lock is acquired on the file
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::file::{File, FileCfg};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = FileCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().join("idempotent.bin"),
+    ///     buffer_size: 64,
+    ///     initial_available_buffers: 2,
+    ///     sync_interval: None,
+    /// };
+    ///
+    /// // First invocation creates and initializes the file
+    /// {
+    ///     let file = File::open_or_create(cfg.clone()).unwrap();
+    ///     assert_eq!(file.length(), 128);
+    /// }
+    ///
+    /// // Subsequent invocation opens the existing file safely
+    /// let reopened = File::open_or_create(cfg).unwrap();
+    /// assert_eq!(reopened.length(), 128);
+    /// ```
     pub fn open_or_create(cfg: FileCfg) -> FrozenResult<Self> {
         let _ = err::init_mid(cfg.module_id);
 
@@ -502,6 +627,30 @@ impl File {
     ///
     /// - `buf.len()` must be a non-zero multiple of `cfg.buffer_size`
     /// - Reading beyond current file length will return `err::HCF`
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::file::{File, FileCfg};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = FileCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().join("read_test.bin"),
+    ///     buffer_size: 16,
+    ///     initial_available_buffers: 2,
+    ///     sync_interval: None,
+    /// };
+    ///
+    /// let file = File::new(cfg).unwrap();
+    /// let data = [7u8; 16];
+    /// let ticket = file.write(&data, 0).unwrap();
+    /// ticket.force().unwrap();
+    ///
+    /// let mut out = [0u8; 16];
+    /// file.read(&mut out, 0).unwrap();
+    /// assert_eq!(out, data);
+    /// ```
     #[inline(always)]
     pub fn read(&self, buf: &mut [u8], index: usize) -> FrozenResult<()> {
         // TODO: Tackle durability verification for uncommitted/non-durable reads internally in the future
@@ -543,6 +692,29 @@ impl File {
     ///
     /// - `buf.len()` must be a non-zero multiple of `cfg.buffer_size`
     /// - Writing beyond current file length will return `err::HCF`
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::file::{File, FileCfg};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = FileCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().join("write_test.bin"),
+    ///     buffer_size: 16,
+    ///     initial_available_buffers: 2,
+    ///     sync_interval: None,
+    /// };
+    ///
+    /// let file = File::new(cfg).unwrap();
+    /// let data = [42u8; 16];
+    /// let ticket = file.write(&data, 1).unwrap();
+    /// assert_eq!(ticket.is_durable(), false);
+    ///
+    /// file.sync().unwrap();
+    /// assert!(ticket.is_durable());
+    /// ```
     #[inline(always)]
     pub fn write(&self, buf: &[u8], index: usize) -> FrozenResult<AckTicket> {
         if buf.is_empty() {
@@ -578,6 +750,28 @@ impl File {
     /// Grow file size of [`File`] by given `count` of buffers
     ///
     /// After successful execution, updated file length will be `current_length + (count * buffer_size)`
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::file::{File, FileCfg};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = FileCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().join("grow_test.bin"),
+    ///     buffer_size: 32,
+    ///     initial_available_buffers: 2,
+    ///     sync_interval: None,
+    /// };
+    ///
+    /// let file = File::new(cfg).unwrap();
+    /// assert_eq!(file.length(), 64);
+    ///
+    /// file.grow(3).unwrap();
+    /// assert_eq!(file.length(), 160);
+    /// assert_eq!(file.total_buffers().unwrap(), 5);
+    /// ```
     pub fn grow(&self, count: usize) -> FrozenResult<()> {
         if count == 0 {
             return Ok(());
@@ -604,12 +798,56 @@ impl File {
     }
 
     /// Syncs in-mem data to the storage device
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::file::{File, FileCfg};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = FileCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().join("sync_test.bin"),
+    ///     buffer_size: 16,
+    ///     initial_available_buffers: 2,
+    ///     sync_interval: None,
+    /// };
+    ///
+    /// let file = File::new(cfg).unwrap();
+    /// let ticket = file.write(&[9u8; 16], 0).unwrap();
+    /// assert!(!ticket.is_durable());
+    ///
+    /// file.sync().unwrap();
+    /// assert!(ticket.is_durable());
+    /// ```
     #[inline]
     pub fn sync(&self) -> FrozenResult<()> {
         self.inner.sync_internal()
     }
 
     /// Best-effort call to prompt kernel to start flushing dirty pages in the specified chunk range
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// # #[cfg(target_os = "linux")]
+    /// # {
+    /// use frozen_core::file::{File, FileCfg};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = FileCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().join("sync_range.bin"),
+    ///     buffer_size: 64,
+    ///     initial_available_buffers: 4,
+    ///     sync_interval: None,
+    /// };
+    ///
+    /// let file = File::new(cfg).unwrap();
+    /// file.write(&[1u8; 64], 0).unwrap();
+    /// assert!(file.sync_range(0, 1).is_ok());
+    /// # }
+    /// ```
     #[cfg(target_os = "linux")]
     pub fn sync_range(&self, index: usize, count: usize) -> FrozenResult<()> {
         let offset = match index.checked_mul(self.cfg.buffer_size) {
@@ -631,6 +869,24 @@ impl File {
     }
 
     /// Fetch total available buffers in [`File`]
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::file::{File, FileCfg};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = FileCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().join("buffers.bin"),
+    ///     buffer_size: 32,
+    ///     initial_available_buffers: 8,
+    ///     sync_interval: None,
+    /// };
+    ///
+    /// let file = File::new(cfg).unwrap();
+    /// assert_eq!(file.total_buffers().unwrap(), 8);
+    /// ```
     #[inline]
     pub fn total_buffers(&self) -> FrozenResult<usize> {
         let curr_len = self.length();
@@ -644,30 +900,129 @@ impl File {
     }
 
     /// Get reference to configuration of [`File`]
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::file::{File, FileCfg};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = FileCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().join("cfg.bin"),
+    ///     buffer_size: 64,
+    ///     initial_available_buffers: 2,
+    ///     sync_interval: None,
+    /// };
+    ///
+    /// let file = File::new(cfg).unwrap();
+    /// assert_eq!(file.cfg().buffer_size, 64);
+    /// assert_eq!(file.cfg().initial_available_buffers, 2);
+    /// ```
     #[inline]
     pub fn cfg(&self) -> &FileCfg {
         &self.cfg
     }
 
     /// Read current length (in bytes) of [`File`]
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::file::{File, FileCfg};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = FileCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().join("len.bin"),
+    ///     buffer_size: 128,
+    ///     initial_available_buffers: 4,
+    ///     sync_interval: None,
+    /// };
+    ///
+    /// let file = File::new(cfg).unwrap();
+    /// assert_eq!(file.length(), 512);
+    /// ```
     #[inline]
     pub fn length(&self) -> usize {
         self.inner.current_length.load(atomic::Ordering::Acquire)
     }
 
     /// Fetch the latest assigned durability epoch
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::file::{File, FileCfg};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = FileCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().join("epoch.bin"),
+    ///     buffer_size: 16,
+    ///     initial_available_buffers: 2,
+    ///     sync_interval: None,
+    /// };
+    ///
+    /// let file = File::new(cfg).unwrap();
+    /// assert_eq!(file.current_epoch(), 0);
+    ///
+    /// file.write(&[1u8; 16], 0).unwrap();
+    /// assert_eq!(file.current_epoch(), 1);
+    /// ```
     #[inline]
     pub fn current_epoch(&self) -> TEpoch {
         self.inner.completion.read_current_epoch()
     }
 
     /// Fetch the latest durable epoch
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::file::{File, FileCfg};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = FileCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().join("durable_epoch.bin"),
+    ///     buffer_size: 16,
+    ///     initial_available_buffers: 2,
+    ///     sync_interval: None,
+    /// };
+    ///
+    /// let file = File::new(cfg).unwrap();
+    /// file.write(&[1u8; 16], 0).unwrap();
+    /// assert_eq!(file.durable_epoch(), 0);
+    ///
+    /// file.sync().unwrap();
+    /// assert_eq!(file.durable_epoch(), 1);
+    /// ```
     #[inline]
     pub fn durable_epoch(&self) -> TEpoch {
         self.inner.completion.read_durable_epoch()
     }
 
     /// Fetch reference to underlying durability [`Completion`]
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::file::{File, FileCfg};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = FileCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().join("completion.bin"),
+    ///     buffer_size: 16,
+    ///     initial_available_buffers: 2,
+    ///     sync_interval: None,
+    /// };
+    ///
+    /// let file = File::new(cfg).unwrap();
+    /// let completion = file.completion();
+    /// assert_eq!(completion.read_current_epoch(), 0);
+    /// ```
     #[inline]
     pub fn completion(&self) -> &Arc<Completion> {
         &self.inner.completion
@@ -678,6 +1033,24 @@ impl File {
     /// ## Access Semantics
     ///
     /// Uses `access(path, F_OK)` to verify the existence of the file
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::file::{File, FileCfg};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = FileCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().join("exists.bin"),
+    ///     buffer_size: 16,
+    ///     initial_available_buffers: 2,
+    ///     sync_interval: None,
+    /// };
+    ///
+    /// let file = File::new(cfg).unwrap();
+    /// assert!(file.exists().unwrap());
+    /// ```
     #[inline]
     pub fn exists(&self) -> FrozenResult<bool> {
         PlatformFile::exists(&self.cfg.path)
@@ -689,6 +1062,28 @@ impl File {
     ///
     /// Unlinks the file at `path`, closes the underlying descriptor, and syncs the parent directory to
     /// guarantee crash-safe durability
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::file::{File, FileCfg};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let path = dir.path().join("delete_test.bin");
+    /// let cfg = FileCfg {
+    ///     module_id: 1,
+    ///     path: path.clone(),
+    ///     buffer_size: 16,
+    ///     initial_available_buffers: 2,
+    ///     sync_interval: None,
+    /// };
+    ///
+    /// let file = File::new(cfg).unwrap();
+    /// assert!(path.exists());
+    ///
+    /// file.delete().unwrap();
+    /// assert!(!path.exists());
+    /// ```
     pub fn delete(mut self) -> FrozenResult<()> {
         self.inner.shutdown.store(true, atomic::Ordering::Release);
         {
@@ -711,6 +1106,27 @@ impl File {
     }
 
     /// Get file descriptor or handle for [`File`]
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::file::{File, FileCfg};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = FileCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().join("fd_test.bin"),
+    ///     buffer_size: 16,
+    ///     initial_available_buffers: 2,
+    ///     sync_interval: None,
+    /// };
+    ///
+    /// let file = File::new(cfg).unwrap();
+    /// #[cfg(unix)]
+    /// assert!(file.fd() >= 0);
+    /// #[cfg(windows)]
+    /// assert_ne!(file.fd(), -1isize);
+    /// ```
     #[inline]
     pub fn fd(&self) -> FileId {
         let guard = self.inner.file.read().unwrap_or_else(|e| e.into_inner());
