@@ -17,8 +17,9 @@ const MAX_RETRIES: usize = 0x0A;
 
 /// Custom implementation of memory-mapped memory via `mmap(2)` for POSIX systems
 ///
-/// Wraps an allocated virtual memory mapping, managing its lifetime via RAII.
-/// Automatic cleanup is provided via [`Drop`] unless explicitly consumed with [`POSIXMemMap::unmap`].
+/// Wraps an allocated virtual memory mapping, managing its lifetime via RAII
+///
+/// Automatic cleanup is provided via [`Drop`] unless explicitly consumed with [`POSIXMemMap::unmap`]
 #[derive(Debug)]
 pub(super) struct POSIXMemMap {
     ptr: TPtr,
@@ -39,7 +40,7 @@ impl Drop for POSIXMemMap {
 impl POSIXMemMap {
     /// Create a new [`POSIXMemMap`] by mapping `length` bytes of the file represented by `fd`
     ///
-    /// Maps memory from offset 0 with `PROT_READ | PROT_WRITE` and `MAP_SHARED`.
+    /// Maps memory from offset 0 with `PROT_READ | PROT_WRITE` and `MAP_SHARED`
     pub(super) fn new(fd: i32, length: size_t) -> FrozenResult<Self> {
         let ptr = mmap_raw(fd, length)?;
         Ok(Self { ptr, length })
@@ -47,8 +48,9 @@ impl POSIXMemMap {
 
     /// Unmap [`POSIXMemMap`] to explicitly release mapped memory resources
     ///
-    /// Consumes `self` to prevent use-after-free or double-unmapping at compile time.
-    /// Clears internal state so subsequent [`Drop`] execution becomes a safe no-op.
+    /// Consumes `self` to prevent use-after-free or double-unmapping at compile time
+    ///
+    /// Clears internal state so subsequent [`Drop`] execution becomes a safe no-op
     pub(super) fn unmap(mut self) -> FrozenResult<()> {
         if !self.ptr.is_null() && self.length > 0 {
             let res = munmap_raw(self.ptr, self.length);
@@ -71,14 +73,15 @@ impl POSIXMemMap {
     /// ## Durability
     ///
     /// In POSIX systems `msync(MS_SYNC)` does not provide crash-safe durability; this syscall is used as a best-effort
-    /// operation to explicitly push dirty mmapped pages into filesystem writeback.
+    /// operation to explicitly push dirty mmapped pages into filesystem writeback
     ///
-    /// For strong durability, use of [`File::sync`](crate::file::File::sync) is required right after calling [`POSIXMemMap::sync`].
+    /// For strong durability, use of [`File::sync`](crate::file::File::sync) is required right after calling
+    /// [`POSIXMemMap::sync`]
     ///
     /// ## Why do we retry?
     ///
     /// POSIX syscalls are interruptible by signals and may fail w/ `EINTR`, `EBUSY`, or `EAGAIN`. In such cases,
-    /// no progress is guaranteed, so the syscall must be retried.
+    /// no progress is guaranteed, so the syscall must be retried
     pub(super) fn sync(&self, length: usize) -> FrozenResult<()> {
         msync_raw(self.ptr, length)
     }
@@ -89,10 +92,12 @@ impl POSIXMemMap {
     ///
     /// # Safety
     ///
-    /// - The caller must ensure that `offset + std::mem::size_of::<T>() <= length` where `length` is the mapped region size.
-    /// - The pointer `base + offset` must be properly aligned for `T`.
-    /// - The caller must uphold Rust's aliasing rules (no concurrent unsynchronized reads or writes to overlapping bytes).
-    /// - The memory mapping must not have been unmapped via [`POSIXMemMap::unmap`].
+    /// - The caller must ensure that `offset + std::mem::size_of::<T>() <= length` where `length` is the mapped
+    ///   region size
+    /// - The pointer `base + offset` must be properly aligned for `T`
+    /// - The caller must uphold Rust's aliasing rules (no concurrent unsynchronized reads or writes to overlapping
+    ///   bytes)
+    /// - The memory mapping must not have been unmapped via [`POSIXMemMap::unmap`]
     #[inline]
     #[allow(unsafe_op_in_unsafe_fn)]
     pub(super) unsafe fn as_mut_ptr<T>(&self, offset: usize) -> *mut T
@@ -108,10 +113,11 @@ impl POSIXMemMap {
     ///
     /// # Safety
     ///
-    /// - The caller must ensure that `offset + std::mem::size_of::<T>() <= length` where `length` is the mapped region size.
-    /// - The pointer `base + offset` must be properly aligned for `T`.
-    /// - The caller must uphold Rust's aliasing rules (no concurrent unsynchronized writes).
-    /// - The memory mapping must not have been unmapped via [`POSIXMemMap::unmap`].
+    /// - The caller must ensure that `offset + std::mem::size_of::<T>() <= length` where `length` is the mapped region
+    ///   size
+    /// - The pointer `base + offset` must be properly aligned for `T`
+    /// - The caller must uphold Rust's aliasing rules (no concurrent unsynchronized writes)
+    /// - The memory mapping must not have been unmapped via [`POSIXMemMap::unmap`]
     #[inline]
     #[allow(unsafe_op_in_unsafe_fn)]
     pub(super) unsafe fn as_ptr<T>(&self, offset: usize) -> *const T
@@ -127,9 +133,9 @@ impl POSIXMemMap {
 /// ## Caveats of `mmap(2)` on POSIX
 ///
 /// In POSIX systems, when calling `mmap(2)`, the provided offset must be a multiple of page size,
-/// i.e. `sysconf(_SC_PAGESIZE)`, otherwise an `EINVAL` error is returned.
+/// i.e. `sysconf(_SC_PAGESIZE)`, otherwise an `EINVAL` error is returned
 ///
-/// For our use case, we always map the entire file from offset 0, hence this is never an issue for us.
+/// For our use case, we always map the entire file from offset 0, hence this is never an issue for us
 fn mmap_raw(fd: i32, length: size_t) -> FrozenResult<TPtr> {
     let mut retries = 0; // only for transient errors (EINTR, EBUSY, EAGAIN)
     loop {
@@ -192,7 +198,7 @@ fn munmap_raw(ptr: TPtr, length: size_t) -> FrozenResult<()> {
 ///
 /// This syscall by itself does not provide any durability guarantee; it is used as a best-effort operation
 /// to explicitly push dirty mmapped pages into filesystem writeback, to aid hard sync calls like `fdatasync` on Linux
-/// and `fcntl(F_FULLFSYNC)` on macOS.
+/// and `fcntl(F_FULLFSYNC)` on macOS
 fn msync_raw(ptr: TPtr, length: size_t) -> FrozenResult<()> {
     let mut retries = 0; // only for transient errors (EINTR, EBUSY, EAGAIN)
     loop {
