@@ -336,6 +336,26 @@ mod tests {
         }
 
         #[test]
+        fn ok_multiple_shared_mappings_reflect_writes() {
+            const VAL: u64 = 0x1234_5678_9ABC_DEF0;
+            let (_dir, file) = new_tmp();
+
+            unsafe {
+                let mmap1 = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
+                let mmap2 = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
+
+                let wptr = mmap1.as_mut_ptr::<u64>(0);
+                *wptr = VAL;
+
+                let rptr = mmap2.as_ptr::<u64>(0);
+                assert_eq!(*rptr, VAL);
+
+                mmap1.unmap().unwrap();
+                mmap2.unmap().unwrap();
+            }
+        }
+
+        #[test]
         fn err_map_on_invalid_length() {
             let (_dir, file) = new_tmp();
             unsafe {
@@ -420,6 +440,31 @@ mod tests {
             unsafe {
                 let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
                 assert!(mmap.sync(0).is_ok());
+                mmap.unmap().unwrap();
+            }
+        }
+
+        #[test]
+        fn ok_sync_partial_range() {
+            const VAL: u64 = 0xA5A5_A5A5_A5A5_A5A5;
+            let (_dir, file) = new_tmp();
+            unsafe {
+                let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
+                let wptr = mmap.as_mut_ptr::<u64>(0);
+                *wptr = VAL;
+                assert!(mmap.sync(BUFFER_SIZE).is_ok());
+                mmap.unmap().unwrap();
+            }
+        }
+
+        #[test]
+        fn err_sync_on_unaligned_pointer() {
+            let (_dir, file) = new_tmp();
+            unsafe {
+                let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
+                let unaligned = (mmap.as_ptr::<u8>(0) as usize + 1) as *mut u8;
+                let err = msync_raw(unaligned, BUFFER_SIZE).unwrap_err();
+                assert_eq!(err.reason, err::HCF.reason);
                 mmap.unmap().unwrap();
             }
         }
@@ -523,6 +568,33 @@ mod tests {
                 mmap.unmap().unwrap();
             }
         }
+
+        #[test]
+        fn ok_write_read_heterogeneous_types() {
+            let (_dir, file) = new_tmp();
+            unsafe {
+                let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
+
+                let p_u8 = mmap.as_mut_ptr::<u8>(0);
+                *p_u8 = 0xAA;
+
+                let p_u16 = mmap.as_mut_ptr::<u16>(2);
+                *p_u16 = 0xBBCC;
+
+                let p_u32 = mmap.as_mut_ptr::<u32>(4);
+                *p_u32 = 0xDDEEFF00;
+
+                let p_u64 = mmap.as_mut_ptr::<u64>(8);
+                *p_u64 = 0x11223344_55667788;
+
+                assert_eq!(*mmap.as_ptr::<u8>(0), 0xAA);
+                assert_eq!(*mmap.as_ptr::<u16>(2), 0xBBCC);
+                assert_eq!(*mmap.as_ptr::<u32>(4), 0xDDEEFF00);
+                assert_eq!(*mmap.as_ptr::<u64>(8), 0x11223344_55667788);
+
+                mmap.unmap().unwrap();
+            }
+        }
     }
 
     mod map_durability {
@@ -592,6 +664,35 @@ mod tests {
                 mmap.unmap().unwrap();
             }
         }
+        #[test]
+        fn ok_map_durability_on_drop_and_reopen() {
+            const VAL: u64 = 0x0123_4567_89AB_CDEF;
+            let (dir, file) = new_tmp();
+            unsafe {
+                let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
+                let ptr = mmap.as_mut_ptr::<u64>(0);
+                *ptr = VAL;
+                mmap.sync(LENGTH).unwrap();
+                drop(mmap);
+                drop(file);
+            }
+
+            unsafe {
+                let path = dir.path().join("tmp_map");
+                let cfg = FileCfg {
+                    path,
+                    module_id: MOD_ID,
+                    buffer_size: BUFFER_SIZE,
+                    initial_available_buffers: INIT_BUFFERS,
+                    sync_interval: None,
+                };
+                let file = File::open(cfg).expect("open FF");
+                let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
+                let ptr = mmap.as_ptr::<u64>(0);
+                assert_eq!(*ptr, VAL);
+                mmap.unmap().unwrap();
+            }
+        }
     }
 
     mod map_drop {
@@ -602,6 +703,16 @@ mod tests {
             let (_dir, file) = new_tmp();
             let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
             assert_eq!(mmap.length(), LENGTH);
+        }
+
+        #[test]
+        fn ok_explicit_unmap_prevents_drop_double_unmap() {
+            let (_dir, file) = new_tmp();
+            unsafe {
+                let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
+                assert!(mmap.unmap().is_ok());
+                // explicit unmap consumed mmap; drop should be a safe no-op without double-unmap
+            }
         }
 
         #[test]
