@@ -40,8 +40,15 @@ impl POSIXMemMap {
     }
 
     /// Unmap [`POSIXMemMap`] to release mapped memory resources
-    pub(super) fn unmap(&self, length: usize) -> FrozenResult<()> {
-        munmap_raw(self.ptr, length)
+    pub(super) fn unmap(mut self) -> FrozenResult<()> {
+        if !self.ptr.is_null() && self.length > 0 {
+            let res = munmap_raw(self.ptr, self.length);
+            self.ptr = ptr::null_mut();
+            self.length = 0;
+            res
+        } else {
+            Ok(())
+        }
     }
 
     /// Returns the length of the memory mapping in bytes
@@ -288,7 +295,7 @@ mod tests {
 
             unsafe {
                 let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
-                mmap.unmap(LENGTH).unwrap();
+                mmap.unmap().unwrap();
             }
         }
 
@@ -303,7 +310,17 @@ mod tests {
                 let ptr = mmap.as_ptr::<[u8; LENGTH]>(0);
                 assert_eq!(*ptr, BUF);
 
-                mmap.unmap(LENGTH).unwrap();
+                mmap.unmap().unwrap();
+            }
+        }
+
+        #[test]
+        fn ok_unmap_consumes_self() {
+            let (_dir, file) = new_tmp();
+
+            unsafe {
+                let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
+                assert!(mmap.unmap().is_ok());
             }
         }
 
@@ -348,9 +365,9 @@ mod tests {
 
             unsafe {
                 let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
-                let err = mmap.unmap(0).unwrap_err();
+                let err = munmap_raw(mmap.as_ptr::<u8>(0) as *mut u8, 0).unwrap_err();
                 assert_eq!(err.reason, err::HCF.reason);
-                mmap.unmap(LENGTH).unwrap();
+                mmap.unmap().unwrap();
             }
         }
     }
@@ -365,7 +382,7 @@ mod tests {
             unsafe {
                 let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
                 mmap.sync(LENGTH).unwrap();
-                mmap.unmap(LENGTH).unwrap();
+                mmap.unmap().unwrap();
             }
         }
 
@@ -381,7 +398,7 @@ mod tests {
                 mmap.sync(LENGTH).unwrap();
                 mmap.sync(LENGTH).unwrap();
 
-                mmap.unmap(LENGTH).unwrap();
+                mmap.unmap().unwrap();
             }
         }
 
@@ -392,7 +409,7 @@ mod tests {
             unsafe {
                 let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
                 assert!(mmap.sync(0).is_ok());
-                mmap.unmap(LENGTH).unwrap();
+                mmap.unmap().unwrap();
             }
         }
     }
@@ -416,7 +433,7 @@ mod tests {
                 let rptr = mmap.as_ptr::<u64>(0);
                 assert_eq!(*rptr, VAL);
 
-                mmap.unmap(LENGTH).unwrap();
+                mmap.unmap().unwrap();
             }
         }
 
@@ -436,7 +453,7 @@ mod tests {
                 let rptr = mmap.as_ptr::<u64>(8);
                 assert_eq!(*rptr, VAL);
 
-                mmap.unmap(LENGTH).unwrap();
+                mmap.unmap().unwrap();
             }
         }
 
@@ -455,7 +472,7 @@ mod tests {
                 let rptr = mmap.as_ptr::<u64>(OFFSET);
                 assert_eq!(*rptr, VAL);
 
-                mmap.unmap(LENGTH).unwrap();
+                mmap.unmap().unwrap();
             }
         }
 
@@ -478,7 +495,7 @@ mod tests {
                 let rptr = mmap.as_ptr::<[u32; 0x0A]>(0);
                 assert_eq!(*rptr, VAL);
 
-                mmap.unmap(LENGTH).unwrap();
+                mmap.unmap().unwrap();
             }
         }
 
@@ -492,7 +509,7 @@ mod tests {
                 let rptr = mmap.as_ptr::<u64>(0);
                 assert_eq!(*rptr, 0);
 
-                mmap.unmap(LENGTH).unwrap();
+                mmap.unmap().unwrap();
             }
         }
     }
@@ -513,7 +530,7 @@ mod tests {
                 *ptr = VAL;
 
                 mmap.sync(LENGTH).unwrap();
-                mmap.unmap(LENGTH).unwrap();
+                mmap.unmap().unwrap();
             }
 
             // open + map + read
@@ -523,7 +540,7 @@ mod tests {
                 let ptr = mmap.as_ptr::<u64>(0);
                 assert_eq!(*ptr, VAL);
 
-                mmap.unmap(LENGTH).unwrap();
+                mmap.unmap().unwrap();
             }
         }
 
@@ -540,7 +557,7 @@ mod tests {
                 *ptr = VAL;
 
                 mmap.sync(LENGTH).unwrap();
-                mmap.unmap(LENGTH).unwrap();
+                mmap.unmap().unwrap();
                 drop(file);
             }
 
@@ -561,7 +578,7 @@ mod tests {
                 let ptr = mmap.as_ptr::<u64>(0);
                 assert_eq!(*ptr, VAL);
 
-                mmap.unmap(LENGTH).unwrap();
+                mmap.unmap().unwrap();
             }
         }
     }
@@ -594,14 +611,16 @@ mod tests {
                 let mmap2 = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
                 let rptr = mmap2.as_ptr::<u64>(0);
                 assert_eq!(*rptr, VAL);
-                mmap2.unmap(LENGTH).unwrap();
+                mmap2.unmap().unwrap();
             }
         }
 
         #[test]
         #[cfg(target_os = "linux")]
         fn ok_drop_unmaps_from_proc_maps() {
-            let (_dir, file) = new_tmp();
+            let (dir, file) = new_tmp();
+            let path_str = dir.path().join("tmp_map");
+            let path_str = path_str.to_str().unwrap();
             let addr: usize;
 
             unsafe {
@@ -611,14 +630,16 @@ mod tests {
                 let is_mapped = || {
                     let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
                     maps.lines().any(|line| {
-                        if let Some((start_s, end_s)) =
-                            line.split_whitespace().next().and_then(|r| r.split_once('-'))
-                        {
-                            if let (Ok(start), Ok(end)) = (
-                                usize::from_str_radix(start_s, 16),
-                                usize::from_str_radix(end_s, 16),
-                            ) {
-                                return addr >= start && addr < end;
+                        if line.contains(path_str) {
+                            if let Some((start_s, end_s)) =
+                                line.split_whitespace().next().and_then(|r| r.split_once('-'))
+                            {
+                                if let (Ok(start), Ok(end)) = (
+                                    usize::from_str_radix(start_s, 16),
+                                    usize::from_str_radix(end_s, 16),
+                                ) {
+                                    return addr >= start && addr < end;
+                                }
                             }
                         }
                         false
