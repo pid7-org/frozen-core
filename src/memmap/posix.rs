@@ -17,18 +17,37 @@ const MAX_RETRIES: usize = 0x0A;
 
 /// Custom impl of `mmap(2)` for POSIX systems
 #[derive(Debug)]
-pub(super) struct POSIXMemMap(TPtr);
+pub(super) struct POSIXMemMap {
+    ptr: TPtr,
+    length: usize,
+}
+
+impl Drop for POSIXMemMap {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() && self.length > 0 {
+            let _ = munmap_raw(self.ptr, self.length);
+            self.ptr = ptr::null_mut();
+            self.length = 0;
+        }
+    }
+}
 
 impl POSIXMemMap {
     /// Create a new [`POSIXMemMap`] w/ given `fd` and `length`
     pub(super) fn new(fd: i32, length: size_t) -> FrozenResult<Self> {
         let ptr = mmap_raw(fd, length)?;
-        Ok(Self(ptr))
+        Ok(Self { ptr, length })
     }
 
     /// Unmap [`POSIXMemMap`] to release mapped memory resources
     pub(super) fn unmap(&self, length: usize) -> FrozenResult<()> {
-        munmap_raw(self.0, length)
+        munmap_raw(self.ptr, length)
+    }
+
+    /// Returns the length of the memory mapping in bytes
+    #[inline]
+    pub(super) fn length(&self) -> usize {
+        self.length
     }
 
     /// Syncs in cache data updates on the storage device
@@ -45,7 +64,7 @@ impl POSIXMemMap {
     /// POSIX syscalls are interruptible by signals and may fail w/ `EINTR`, `EBUSY`, or `EAGAIN`. In such cases,
     /// no progress is guaranteed, so the syscall must be retried.
     pub(super) fn sync(&self, length: usize) -> FrozenResult<()> {
-        msync_raw(self.0, length)
+        msync_raw(self.ptr, length)
     }
 
     /// Get a mutable (read/write) typed pointer to `T` at given `offset`
@@ -64,7 +83,7 @@ impl POSIXMemMap {
     where
         T: Sized,
     {
-        unsafe { self.0.add(offset) as *mut T }
+        unsafe { self.ptr.add(offset) as *mut T }
     }
 
     /// Get an immutable (read only) typed pointer to `T` at given `offset`
@@ -83,7 +102,7 @@ impl POSIXMemMap {
     where
         T: Sized,
     {
-        unsafe { self.0.add(offset) as *const T }
+        unsafe { self.ptr.add(offset) as *const T }
     }
 }
 
@@ -543,6 +562,72 @@ mod tests {
                 assert_eq!(*ptr, VAL);
 
                 mmap.unmap(LENGTH).unwrap();
+            }
+        }
+    }
+
+    mod map_drop {
+        use super::*;
+
+        #[test]
+        fn ok_drop_tracks_length() {
+            let (_dir, file) = new_tmp();
+            let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
+            assert_eq!(mmap.length(), LENGTH);
+        }
+
+        #[test]
+        fn ok_drop_persists_written_data() {
+            const VAL: u64 = 0xCAFEBABE_DEADBEEF;
+            let (_dir, file) = new_tmp();
+
+            unsafe {
+                {
+                    let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
+                    let wptr = mmap.as_mut_ptr::<u64>(0);
+                    *wptr = VAL;
+                    mmap.sync(LENGTH).unwrap();
+                    // mmap goes out of scope and is dropped here without calling unmap
+                }
+
+                // Re-open and verify data persisted across drop
+                let mmap2 = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
+                let rptr = mmap2.as_ptr::<u64>(0);
+                assert_eq!(*rptr, VAL);
+                mmap2.unmap(LENGTH).unwrap();
+            }
+        }
+
+        #[test]
+        #[cfg(target_os = "linux")]
+        fn ok_drop_unmaps_from_proc_maps() {
+            let (_dir, file) = new_tmp();
+            let addr: usize;
+
+            unsafe {
+                let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
+                addr = mmap.as_ptr::<u8>(0) as usize;
+
+                let is_mapped = || {
+                    let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+                    maps.lines().any(|line| {
+                        if let Some((start_s, end_s)) =
+                            line.split_whitespace().next().and_then(|r| r.split_once('-'))
+                        {
+                            if let (Ok(start), Ok(end)) = (
+                                usize::from_str_radix(start_s, 16),
+                                usize::from_str_radix(end_s, 16),
+                            ) {
+                                return addr >= start && addr < end;
+                            }
+                        }
+                        false
+                    })
+                };
+
+                assert!(is_mapped(), "address must be mapped before drop");
+                drop(mmap);
+                assert!(!is_mapped(), "address must not be mapped after drop");
             }
         }
     }
