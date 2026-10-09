@@ -59,6 +59,9 @@ memmap = [
     "error",
     "libc",
     "file",
+    "ack",
+    "hints",
+    "windows-sys",
 ]
 default = [
     "ack",
