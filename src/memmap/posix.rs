@@ -200,3 +200,282 @@ fn last_errno() -> i32 {
 fn err_msg(errno: i32) -> String {
     std::io::Error::from_raw_os_error(errno).to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::file::{File, FileCfg};
+
+    const MOD_ID: u8 = 0;
+    const BUFFER_SIZE: usize = 0x10;
+    const INIT_BUFFERS: usize = 0x0A;
+    const LENGTH: usize = BUFFER_SIZE * INIT_BUFFERS;
+
+    fn new_tmp() -> (tempfile::TempDir, File) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tmp_map");
+
+        let file = File::new(FileCfg {
+            path,
+            module_id: MOD_ID,
+            buffer_size: BUFFER_SIZE,
+            initial_available_buffers: INIT_BUFFERS,
+            sync_interval: None,
+        })
+        .expect("new FF");
+
+        (dir, file)
+    }
+
+    mod utils {
+        use super::*;
+
+        #[test]
+        fn ok_last_errno() {
+            unsafe {
+                let _ = libc::close(-1);
+                assert_eq!(last_errno(), libc::EBADF);
+            }
+        }
+
+        #[test]
+        fn ok_err_msg() {
+            unsafe {
+                let msg = err_msg(libc::ENOENT);
+                assert!(!msg.is_empty(), "ENOENT must produce message");
+            }
+        }
+    }
+
+    mod map_unmap {
+        use super::*;
+
+        #[test]
+        fn ok_map_unmap_cycle() {
+            let (_dir, file) = new_tmp();
+
+            unsafe {
+                let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
+                mmap.unmap(LENGTH).unwrap();
+            }
+        }
+
+        #[test]
+        fn ok_map_zero_bytes_on_new() {
+            let (_dir, file) = new_tmp();
+            const BUF: [u8; LENGTH] = [0; LENGTH];
+
+            unsafe {
+                let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
+
+                let ptr = mmap.as_ptr::<[u8; LENGTH]>(0);
+                assert_eq!(*ptr, BUF);
+
+                mmap.unmap(LENGTH).unwrap();
+            }
+        }
+
+        #[test]
+        fn err_map_on_invalid_length() {
+            let (_dir, file) = new_tmp();
+            unsafe { assert!(POSIXMemMap::new(file.fd(), 0).is_err()) };
+        }
+
+        #[test]
+        fn err_map_on_invalid_fd() {
+            let (_dir, _) = new_tmp();
+            unsafe { assert!(POSIXMemMap::new(-1, LENGTH).is_err()) };
+        }
+
+        #[test]
+        fn err_unmap_on_invalid_length() {
+            let (_dir, file) = new_tmp();
+
+            unsafe {
+                let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
+                assert!(mmap.unmap(0).is_err());
+            }
+        }
+    }
+
+    mod map_sync {
+        use super::*;
+
+        #[test]
+        fn ok_sync() {
+            let (_dir, file) = new_tmp();
+
+            unsafe {
+                let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
+                mmap.sync(LENGTH).unwrap();
+                mmap.unmap(LENGTH).unwrap();
+            }
+        }
+
+        #[test]
+        fn ok_sync_after_sync() {
+            let (_dir, file) = new_tmp();
+
+            unsafe {
+                let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
+
+                mmap.sync(LENGTH).unwrap();
+                mmap.sync(LENGTH).unwrap();
+                mmap.sync(LENGTH).unwrap();
+                mmap.sync(LENGTH).unwrap();
+
+                mmap.unmap(LENGTH).unwrap();
+            }
+        }
+    }
+
+    mod map_write_read {
+        use super::*;
+
+        #[test]
+        fn ok_write_read_cycle() {
+            const VAL: u64 = 0xDEADC0DE;
+            let (_dir, file) = new_tmp();
+
+            unsafe {
+                let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
+
+                // write
+                let wptr = mmap.as_mut_ptr::<u64>(0);
+                *wptr = VAL;
+
+                // read
+                let rptr = mmap.as_ptr::<u64>(0);
+                assert_eq!(*rptr, VAL);
+
+                mmap.unmap(LENGTH).unwrap();
+            }
+        }
+
+        #[test]
+        fn ok_write_read_with_offset() {
+            const VAL: u64 = 0xDEADC0DE;
+            let (_dir, file) = new_tmp();
+
+            unsafe {
+                let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
+
+                // write
+                let wptr = mmap.as_mut_ptr::<u64>(8);
+                *wptr = VAL;
+
+                // read
+                let rptr = mmap.as_ptr::<u64>(8);
+                assert_eq!(*rptr, VAL);
+
+                mmap.unmap(LENGTH).unwrap();
+            }
+        }
+
+        #[test]
+        fn ok_write_read_sync_cycle() {
+            const VAL: [u32; 0x0A] = [0xDEADC0DE; 0x0A];
+            let (_dir, file) = new_tmp();
+
+            unsafe {
+                let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
+
+                // write
+                let wptr = mmap.as_mut_ptr::<[u32; 0x0A]>(0);
+                *wptr = VAL;
+
+                // sync
+                mmap.sync(LENGTH).unwrap();
+
+                // read
+                let rptr = mmap.as_ptr::<[u32; 0x0A]>(0);
+                assert_eq!(*rptr, VAL);
+
+                mmap.unmap(LENGTH).unwrap();
+            }
+        }
+
+        #[test]
+        fn ok_read_zero_bytes() {
+            let (_dir, file) = new_tmp();
+
+            unsafe {
+                let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
+
+                let rptr = mmap.as_ptr::<u64>(0);
+                assert_eq!(*rptr, 0);
+
+                mmap.unmap(LENGTH).unwrap();
+            }
+        }
+    }
+
+    mod map_durability {
+        use super::*;
+
+        #[test]
+        fn ok_map_durability_after_unmap() {
+            const VAL: u64 = 0xCAFEBABEDEADC0DE;
+            let (_dir, file) = new_tmp();
+
+            // create + map + write + sync
+            unsafe {
+                let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
+
+                let ptr = mmap.as_mut_ptr::<u64>(0);
+                *ptr = VAL;
+
+                mmap.sync(LENGTH).unwrap();
+                mmap.unmap(LENGTH).unwrap();
+            }
+
+            // open + map + read
+            unsafe {
+                let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
+
+                let ptr = mmap.as_ptr::<u64>(0);
+                assert_eq!(*ptr, VAL);
+
+                mmap.unmap(LENGTH).unwrap();
+            }
+        }
+
+        #[test]
+        fn ok_map_durability_after_unmap_and_close() {
+            const VAL: u64 = 0xDEADC0DEDEADC0DE;
+            let (dir, file) = new_tmp();
+
+            // create + map + write + sync + unmap
+            unsafe {
+                let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
+
+                let ptr = mmap.as_mut_ptr::<u64>(0);
+                *ptr = VAL;
+
+                mmap.sync(LENGTH).unwrap();
+                mmap.unmap(LENGTH).unwrap();
+                drop(file);
+            }
+
+            // open + map + read
+            unsafe {
+                let path = dir.path().join("tmp_map");
+                let cfg = FileCfg {
+                    path,
+                    module_id: MOD_ID,
+                    buffer_size: BUFFER_SIZE,
+                    initial_available_buffers: INIT_BUFFERS,
+                    sync_interval: None,
+                };
+
+                let file = File::open(cfg).expect("open FF");
+                let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
+
+                let ptr = mmap.as_ptr::<u64>(0);
+                assert_eq!(*ptr, VAL);
+
+                mmap.unmap(LENGTH).unwrap();
+            }
+        }
+    }
+}
