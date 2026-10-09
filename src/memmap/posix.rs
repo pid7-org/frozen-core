@@ -15,7 +15,10 @@ type TPtr = *mut u8;
 /// Max allowed retries for `EINTR`, `EBUSY` and `EAGAIN` errors
 const MAX_RETRIES: usize = 0x0A;
 
-/// Custom impl of `mmap(2)` for POSIX systems
+/// Custom implementation of memory-mapped memory via `mmap(2)` for POSIX systems
+///
+/// Wraps an allocated virtual memory mapping, managing its lifetime via RAII.
+/// Automatic cleanup is provided via [`Drop`] unless explicitly consumed with [`POSIXMemMap::unmap`].
 #[derive(Debug)]
 pub(super) struct POSIXMemMap {
     ptr: TPtr,
@@ -23,6 +26,7 @@ pub(super) struct POSIXMemMap {
 }
 
 impl Drop for POSIXMemMap {
+    /// Automatically releases mapped memory via `munmap(2)` when going out of scope if not explicitly unmapped
     fn drop(&mut self) {
         if !self.ptr.is_null() && self.length > 0 {
             let _ = munmap_raw(self.ptr, self.length);
@@ -33,13 +37,18 @@ impl Drop for POSIXMemMap {
 }
 
 impl POSIXMemMap {
-    /// Create a new [`POSIXMemMap`] w/ given `fd` and `length`
+    /// Create a new [`POSIXMemMap`] by mapping `length` bytes of the file represented by `fd`
+    ///
+    /// Maps memory from offset 0 with `PROT_READ | PROT_WRITE` and `MAP_SHARED`.
     pub(super) fn new(fd: i32, length: size_t) -> FrozenResult<Self> {
         let ptr = mmap_raw(fd, length)?;
         Ok(Self { ptr, length })
     }
 
-    /// Unmap [`POSIXMemMap`] to release mapped memory resources
+    /// Unmap [`POSIXMemMap`] to explicitly release mapped memory resources
+    ///
+    /// Consumes `self` to prevent use-after-free or double-unmapping at compile time.
+    /// Clears internal state so subsequent [`Drop`] execution becomes a safe no-op.
     pub(super) fn unmap(mut self) -> FrozenResult<()> {
         if !self.ptr.is_null() && self.length > 0 {
             let res = munmap_raw(self.ptr, self.length);
@@ -57,12 +66,12 @@ impl POSIXMemMap {
         self.length
     }
 
-    /// Syncs in cache data updates on the storage device
+    /// Syncs in-cache data updates on the storage device
     ///
     /// ## Durability
     ///
     /// In POSIX systems `msync(MS_SYNC)` does not provide crash-safe durability; this syscall is used as a best-effort
-    /// operation to explicitly push dirty mmapped pages into fs writeback.
+    /// operation to explicitly push dirty mmapped pages into filesystem writeback.
     ///
     /// For strong durability, use of [`File::sync`](crate::file::File::sync) is required right after calling [`POSIXMemMap::sync`].
     ///
@@ -117,10 +126,10 @@ impl POSIXMemMap {
 ///
 /// ## Caveats of `mmap(2)` on POSIX
 ///
-/// In POSIX systems, when calling `mmap(2)`, the provided offset must be multiple of page size,
-/// i.e. `sysconf(_SC_PAGESIZE)`, otherwise an `EINVAL` error is returned
+/// In POSIX systems, when calling `mmap(2)`, the provided offset must be a multiple of page size,
+/// i.e. `sysconf(_SC_PAGESIZE)`, otherwise an `EINVAL` error is returned.
 ///
-/// For our usecase, we always map the entire file, hence this is never an issue for us
+/// For our use case, we always map the entire file from offset 0, hence this is never an issue for us.
 fn mmap_raw(fd: i32, length: size_t) -> FrozenResult<TPtr> {
     let mut retries = 0; // only for transient errors (EINTR, EBUSY, EAGAIN)
     loop {
@@ -177,13 +186,13 @@ fn munmap_raw(ptr: TPtr, length: size_t) -> FrozenResult<()> {
     }
 }
 
-/// Syncs in cache data updates on the storage device
+/// Syncs in-cache data updates on the storage device
 ///
 /// ## Caveats of `msync(2)` on POSIX
 ///
-/// This syscall by itself does not provide any durability guarantee, it's used as best-effort operation
-/// to explicitly push dirty mmapped pages into fs writeback, to aid hard sync calls like `fdatasync` on Linux
-/// and `fcntl(F_FULLFSYNC)` on macOS
+/// This syscall by itself does not provide any durability guarantee; it is used as a best-effort operation
+/// to explicitly push dirty mmapped pages into filesystem writeback, to aid hard sync calls like `fdatasync` on Linux
+/// and `fcntl(F_FULLFSYNC)` on macOS.
 fn msync_raw(ptr: TPtr, length: size_t) -> FrozenResult<()> {
     let mut retries = 0; // only for transient errors (EINTR, EBUSY, EAGAIN)
     loop {
@@ -222,6 +231,7 @@ fn msync_raw(ptr: TPtr, length: size_t) -> FrozenResult<()> {
     }
 }
 
+/// Fetch the last thread-local `errno` value for the current target OS
 #[inline]
 fn last_errno() -> i32 {
     #[cfg(target_os = "linux")]
@@ -235,6 +245,7 @@ fn last_errno() -> i32 {
     }
 }
 
+/// Convert a raw OS error code into a formatted human-readable error description
 #[inline]
 fn err_msg(errno: i32) -> String {
     std::io::Error::from_raw_os_error(errno).to_string()
