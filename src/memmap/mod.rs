@@ -1,12 +1,13 @@
 //! NA
 
+#![allow(unused)]
+
 use crate::error::{ErrCode, FrozenError, FrozenResult};
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod posix;
 
 /// Error codes for [`MemMap`] module
-#[allow(unused)]
 pub(in crate::memmap) mod err {
     use super::{ErrCode, FrozenError, FrozenResult};
 
