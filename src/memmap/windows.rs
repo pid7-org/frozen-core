@@ -559,7 +559,7 @@ mod tests {
         #[test]
         fn ok_last_error() {
             unsafe {
-                let _ = CloseHandle(INVALID_HANDLE_VALUE);
+                windows_sys::Win32::Foundation::SetLastError(ERROR_INVALID_HANDLE);
                 assert_eq!(last_error(), ERROR_INVALID_HANDLE);
             }
         }
