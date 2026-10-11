@@ -610,7 +610,7 @@ mod tests {
 
                 // Read page 1 to trigger page fault
                 let p1 = mmap.as_ptr::<u8>(page_size);
-                let _val = *p1;
+                let _val = ptr::read_volatile(p1);
 
                 let active = mmap.active_page_indices().unwrap();
                 assert!(active.contains(&1), "reading page 1 must bring it into memory");
