@@ -351,6 +351,10 @@ fn munmap_raw(ptr: TPtr, length: size_t) -> FrozenResult<()> {
 /// push dirty mmapped pages into filesystem writeback, to aid hard sync calls like `fdatasync` on Linux and
 /// `fcntl(F_FULLFSYNC)` on macOS
 fn msync_raw(ptr: TPtr, length: size_t) -> FrozenResult<()> {
+    if hints::unlikely(length == 0) {
+        return Ok(());
+    }
+
     let mut retries = 0; // only for transient errors (EINTR, EBUSY, EAGAIN)
     loop {
         let res = unsafe { msync(ptr as *mut c_void, length, MS_SYNC) };
@@ -390,6 +394,10 @@ fn msync_raw(ptr: TPtr, length: size_t) -> FrozenResult<()> {
 
 /// Advises the kernel to discard/evict mapped pages w/ `madvise(MADV_DONTNEED)`
 fn madvise_raw(ptr: *mut c_void, length: size_t) -> FrozenResult<()> {
+    if hints::unlikely(ptr.is_null()) {
+        return raw_error(err::NMM, "cannot advise unmapped null pointer");
+    }
+
     let mut retries = 0;
     loop {
         let res = unsafe { madvise(ptr, length, MADV_DONTNEED) };
