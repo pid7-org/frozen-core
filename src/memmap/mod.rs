@@ -7,6 +7,15 @@ use crate::error::{ErrCode, FrozenError, FrozenResult};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod posix;
 
+#[cfg(target_os = "windows")]
+mod windows;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(in crate::memmap) type PlatformMemMap = posix::POSIXMemMap;
+
+#[cfg(target_os = "windows")]
+pub(in crate::memmap) type PlatformMemMap = windows::WINMemMap;
+
 /// Error codes for [`MemMap`] module
 pub(in crate::memmap) mod err {
     use super::{ErrCode, FrozenError, FrozenResult};
