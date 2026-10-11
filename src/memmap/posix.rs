@@ -5,8 +5,8 @@ use crate::{error::FrozenResult, hints};
 use core::ptr;
 use libc::{
     _SC_PAGESIZE, EACCES, EAGAIN, EBADF, EBUSY, EINTR, EINVAL, EIO, ENODEV, ENOMEM, EOVERFLOW,
-    EPERM, ETXTBSY, MAP_FAILED, MAP_SHARED, MS_SYNC, PROT_READ, PROT_WRITE, c_void, mmap, msync,
-    munmap, off_t, size_t, sysconf,
+    EPERM, ETXTBSY, MAP_FAILED, MAP_SHARED, MS_SYNC, PROT_READ, PROT_WRITE, c_void, mincore, mmap,
+    msync, munmap, off_t, size_t, sysconf,
 };
 
 /// Base pointer for `mmap(2)` mapped memory
@@ -94,6 +94,60 @@ impl POSIXMemMap {
         }
 
         Ok(page_size)
+    }
+
+    /// Returns the indices of memory-mapped pages that are currently resident in physical memory (RAM)
+    ///
+    /// ## Residency semantics
+    ///
+    /// Under POSIX systems (Linux and macOS), this queries `mincore(2)` to inspect the
+    /// resident set status of each page in the mapped range. A page index `i` is included if
+    /// the corresponding page is present in physical memory.
+    ///
+    /// The returned list of indices can also be used by callers to compute the total active
+    /// resident page count via `indices.len()`.
+    ///
+    /// ## Why do we retry?
+    ///
+    /// POSIX syscalls are interruptible by signals and may fail w/ `EINTR`, `EBUSY`, or `EAGAIN`. In such cases,
+    /// no progress is guaranteed, so the syscall must be retried
+    pub(super) fn active_page_indices(&self) -> FrozenResult<Vec<usize>> {
+        if hints::unlikely(self.ptr.is_null() || self.length == 0) {
+            return Ok(Vec::new());
+        }
+
+        let page_size = Self::page_size()?;
+        let num_pages = self.length.div_ceil(page_size);
+        let mut vec = vec![0u8; num_pages];
+
+        let mut retries = 0;
+        loop {
+            let res = unsafe { mincore(self.ptr as _, self.length, vec.as_mut_ptr() as *mut _) };
+
+            if hints::likely(res == 0) {
+                let indices = vec
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, &b)| if (b & 1) != 0 { Some(idx) } else { None })
+                    .collect();
+                return Ok(indices);
+            }
+
+            let errno = last_errno();
+            let err_msg = err_msg(errno);
+
+            match errno {
+                EINTR | EBUSY | EAGAIN => {
+                    if retries < MAX_RETRIES {
+                        retries += 1;
+                        continue;
+                    }
+                    return raw_error(err::UNK, err_msg);
+                }
+                EINVAL | ENOMEM => return raw_error(err::HCF, err_msg),
+                _ => return raw_error(err::UNK, err_msg),
+            }
+        }
     }
 
     /// Syncs in-cache data updates on the storage device
@@ -373,6 +427,104 @@ mod tests {
             }
             for handle in handles {
                 handle.join().unwrap();
+            }
+        }
+    }
+
+    mod active_pages {
+        use super::*;
+
+        fn new_paged_tmp(num_pages: usize) -> (tempfile::TempDir, File, usize) {
+            let page_size = POSIXMemMap::page_size().expect("page_size");
+            let total_len = page_size * num_pages;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("tmp_paged_map");
+
+            let file = File::new(FileCfg {
+                path,
+                module_id: MOD_ID,
+                buffer_size: BUFFER_SIZE,
+                initial_available_buffers: total_len / BUFFER_SIZE,
+                sync_interval: None,
+            })
+            .expect("new paged file");
+
+            (dir, file, total_len)
+        }
+
+        #[test]
+        fn ok_active_pages_after_touch() {
+            let (_dir, file, total_len) = new_paged_tmp(4);
+            let page_size = POSIXMemMap::page_size().unwrap();
+
+            unsafe {
+                let mmap = POSIXMemMap::new(file.fd(), total_len).unwrap();
+
+                // Touch page 0 and page 2
+                let p0 = mmap.as_mut_ptr::<u8>(0);
+                *p0 = 0xAA;
+                let p2 = mmap.as_mut_ptr::<u8>(page_size * 2);
+                *p2 = 0xBB;
+
+                let active = mmap.active_page_indices().unwrap();
+                assert!(active.contains(&0), "page 0 must be active after write");
+                assert!(active.contains(&2), "page 2 must be active after write");
+                for &idx in &active {
+                    assert!(idx < 4, "active page index must be within mapping range");
+                }
+
+                mmap.unmap().unwrap();
+            }
+        }
+
+        #[test]
+        fn ok_active_pages_all_touched() {
+            let (_dir, file, total_len) = new_paged_tmp(3);
+            let page_size = POSIXMemMap::page_size().unwrap();
+
+            unsafe {
+                let mmap = POSIXMemMap::new(file.fd(), total_len).unwrap();
+
+                for i in 0..3 {
+                    let ptr = mmap.as_mut_ptr::<u8>(i * page_size);
+                    *ptr = (i + 1) as u8;
+                }
+
+                let active = mmap.active_page_indices().unwrap();
+                assert_eq!(active, vec![0, 1, 2]);
+
+                mmap.unmap().unwrap();
+            }
+        }
+
+        #[test]
+        fn ok_active_pages_read_faults_page() {
+            let (_dir, file, total_len) = new_paged_tmp(2);
+            let page_size = POSIXMemMap::page_size().unwrap();
+
+            unsafe {
+                let mmap = POSIXMemMap::new(file.fd(), total_len).unwrap();
+
+                // Read page 1 to trigger page fault
+                let p1 = mmap.as_ptr::<u8>(page_size);
+                let _val = *p1;
+
+                let active = mmap.active_page_indices().unwrap();
+                assert!(active.contains(&1), "reading page 1 must bring it into memory");
+
+                mmap.unmap().unwrap();
+            }
+        }
+
+        #[test]
+        fn ok_active_pages_consecutive_consistency() {
+            let (_dir, file, total_len) = new_paged_tmp(2);
+            unsafe {
+                let mmap = POSIXMemMap::new(file.fd(), total_len).unwrap();
+                let first = mmap.active_page_indices().unwrap();
+                let second = mmap.active_page_indices().unwrap();
+                assert_eq!(first, second);
+                mmap.unmap().unwrap();
             }
         }
     }
