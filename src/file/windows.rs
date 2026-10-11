@@ -1625,13 +1625,13 @@ mod tests {
             let file = WINFile::create(&path).unwrap();
             file.close().unwrap();
 
-            assert_eq!(WINFile::exists(&path).unwrap(), true);
+            assert!(WINFile::exists(&path).unwrap());
         }
 
         #[test]
         fn ok_exists_false_for_missing_file() {
             let (_dir, path) = tmp_path();
-            assert_eq!(WINFile::exists(&path).unwrap(), false);
+            assert!(!WINFile::exists(&path).unwrap());
         }
     }
 
