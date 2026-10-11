@@ -5,8 +5,8 @@ use crate::{error::FrozenResult, hints};
 use core::ptr;
 use libc::{
     _SC_PAGESIZE, EACCES, EAGAIN, EBADF, EBUSY, EINTR, EINVAL, EIO, ENODEV, ENOMEM, EOVERFLOW,
-    EPERM, ETXTBSY, MAP_FAILED, MAP_SHARED, MS_SYNC, PROT_READ, PROT_WRITE, c_void, mincore, mmap,
-    msync, munmap, off_t, size_t, sysconf,
+    EPERM, ETXTBSY, MADV_DONTNEED, MAP_FAILED, MAP_SHARED, MS_SYNC, PROT_READ, PROT_WRITE, c_void,
+    madvise, mincore, mmap, msync, munmap, off_t, size_t, sysconf,
 };
 
 /// Base pointer for `mmap(2)` mapped memory
@@ -100,12 +100,13 @@ impl POSIXMemMap {
     ///
     /// ## Residency semantics
     ///
-    /// Under POSIX systems (Linux and macOS), this queries `mincore(2)` to inspect the
-    /// resident set status of each page in the mapped range. A page index `i` is included if
-    /// the corresponding page is present in physical memory.
+    /// Under POSIX systems (Linux and macOS), this queries `mincore(2)` to inspect the resident set status of
+    /// each page in the mapped range
     ///
-    /// The returned list of indices can also be used by callers to compute the total active
-    /// resident page count via `indices.len()`.
+    /// A page index `i` is included if the corresponding page is present in physical memory
+    ///
+    /// The returned list of indices can also be used by callers to compute the total active resident page count
+    /// via `indices.len()`
     ///
     /// ## Why do we retry?
     ///
@@ -118,9 +119,10 @@ impl POSIXMemMap {
 
         let page_size = Self::page_size()?;
         let num_pages = self.length.div_ceil(page_size);
-        let mut vec = vec![0u8; num_pages];
 
+        let mut vec = vec![0u8; num_pages];
         let mut retries = 0;
+
         loop {
             let res = unsafe { mincore(self.ptr as _, self.length, vec.as_mut_ptr() as *mut _) };
 
@@ -130,6 +132,7 @@ impl POSIXMemMap {
                     .enumerate()
                     .filter_map(|(idx, &b)| if (b & 1) != 0 { Some(idx) } else { None })
                     .collect();
+
                 return Ok(indices);
             }
 
@@ -142,12 +145,78 @@ impl POSIXMemMap {
                         retries += 1;
                         continue;
                     }
+
                     return raw_error(err::UNK, err_msg);
                 }
                 EINVAL | ENOMEM => return raw_error(err::HCF, err_msg),
                 _ => return raw_error(err::UNK, err_msg),
             }
         }
+    }
+
+    /// Evicts selected memory pages from physical memory via `madvise(MADV_DONTNEED)`
+    ///
+    /// ## Eviction semantics
+    ///
+    /// Under POSIX systems (Linux and macOS), this advises the kernel with `MADV_DONTNEED` for the specified page
+    /// indices, releasing process page table entries and freeing physical memory associated with the mapping
+    ///
+    /// Contiguous page indices are automatically coalesced into single `madvise(2)` calls to minimize system call
+    /// overhead
+    ///
+    /// Duplicate page indices are deduplicated
+    ///
+    /// If `indices` is empty, this operation is a safe no-op
+    ///
+    /// ## Durability notice
+    ///
+    /// If pages contain modified (`MAP_SHARED`) data that has not been synced, call [`POSIXMemMap::sync`] before
+    /// evicting to avoid discarding unwritten changes
+    pub(super) fn evict_pages(&self, indices: &[usize]) -> FrozenResult<()> {
+        if hints::unlikely(indices.is_empty()) {
+            return Ok(());
+        }
+
+        if hints::unlikely(self.ptr.is_null() || self.length == 0) {
+            return raw_error(err::HCF, "cannot evict pages on unmapped or zero-length mapping");
+        }
+
+        let page_size = Self::page_size()?;
+        let num_pages = self.length.div_ceil(page_size);
+
+        let mut sorted_indices = indices.to_vec();
+        sorted_indices.sort_unstable();
+        sorted_indices.dedup();
+
+        for &idx in &sorted_indices {
+            if hints::unlikely(idx >= num_pages) {
+                return raw_error(
+                    err::HCF,
+                    format!("page index {idx} out of bounds for mapping of {num_pages} pages"),
+                );
+            }
+        }
+
+        let mut i = 0;
+        while i < sorted_indices.len() {
+            let start_idx = sorted_indices[i];
+            let mut end_idx = start_idx;
+
+            while i + 1 < sorted_indices.len() && sorted_indices[i + 1] == end_idx + 1 {
+                i += 1;
+                end_idx = sorted_indices[i];
+            }
+
+            let run_count = end_idx - start_idx + 1;
+            let offset = start_idx * page_size;
+            let len = (self.length - offset).min(run_count * page_size);
+            let target_ptr = unsafe { self.ptr.add(offset) as *mut c_void };
+
+            madvise_raw(target_ptr, len)?;
+            i += 1;
+        }
+
+        Ok(())
     }
 
     /// Syncs in-cache data updates on the storage device
@@ -162,8 +231,9 @@ impl POSIXMemMap {
     ///
     /// ## Why do we retry?
     ///
-    /// POSIX syscalls are interruptible by signals and may fail w/ `EINTR`, `EBUSY`, or `EAGAIN`. In such cases,
-    /// no progress is guaranteed, so the syscall must be retried
+    /// POSIX syscalls are interruptible by signals and may fail w/ `EINTR`, `EBUSY`, or `EAGAIN`
+    ///
+    /// In such cases, no progress is guaranteed, so the syscall must be retried
     pub(super) fn sync(&self, length: usize) -> FrozenResult<()> {
         msync_raw(self.ptr, length)
     }
@@ -174,11 +244,10 @@ impl POSIXMemMap {
     ///
     /// # Safety
     ///
-    /// - The caller must ensure that `offset + std::mem::size_of::<T>() <= length` where `length` is the mapped
-    ///   region size
+    /// - The caller must ensure that `offset + std::mem::size_of::<T>() <= length` where `length` is the mapped region
+    ///   size
     /// - The pointer `base + offset` must be properly aligned for `T`
-    /// - The caller must uphold Rust's aliasing rules (no concurrent unsynchronized reads or writes to overlapping
-    ///   bytes)
+    /// - The caller must uphold Rust's aliasing rules (no concurrent unsynchronized reads or writes to overlapping bytes)
     /// - The memory mapping must not have been unmapped via [`POSIXMemMap::unmap`]
     #[inline]
     #[allow(unsafe_op_in_unsafe_fn)]
@@ -278,9 +347,9 @@ fn munmap_raw(ptr: TPtr, length: size_t) -> FrozenResult<()> {
 ///
 /// ## Caveats of `msync(2)` on POSIX
 ///
-/// This syscall by itself does not provide any durability guarantee; it is used as a best-effort operation
-/// to explicitly push dirty mmapped pages into filesystem writeback, to aid hard sync calls like `fdatasync` on Linux
-/// and `fcntl(F_FULLFSYNC)` on macOS
+/// This syscall by itself does not provide any durability guarantee; it is used as a best-effort operation to explicitly
+/// push dirty mmapped pages into filesystem writeback, to aid hard sync calls like `fdatasync` on Linux and
+/// `fcntl(F_FULLFSYNC)` on macOS
 fn msync_raw(ptr: TPtr, length: size_t) -> FrozenResult<()> {
     let mut retries = 0; // only for transient errors (EINTR, EBUSY, EAGAIN)
     loop {
@@ -312,6 +381,40 @@ fn msync_raw(ptr: TPtr, length: size_t) -> FrozenResult<()> {
             EINVAL => return raw_error(err::HCF, err_msg),
 
             // no-more memory available
+            ENOMEM => return raw_error(err::NMM, err_msg),
+
+            _ => return raw_error(err::UNK, err_msg),
+        }
+    }
+}
+
+/// Advises the kernel to discard/evict mapped pages w/ `madvise(MADV_DONTNEED)`
+fn madvise_raw(ptr: *mut c_void, length: size_t) -> FrozenResult<()> {
+    let mut retries = 0;
+    loop {
+        let res = unsafe { madvise(ptr, length, MADV_DONTNEED) };
+        if hints::likely(res == 0) {
+            return Ok(());
+        }
+
+        let errno = last_errno();
+        let err_msg = err_msg(errno);
+
+        match errno {
+            // Transient busy or interrupted errors
+            EINTR | EBUSY | EAGAIN => {
+                if retries < MAX_RETRIES {
+                    retries += 1;
+                    continue;
+                }
+
+                return raw_error(err::UNK, err_msg);
+            }
+
+            // Invalid address range, unaligned pointer, or invalid flags
+            EINVAL => return raw_error(err::HCF, err_msg),
+
+            // Address range is not mapped
             ENOMEM => return raw_error(err::NMM, err_msg),
 
             _ => return raw_error(err::UNK, err_msg),
@@ -524,6 +627,145 @@ mod tests {
                 let first = mmap.active_page_indices().unwrap();
                 let second = mmap.active_page_indices().unwrap();
                 assert_eq!(first, second);
+                mmap.unmap().unwrap();
+            }
+        }
+    }
+
+    mod eviction {
+        use super::*;
+
+        fn new_paged_tmp(num_pages: usize) -> (tempfile::TempDir, File, usize) {
+            let page_size = POSIXMemMap::page_size().expect("page_size");
+            let total_len = page_size * num_pages;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("tmp_evict_map");
+
+            let file = File::new(FileCfg {
+                path,
+                module_id: MOD_ID,
+                buffer_size: BUFFER_SIZE,
+                initial_available_buffers: total_len / BUFFER_SIZE,
+                sync_interval: None,
+            })
+            .expect("new paged file");
+
+            (dir, file, total_len)
+        }
+
+        #[test]
+        fn ok_evict_empty_indices() {
+            let (_dir, file, total_len) = new_paged_tmp(2);
+            unsafe {
+                let mmap = POSIXMemMap::new(file.fd(), total_len).unwrap();
+                assert!(mmap.evict_pages(&[]).is_ok());
+                mmap.unmap().unwrap();
+            }
+        }
+
+        #[test]
+        fn ok_evict_single_page() {
+            let (_dir, file, total_len) = new_paged_tmp(2);
+            unsafe {
+                let mmap = POSIXMemMap::new(file.fd(), total_len).unwrap();
+                let p0 = mmap.as_mut_ptr::<u8>(0);
+                *p0 = 0xAA;
+                mmap.sync(total_len).unwrap();
+
+                assert!(mmap.evict_pages(&[0]).is_ok());
+                mmap.unmap().unwrap();
+            }
+        }
+
+        #[test]
+        fn ok_evict_contiguous_runs() {
+            let (_dir, file, total_len) = new_paged_tmp(4);
+            let page_size = POSIXMemMap::page_size().unwrap();
+
+            unsafe {
+                let mmap = POSIXMemMap::new(file.fd(), total_len).unwrap();
+                for i in 0..4 {
+                    let ptr = mmap.as_mut_ptr::<u8>(i * page_size);
+                    *ptr = (i + 1) as u8;
+                }
+                mmap.sync(total_len).unwrap();
+
+                // Evict contiguous run [0, 1]
+                assert!(mmap.evict_pages(&[0, 1]).is_ok());
+                // Evict remaining contiguous run [2, 3]
+                assert!(mmap.evict_pages(&[2, 3]).is_ok());
+
+                mmap.unmap().unwrap();
+            }
+        }
+
+        #[test]
+        fn ok_evict_unsorted_and_duplicate_indices() {
+            let (_dir, file, total_len) = new_paged_tmp(3);
+            let page_size = POSIXMemMap::page_size().unwrap();
+
+            unsafe {
+                let mmap = POSIXMemMap::new(file.fd(), total_len).unwrap();
+                for i in 0..3 {
+                    let ptr = mmap.as_mut_ptr::<u8>(i * page_size);
+                    *ptr = 0xFF;
+                }
+                mmap.sync(total_len).unwrap();
+
+                // Duplicates and unsorted order
+                assert!(mmap.evict_pages(&[2, 0, 2, 1, 0]).is_ok());
+                mmap.unmap().unwrap();
+            }
+        }
+
+        #[test]
+        fn ok_evict_all_using_active_page_indices() {
+            let (_dir, file, total_len) = new_paged_tmp(3);
+            let page_size = POSIXMemMap::page_size().unwrap();
+
+            unsafe {
+                let mmap = POSIXMemMap::new(file.fd(), total_len).unwrap();
+                for i in 0..3 {
+                    let ptr = mmap.as_mut_ptr::<u8>(i * page_size);
+                    *ptr = 0x55;
+                }
+                mmap.sync(total_len).unwrap();
+
+                let active = mmap.active_page_indices().unwrap();
+                assert!(mmap.evict_pages(&active).is_ok());
+
+                mmap.unmap().unwrap();
+            }
+        }
+
+        #[test]
+        fn err_evict_out_of_bounds() {
+            let (_dir, file, total_len) = new_paged_tmp(2);
+            unsafe {
+                let mmap = POSIXMemMap::new(file.fd(), total_len).unwrap();
+                let err = mmap.evict_pages(&[2]).unwrap_err();
+                assert_eq!(err.reason, err::HCF.reason);
+
+                let err_large = mmap.evict_pages(&[100]).unwrap_err();
+                assert_eq!(err_large.reason, err::HCF.reason);
+
+                mmap.unmap().unwrap();
+            }
+        }
+
+        #[test]
+        fn err_evict_unmapped_and_unaligned_ptr() {
+            // Unmapped memory returns ENOMEM -> NMM
+            let err_unmapped = madvise_raw(ptr::null_mut(), BUFFER_SIZE).unwrap_err();
+            assert_eq!(err_unmapped.reason, err::NMM.reason);
+
+            // Unaligned pointer returns EINVAL -> HCF
+            let (_dir, file, total_len) = new_paged_tmp(1);
+            unsafe {
+                let mmap = POSIXMemMap::new(file.fd(), total_len).unwrap();
+                let unaligned = (mmap.as_ptr::<u8>(0) as usize + 1) as *mut c_void;
+                let err_unaligned = madvise_raw(unaligned, BUFFER_SIZE).unwrap_err();
+                assert_eq!(err_unaligned.reason, err::HCF.reason);
                 mmap.unmap().unwrap();
             }
         }
