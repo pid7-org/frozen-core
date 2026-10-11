@@ -4,9 +4,9 @@ use super::err::{self, raw_error};
 use crate::{error::FrozenResult, hints};
 use core::ptr;
 use libc::{
-    EACCES, EAGAIN, EBADF, EBUSY, EINTR, EINVAL, EIO, ENODEV, ENOMEM, EOVERFLOW, EPERM, ETXTBSY,
-    MAP_FAILED, MAP_SHARED, MS_SYNC, PROT_READ, PROT_WRITE, c_void, mmap, msync, munmap, off_t,
-    size_t,
+    _SC_PAGESIZE, EACCES, EAGAIN, EBADF, EBUSY, EINTR, EINVAL, EIO, ENODEV, ENOMEM, EOVERFLOW,
+    EPERM, ETXTBSY, MAP_FAILED, MAP_SHARED, MS_SYNC, PROT_READ, PROT_WRITE, c_void, mmap, msync,
+    munmap, off_t, size_t, sysconf,
 };
 
 /// Base pointer for `mmap(2)` mapped memory
@@ -66,6 +66,34 @@ impl POSIXMemMap {
     #[inline]
     pub(super) fn length(&self) -> usize {
         self.length
+    }
+
+    /// Returns the system memory page size in bytes queried from kernel settings
+    ///
+    /// Under POSIX systems (Linux and macOS), this queries `sysconf(_SC_PAGESIZE)`
+    pub(super) fn page_size() -> FrozenResult<usize> {
+        let res = unsafe { sysconf(_SC_PAGESIZE) };
+        if hints::unlikely(res <= 0) {
+            let errno = last_errno();
+            let err_msg = err_msg(errno);
+
+            return match errno {
+                EINVAL => raw_error(err::HCF, err_msg),
+                _ => raw_error(err::UNK, err_msg),
+            };
+        }
+
+        let page_size = res as usize;
+        if hints::unlikely(!page_size.is_power_of_two() || page_size < 4096) {
+            return raw_error(
+                err::HCF,
+                format!(
+                    "kernel returned invalid page size: {page_size} (must be power of two >= 4096)"
+                ),
+            );
+        }
+
+        Ok(page_size)
     }
 
     /// Syncs in-cache data updates on the storage device
@@ -299,6 +327,52 @@ mod tests {
             unsafe {
                 let msg = err_msg(libc::ENOENT);
                 assert!(!msg.is_empty(), "ENOENT must produce message");
+            }
+        }
+    }
+
+    mod page_size {
+        use super::*;
+
+        #[test]
+        fn ok_page_size_returns_valid_power_of_two() {
+            let size = POSIXMemMap::page_size().expect("page_size must succeed");
+            assert!(size.is_power_of_two(), "page size must be a power of two, got {size}");
+            assert!(
+                size >= 4096,
+                "page size must be at least 4096 bytes on supported 64-bit systems, got {size}"
+            );
+        }
+
+        #[test]
+        fn ok_page_size_matches_libc_sysconf() {
+            let size = POSIXMemMap::page_size().expect("page_size must succeed");
+            let sysconf_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+            assert_eq!(size, sysconf_size);
+        }
+
+        #[test]
+        fn ok_page_size_consistency() {
+            let first = POSIXMemMap::page_size().unwrap();
+            for _ in 0..1000 {
+                assert_eq!(POSIXMemMap::page_size().unwrap(), first);
+            }
+        }
+
+        #[test]
+        fn ok_page_size_across_threads() {
+            let expected = POSIXMemMap::page_size().unwrap();
+            let mut handles = Vec::new();
+            for _ in 0..16 {
+                let handle = std::thread::spawn(move || {
+                    for _ in 0..100 {
+                        assert_eq!(POSIXMemMap::page_size().unwrap(), expected);
+                    }
+                });
+                handles.push(handle);
+            }
+            for handle in handles {
+                handle.join().unwrap();
             }
         }
     }
