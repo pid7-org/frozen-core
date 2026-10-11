@@ -1621,7 +1621,7 @@ mod tests {
             let missing_path = path.join("non_existent_file");
             let file2 = POSIXFile {
                 fd: atomic::AtomicI32::new(unsafe {
-                    libc::open(b"/dev/null\0".as_ptr() as *const _, libc::O_RDONLY)
+                    libc::open(c"/dev/null".as_ptr() as *const _, libc::O_RDONLY)
                 }),
             };
             let err = file2.unlink(&missing_path).unwrap_err();
