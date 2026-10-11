@@ -1439,7 +1439,6 @@ mod tests {
             };
 
             let t2 = {
-                let cfg = cfg;
                 let b = barrier;
                 std::thread::spawn(move || {
                     b.wait();
@@ -1482,7 +1481,6 @@ mod tests {
             };
 
             let t_open = {
-                let cfg = cfg;
                 let b = barrier;
                 std::thread::spawn(move || {
                     b.wait();
@@ -1529,7 +1527,6 @@ mod tests {
             };
 
             let t2 = {
-                let cfg = cfg;
                 let b = barrier;
                 std::thread::spawn(move || {
                     b.wait();
@@ -1691,14 +1688,14 @@ mod tests {
                 }));
             }
 
-            let mut successes = 0;
+            let mut opened_files = vec![];
             let mut lock_failures = 0;
 
             for h in handles {
                 match h.join().unwrap() {
                     Ok(f) => {
                         assert_eq!(f.length(), BUFFER_SIZE * INIT_BUFFERS);
-                        successes += 1;
+                        opened_files.push(f);
                     }
                     Err(e) => {
                         assert_eq!(e.reason, err::LCK.reason, "error must be LCK: {:?}", e);
@@ -1708,7 +1705,7 @@ mod tests {
             }
 
             // Exactly one must acquire the exclusive lock while other concurrent callers fail with LCK
-            assert_eq!(successes, 1);
+            assert_eq!(opened_files.len(), 1);
             assert_eq!(lock_failures, num_threads - 1);
             assert!(cfg.path.exists());
         }
@@ -2213,15 +2210,14 @@ mod tests {
             let (_dir, cfg) = tmp_path();
             let file = File::new(cfg.clone()).unwrap();
 
-            let mut perms = std::fs::metadata(&cfg.path).unwrap().permissions();
-            perms.set_readonly(true);
-            std::fs::set_permissions(&cfg.path, perms).unwrap();
+            let orig_perms = std::fs::metadata(&cfg.path).unwrap().permissions();
+            let mut read_only = orig_perms.clone();
+            read_only.set_readonly(true);
+            std::fs::set_permissions(&cfg.path, read_only).unwrap();
 
             let err = file.delete().unwrap_err();
 
-            let mut perms = std::fs::metadata(&cfg.path).unwrap().permissions();
-            perms.set_readonly(false);
-            let _ = std::fs::set_permissions(&cfg.path, perms);
+            let _ = std::fs::set_permissions(&cfg.path, orig_perms);
 
             assert_eq!(err.reason, err::PRM.reason);
         }
