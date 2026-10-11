@@ -4,11 +4,15 @@
 
 use crate::error::{ErrCode, FrozenError, FrozenResult};
 
+mod interface;
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod posix;
 
 #[cfg(target_os = "windows")]
 mod windows;
+
+pub(in crate::memmap) use interface::MemMapInterface;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(in crate::memmap) type PlatformMemMap = posix::POSIXMemMap;

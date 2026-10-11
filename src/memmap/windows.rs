@@ -1,4 +1,7 @@
-use super::err::{self, raw_error};
+use super::{
+    err::{self, raw_error},
+    interface::MemMapInterface,
+};
 use crate::{error::FrozenResult, hints};
 use core::ptr;
 use std::time::Duration;
@@ -26,6 +29,9 @@ use windows_sys::Win32::{
         Threading::GetCurrentProcess,
     },
 };
+
+/// File handle type for Windows systems
+pub(super) type FileId = isize;
 
 /// Base pointer for Win32 mapped memory
 type TPtr = *mut u8;
@@ -61,11 +67,13 @@ impl Drop for WINMemMap {
     }
 }
 
-impl WINMemMap {
+impl MemMapInterface for WINMemMap {
+    type Id = FileId;
+
     /// Create a new [`WINMemMap`] by mapping `length` bytes of the file represented by `handle`
     ///
     /// Maps memory from offset 0 with `PAGE_READWRITE` and `FILE_MAP_READ | FILE_MAP_WRITE`
-    pub(super) fn new(handle: isize, length: usize) -> FrozenResult<Self> {
+    fn new(handle: FileId, length: usize) -> FrozenResult<Self> {
         let ptr = mmap_raw(handle, length)?;
         Ok(Self { ptr, length })
     }
@@ -75,7 +83,7 @@ impl WINMemMap {
     /// Consumes `self` to prevent use-after-free or double-unmapping at compile time
     ///
     /// Clears internal state so subsequent [`Drop`] execution becomes a safe no-op
-    pub(super) fn unmap(mut self) -> FrozenResult<()> {
+    fn unmap(mut self) -> FrozenResult<()> {
         if !self.ptr.is_null() && self.length > 0 {
             let res = munmap_raw(self.ptr, self.length);
             self.ptr = ptr::null_mut();
@@ -88,14 +96,14 @@ impl WINMemMap {
 
     /// Returns the length of the memory mapping in bytes
     #[inline]
-    pub(super) fn length(&self) -> usize {
+    fn length(&self) -> usize {
         self.length
     }
 
     /// Returns the system memory page size in bytes queried from kernel settings
     ///
     /// Under Windows systems, this queries `GetSystemInfo`
-    pub(super) fn page_size() -> FrozenResult<usize> {
+    fn page_size() -> FrozenResult<usize> {
         let mut sys_info = unsafe { core::mem::zeroed::<SYSTEM_INFO>() };
         unsafe { GetSystemInfo(&mut sys_info) };
 
@@ -123,7 +131,7 @@ impl WINMemMap {
     ///
     /// The returned list of indices can also be used by callers to compute the total active resident page count
     /// via `indices.len()`
-    pub(super) fn active_page_indices(&self) -> FrozenResult<Vec<usize>> {
+    fn active_page_indices(&self) -> FrozenResult<Vec<usize>> {
         if hints::unlikely(self.ptr.is_null() || self.length == 0) {
             return Ok(Vec::new());
         }
@@ -210,7 +218,7 @@ impl WINMemMap {
     ///
     /// If pages contain modified data that has not been synced, call [`WINMemMap::sync`] before evicting
     /// to avoid discarding unwritten changes
-    pub(super) fn evict_pages(&self, indices: &[usize]) -> FrozenResult<()> {
+    fn evict_pages(&self, indices: &[usize]) -> FrozenResult<()> {
         if hints::unlikely(indices.is_empty()) {
             return Ok(());
         }
@@ -265,7 +273,7 @@ impl WINMemMap {
     ///
     /// For strong durability, use of [`File::sync`](crate::file::File::sync) (`FlushFileBuffers`) is required
     /// right after calling [`WINMemMap::sync`]
-    pub(super) fn sync(&self, length: usize) -> FrozenResult<()> {
+    fn sync(&self, length: usize) -> FrozenResult<()> {
         msync_raw(self.ptr, length)
     }
 
@@ -281,7 +289,7 @@ impl WINMemMap {
     /// - The memory mapping must not have been unmapped via [`WINMemMap::unmap`]
     #[inline]
     #[allow(unsafe_op_in_unsafe_fn)]
-    pub(super) unsafe fn as_mut_ptr<T>(&self, offset: usize) -> *mut T
+    unsafe fn as_mut_ptr<T>(&self, offset: usize) -> *mut T
     where
         T: Sized,
     {
@@ -300,7 +308,7 @@ impl WINMemMap {
     /// - The memory mapping must not have been unmapped via [`WINMemMap::unmap`]
     #[inline]
     #[allow(unsafe_op_in_unsafe_fn)]
-    pub(super) unsafe fn as_ptr<T>(&self, offset: usize) -> *const T
+    unsafe fn as_ptr<T>(&self, offset: usize) -> *const T
     where
         T: Sized,
     {

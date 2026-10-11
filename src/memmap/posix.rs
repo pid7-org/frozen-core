@@ -1,13 +1,19 @@
 //! Implementation of memory mapped files for POSIX (Linux and macOS) systems
 
-use super::err::{self, raw_error};
+use super::{
+    err::{self, raw_error},
+    interface::MemMapInterface,
+};
 use crate::{error::FrozenResult, hints};
 use core::ptr;
 use libc::{
     _SC_PAGESIZE, EACCES, EAGAIN, EBADF, EBUSY, EINTR, EINVAL, EIO, ENODEV, ENOMEM, EOVERFLOW,
-    EPERM, ETXTBSY, MADV_DONTNEED, MAP_FAILED, MAP_SHARED, MS_SYNC, PROT_READ, PROT_WRITE, c_void,
-    madvise, mincore, mmap, msync, munmap, off_t, size_t, sysconf,
+    EPERM, ETXTBSY, MADV_DONTNEED, MAP_FAILED, MAP_SHARED, MS_SYNC, PROT_READ, PROT_WRITE, c_int,
+    c_void, madvise, mincore, mmap, msync, munmap, off_t, size_t, sysconf,
 };
+
+/// File descriptor type for POSIX systems
+pub(super) type FileId = c_int;
 
 /// Base pointer for `mmap(2)` mapped memory
 type TPtr = *mut u8;
@@ -37,11 +43,13 @@ impl Drop for POSIXMemMap {
     }
 }
 
-impl POSIXMemMap {
+impl MemMapInterface for POSIXMemMap {
+    type Id = FileId;
+
     /// Create a new [`POSIXMemMap`] by mapping `length` bytes of the file represented by `fd`
     ///
     /// Maps memory from offset 0 with `PROT_READ | PROT_WRITE` and `MAP_SHARED`
-    pub(super) fn new(fd: i32, length: size_t) -> FrozenResult<Self> {
+    fn new(fd: FileId, length: usize) -> FrozenResult<Self> {
         let ptr = mmap_raw(fd, length)?;
         Ok(Self { ptr, length })
     }
@@ -51,7 +59,7 @@ impl POSIXMemMap {
     /// Consumes `self` to prevent use-after-free or double-unmapping at compile time
     ///
     /// Clears internal state so subsequent [`Drop`] execution becomes a safe no-op
-    pub(super) fn unmap(mut self) -> FrozenResult<()> {
+    fn unmap(mut self) -> FrozenResult<()> {
         if !self.ptr.is_null() && self.length > 0 {
             let res = munmap_raw(self.ptr, self.length);
             self.ptr = ptr::null_mut();
@@ -64,14 +72,14 @@ impl POSIXMemMap {
 
     /// Returns the length of the memory mapping in bytes
     #[inline]
-    pub(super) fn length(&self) -> usize {
+    fn length(&self) -> usize {
         self.length
     }
 
     /// Returns the system memory page size in bytes queried from kernel settings
     ///
     /// Under POSIX systems (Linux and macOS), this queries `sysconf(_SC_PAGESIZE)`
-    pub(super) fn page_size() -> FrozenResult<usize> {
+    fn page_size() -> FrozenResult<usize> {
         let res = unsafe { sysconf(_SC_PAGESIZE) };
         if hints::unlikely(res <= 0) {
             let errno = last_errno();
@@ -112,7 +120,7 @@ impl POSIXMemMap {
     ///
     /// POSIX syscalls are interruptible by signals and may fail w/ `EINTR`, `EBUSY`, or `EAGAIN`. In such cases,
     /// no progress is guaranteed, so the syscall must be retried
-    pub(super) fn active_page_indices(&self) -> FrozenResult<Vec<usize>> {
+    fn active_page_indices(&self) -> FrozenResult<Vec<usize>> {
         if hints::unlikely(self.ptr.is_null() || self.length == 0) {
             return Ok(Vec::new());
         }
@@ -172,7 +180,7 @@ impl POSIXMemMap {
     ///
     /// If pages contain modified (`MAP_SHARED`) data that has not been synced, call [`POSIXMemMap::sync`] before
     /// evicting to avoid discarding unwritten changes
-    pub(super) fn evict_pages(&self, indices: &[usize]) -> FrozenResult<()> {
+    fn evict_pages(&self, indices: &[usize]) -> FrozenResult<()> {
         if hints::unlikely(indices.is_empty()) {
             return Ok(());
         }
@@ -234,7 +242,7 @@ impl POSIXMemMap {
     /// POSIX syscalls are interruptible by signals and may fail w/ `EINTR`, `EBUSY`, or `EAGAIN`
     ///
     /// In such cases, no progress is guaranteed, so the syscall must be retried
-    pub(super) fn sync(&self, length: usize) -> FrozenResult<()> {
+    fn sync(&self, length: usize) -> FrozenResult<()> {
         msync_raw(self.ptr, length)
     }
 
@@ -251,7 +259,7 @@ impl POSIXMemMap {
     /// - The memory mapping must not have been unmapped via [`POSIXMemMap::unmap`]
     #[inline]
     #[allow(unsafe_op_in_unsafe_fn)]
-    pub(super) unsafe fn as_mut_ptr<T>(&self, offset: usize) -> *mut T
+    unsafe fn as_mut_ptr<T>(&self, offset: usize) -> *mut T
     where
         T: Sized,
     {
@@ -271,7 +279,7 @@ impl POSIXMemMap {
     /// - The memory mapping must not have been unmapped via [`POSIXMemMap::unmap`]
     #[inline]
     #[allow(unsafe_op_in_unsafe_fn)]
-    pub(super) unsafe fn as_ptr<T>(&self, offset: usize) -> *const T
+    unsafe fn as_ptr<T>(&self, offset: usize) -> *const T
     where
         T: Sized,
     {
