@@ -398,6 +398,11 @@ fn madvise_raw(ptr: *mut c_void, length: size_t) -> FrozenResult<()> {
         return raw_error(err::NMM, "cannot advise unmapped null pointer");
     }
 
+    let page_size = POSIXMemMap::page_size()?;
+    if hints::unlikely(ptr as usize % page_size != 0) {
+        return raw_error(err::HCF, "address is not page-aligned");
+    }
+
     let mut retries = 0;
     loop {
         let res = unsafe { madvise(ptr, length, MADV_DONTNEED) };
@@ -774,6 +779,21 @@ mod tests {
                 let unaligned = (mmap.as_ptr::<u8>(0) as usize + 1) as *mut c_void;
                 let err_unaligned = madvise_raw(unaligned, BUFFER_SIZE).unwrap_err();
                 assert_eq!(err_unaligned.reason, err::HCF.reason);
+
+                // Target-specific raw syscall assertion:
+                // Linux kernel rejects unaligned address with -1 (EINVAL)
+                #[cfg(target_os = "linux")]
+                {
+                    let raw = madvise(unaligned, BUFFER_SIZE, MADV_DONTNEED);
+                    assert_eq!(raw, -1);
+                }
+                // Darwin/macOS XNU kernel auto-truncates unaligned address to page boundary and returns 0
+                #[cfg(target_os = "macos")]
+                {
+                    let raw = madvise(unaligned, BUFFER_SIZE, MADV_DONTNEED);
+                    assert_eq!(raw, 0);
+                }
+
                 mmap.unmap().unwrap();
             }
         }
