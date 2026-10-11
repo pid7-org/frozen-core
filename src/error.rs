@@ -387,7 +387,7 @@ mod tests {
     fn ok_new_and_new_raw_same_id() {
         let e1 = FrozenError::new(1, 2, ErrCode::new(3, "io"), "fail");
 
-        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "fail");
+        let io_err = std::io::Error::other("fail");
         let e2 = FrozenError::new_raw(1, 2, ErrCode::new(3, "io"), io_err);
 
         assert_eq!(e1, e2);
