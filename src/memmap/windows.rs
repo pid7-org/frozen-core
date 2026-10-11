@@ -10,7 +10,8 @@ use windows_sys::Win32::{
         CloseHandle, ERROR_ACCESS_DENIED, ERROR_COMMITMENT_LIMIT, ERROR_DISK_FULL,
         ERROR_HANDLE_DISK_FULL, ERROR_INVALID_ADDRESS, ERROR_INVALID_HANDLE,
         ERROR_INVALID_PARAMETER, ERROR_IO_DEVICE, ERROR_LOCK_VIOLATION, ERROR_NOT_ENOUGH_MEMORY,
-        ERROR_OUTOFMEMORY, ERROR_SHARING_VIOLATION, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE,
+        ERROR_NOT_LOCKED, ERROR_OUTOFMEMORY, ERROR_SHARING_VIOLATION, GENERIC_READ, HANDLE,
+        INVALID_HANDLE_VALUE,
     },
     Storage::FileSystem::{
         CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
@@ -18,9 +19,9 @@ use windows_sys::Win32::{
     },
     System::{
         Memory::{
-            CreateFileMappingW, DiscardVirtualMemory, FILE_MAP_READ, FILE_MAP_WRITE,
-            FlushViewOfFile, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_READWRITE,
-            UnmapViewOfFile,
+            CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, FlushViewOfFile,
+            MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile,
+            VirtualUnlock,
         },
         ProcessStatus::{
             K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_BLOCK, PSAPI_WORKING_SET_EX_INFORMATION,
@@ -200,14 +201,14 @@ impl MemMapInterface for WINMemMap {
         }
     }
 
-    /// Evicts selected memory pages from physical memory via `DiscardVirtualMemory`
+    /// Evicts selected memory pages from physical memory via `VirtualUnlock`
     ///
     /// ## Eviction semantics
     ///
-    /// Under Windows systems, this calls `DiscardVirtualMemory` for the specified page indices, releasing
-    /// working set entries and discarding physical memory associated with the mapping
+    /// Under Windows systems, this calls `VirtualUnlock` for the specified page indices, releasing
+    /// working set entries and evicting physical memory associated with the mapping
     ///
-    /// Contiguous page indices are automatically coalesced into single `DiscardVirtualMemory` calls to minimize
+    /// Contiguous page indices are automatically coalesced into single `VirtualUnlock` calls to minimize
     /// system call overhead
     ///
     /// Duplicate page indices are deduplicated
@@ -477,7 +478,7 @@ fn msync_raw(ptr: TPtr, length: usize) -> FrozenResult<()> {
     }
 }
 
-/// Discards/evicts mapped pages w/ `DiscardVirtualMemory`
+/// Discards/evicts mapped pages w/ `VirtualUnlock`
 fn discard_raw(ptr: *mut core::ffi::c_void, length: usize) -> FrozenResult<()> {
     if hints::unlikely(ptr.is_null()) {
         return raw_error(err::NMM, "cannot advise unmapped null pointer");
@@ -492,13 +493,21 @@ fn discard_raw(ptr: *mut core::ffi::c_void, length: usize) -> FrozenResult<()> {
 
     let mut retries = 0;
     loop {
-        let res = unsafe { DiscardVirtualMemory(ptr, aligned_len) };
-        if hints::likely(res == 0) {
+        // Calling VirtualUnlock on an unlocked range removes those pages from the process working set,
+        // returning FALSE with last error ERROR_NOT_LOCKED. If the pages were locked, it unlocks them
+        // and returns nonzero.
+        let ok = unsafe { VirtualUnlock(ptr, aligned_len) };
+        if hints::likely(ok != 0) {
             return Ok(());
         }
 
-        let err_msg = err_msg(res);
-        match res {
+        let code = last_error();
+        if hints::likely(code == ERROR_NOT_LOCKED) {
+            return Ok(());
+        }
+
+        let err_msg = err_msg(code);
+        match code {
             ERROR_LOCK_VIOLATION | ERROR_SHARING_VIOLATION => {
                 if retries < MAX_RETRIES {
                     retries += 1;
