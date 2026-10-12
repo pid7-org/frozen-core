@@ -32,6 +32,9 @@ pub(super) struct POSIXMemMap {
     length: usize,
 }
 
+unsafe impl Send for POSIXMemMap {}
+unsafe impl Sync for POSIXMemMap {}
+
 impl Drop for POSIXMemMap {
     /// Automatically releases mapped memory via `munmap(2)` when going out of scope if not explicitly unmapped
     fn drop(&mut self) {

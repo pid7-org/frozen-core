@@ -3,7 +3,7 @@
 use crate::error::FrozenResult;
 
 /// Common interface contract implemented by platform-specific memory map backends
-pub(in crate::memmap) trait MemMapInterface: Sized {
+pub(in crate::memmap) trait MemMapInterface: Sized + Send + Sync {
     /// Associated type for the underlying operating system file descriptor or kernel handle
     type Id: Copy + Eq + PartialEq + core::fmt::Debug + Send + Sync;
 

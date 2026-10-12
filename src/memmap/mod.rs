@@ -3,11 +3,13 @@
 #![allow(unused)]
 
 use crate::{
+    ack::{AckTicket, Completion, SyncTrigger, TEpoch},
     error::{BindModule, ErrCode, FrozenError, FrozenResult},
     file::{File, FileCfg},
     hints,
 };
 use core::marker::PhantomData;
+use std::sync::{Arc, Condvar, Mutex, RwLock, atomic};
 
 mod interface;
 
@@ -120,12 +122,12 @@ pub(in crate::memmap) mod err {
 ///     path: std::path::PathBuf::from("test.db"),
 ///     version: 1,
 ///     initial_t: 0x10,
-///     sync_interval: Some(Duration::from_millis(0x64)),
+///     sync_interval: Duration::from_millis(0x64),
 /// };
 ///
 /// assert_eq!(cfg.version, 1);
 /// assert_eq!(cfg.initial_t, 0x10);
-/// assert_eq!(cfg.sync_interval, Some(Duration::from_millis(0x64)));
+/// assert_eq!(cfg.sync_interval, Duration::from_millis(0x64));
 /// ```
 #[derive(Debug, Clone)]
 pub struct MemMapCfg {
@@ -152,11 +154,10 @@ pub struct MemMapCfg {
     /// Initial file length will be `core::mem::size_of::<T>() * initial_t` (bytes)
     pub initial_t: usize,
 
-    /// Optional interval for the background sync thread
+    /// Interval for the background sync thread
     ///
-    /// If `Some(duration)`, a background worker thread is spawned which flushes dirty pages at this interval; and
-    /// if `None`, background sync is disabled and durability advances via manual sync
-    pub sync_interval: Option<std::time::Duration>,
+    /// The background worker thread flushes dirty mapped pages and file state to disk at this interval
+    pub sync_interval: std::time::Duration,
 }
 
 impl MemMapCfg {
@@ -179,11 +180,73 @@ impl MemMapCfg {
     }
 }
 
-/// NA
+/// Internal shared state for [`MemMap`]
+#[derive(Debug)]
+struct MemMapInner {
+    cfg: MemMapCfg,
+    mmap: RwLock<Option<PlatformMemMap>>,
+    length: usize,
+    completion: Arc<Completion>,
+    sync_condvar: Condvar,
+    sync_mutex: Mutex<bool>,
+    shutdown: atomic::AtomicBool,
+}
+
+impl SyncTrigger for MemMapInner {
+    fn trigger_sync(&self) -> FrozenResult<()> {
+        {
+            let mut guard = self.sync_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = true;
+        }
+
+        self.sync_condvar.notify_one();
+        Ok(())
+    }
+}
+
+impl MemMapInner {
+    fn sync_internal(&self) -> FrozenResult<()> {
+        let guard = self.mmap.read().unwrap_or_else(|e| e.into_inner());
+        let mmap = match guard.as_ref() {
+            Some(m) => m,
+            None => return Ok(()),
+        };
+
+        let target_epoch = self.completion.read_current_epoch();
+        let durable_epoch = self.completion.read_durable_epoch();
+
+        if target_epoch == durable_epoch {
+            return Ok(());
+        }
+
+        // Two-phase flush: flush mapped pages from VM to file writeback, then sync file descriptor for durability
+        let sync_res = mmap.sync(self.length);
+
+        match sync_res {
+            Ok(()) => {
+                self.completion.mark_epoch_as_durable(target_epoch);
+                self.completion.del_err();
+                self.completion.notify_all_listeners();
+
+                Ok(())
+            }
+            Err(e) => {
+                let e = e.with_module(self.cfg.module_id);
+                self.completion.set_err(e.clone());
+                self.completion.notify_all_listeners();
+
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Custom memory-mapped file abstraction with background synchronization and durability tracking
 pub struct MemMap<T: Sized + Clone> {
     cfg: MemMapCfg,
-    mmap: PlatformMemMap,
-    file: File,
+    file: Option<File>,
+    inner: Arc<MemMapInner>,
+    bg_thread: Option<std::thread::JoinHandle<()>>,
     _marker: PhantomData<T>,
 }
 
@@ -192,15 +255,12 @@ where
     T: Sized + Clone,
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("MemMap")
-            .field("cfg", &self.cfg)
-            .field("mmap", &self.mmap)
-            .field("file", &self.file)
-            .finish()
+        f.debug_struct("MemMap").field("cfg", &self.cfg).field("inner", &self.inner).finish()
     }
 }
 
 unsafe impl<T> Send for MemMap<T> where T: Sized + Clone {}
+unsafe impl<T> Sync for MemMap<T> where T: Sized + Clone {}
 
 impl<T> MemMap<T>
 where
@@ -268,6 +328,75 @@ where
         }
     }
 
+    fn from_components(cfg: MemMapCfg, mmap: PlatformMemMap, file: File) -> FrozenResult<Self> {
+        let length = mmap.length();
+        let completion = Arc::new(Completion::default());
+        let sync_interval = cfg.sync_interval;
+
+        let inner = Arc::new(MemMapInner {
+            cfg: cfg.clone(),
+            mmap: RwLock::new(Some(mmap)),
+            length,
+            completion: completion.clone(),
+            sync_condvar: Condvar::new(),
+            sync_mutex: Mutex::new(false),
+            shutdown: atomic::AtomicBool::new(false),
+        });
+
+        let weak_inner: std::sync::Weak<dyn SyncTrigger> =
+            Arc::downgrade(&inner) as std::sync::Weak<dyn SyncTrigger>;
+        completion.set_sync_trigger(weak_inner);
+
+        let worker_inner = Arc::clone(&inner);
+        let handle =
+            std::thread::Builder::new().name("frozen-mmap-sync-worker".into()).spawn(move || {
+                let mut guard = worker_inner.sync_mutex.lock().unwrap_or_else(|e| e.into_inner());
+
+                while !worker_inner.shutdown.load(atomic::Ordering::Acquire) {
+                    if *guard {
+                        *guard = false;
+                        drop(guard);
+
+                        let _ = worker_inner.sync_internal();
+                        guard = worker_inner.sync_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                        continue;
+                    }
+
+                    let (new_guard, _) = worker_inner
+                        .sync_condvar
+                        .wait_timeout(guard, sync_interval)
+                        .unwrap_or_else(|e| e.into_inner());
+
+                    guard = new_guard;
+                    if worker_inner.shutdown.load(atomic::Ordering::Acquire) {
+                        break;
+                    }
+
+                    *guard = false;
+                    drop(guard);
+
+                    let _ = worker_inner.sync_internal();
+                    guard = worker_inner.sync_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                }
+            });
+
+        let bg_thread = match handle {
+            Ok(h) => h,
+            Err(spawn_err) => {
+                let mut mmap_guard = inner.mmap.write().unwrap_or_else(|e| e.into_inner());
+                let mut err = err::make_raw_error(err::FXE, spawn_err);
+                if let Some(m) = mmap_guard.take() {
+                    if let Err(unmap_err) = m.unmap() {
+                        err.add_suppressed(unmap_err);
+                    }
+                }
+                return Err(err.with_module(cfg.module_id));
+            }
+        };
+
+        Ok(Self { cfg, file: Some(file), inner, bg_thread: Some(bg_thread), _marker: PhantomData })
+    }
+
     /// Creates and memory-maps a new [`File`] at `cfg.versioned_path()`
     ///
     /// *NOTE:* Returns an error if the file already exists on fs, use
@@ -290,6 +419,7 @@ where
     ///
     /// ```
     /// use frozen_core::memmap::{MemMap, MemMapCfg};
+    /// use std::time::Duration;
     ///
     /// let dir = tempfile::tempdir().unwrap();
     /// let cfg = MemMapCfg {
@@ -297,7 +427,7 @@ where
     ///     path: dir.path().join("new_memmap.bin"),
     ///     version: 1,
     ///     initial_t: 4,
-    ///     sync_interval: None,
+    ///     sync_interval: Duration::from_millis(100),
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
@@ -335,7 +465,7 @@ where
             }
         };
 
-        Ok(Self { cfg, mmap, file, _marker: PhantomData })
+        Self::from_components(cfg, mmap, file)
     }
 
     /// NA
@@ -344,6 +474,7 @@ where
     ///
     /// ```
     /// use frozen_core::memmap::{MemMap, MemMapCfg};
+    /// use std::time::Duration;
     ///
     /// let dir = tempfile::tempdir().unwrap();
     /// let cfg = MemMapCfg {
@@ -351,7 +482,7 @@ where
     ///     path: dir.path().join("open_memmap.bin"),
     ///     version: 1,
     ///     initial_t: 4,
-    ///     sync_interval: None,
+    ///     sync_interval: Duration::from_millis(100),
     /// };
     ///
     /// {
@@ -379,7 +510,7 @@ where
 
         let mmap = PlatformMemMap::new(file.fd(), file.length()).with_module(cfg.module_id)?;
 
-        Ok(Self { cfg, mmap, file, _marker: PhantomData })
+        Self::from_components(cfg, mmap, file)
     }
 
     /// NA
@@ -388,6 +519,7 @@ where
     ///
     /// ```
     /// use frozen_core::memmap::{MemMap, MemMapCfg};
+    /// use std::time::Duration;
     ///
     /// let dir = tempfile::tempdir().unwrap();
     /// let cfg = MemMapCfg {
@@ -395,7 +527,7 @@ where
     ///     path: dir.path().join("open_or_create_memmap.bin"),
     ///     version: 1,
     ///     initial_t: 2,
-    ///     sync_interval: None,
+    ///     sync_interval: Duration::from_millis(100),
     /// };
     ///
     /// {
@@ -420,13 +552,13 @@ where
 
         let mmap = PlatformMemMap::new(file.fd(), file.length()).with_module(cfg.module_id)?;
 
-        Ok(Self { cfg, mmap, file, _marker: PhantomData })
+        Self::from_components(cfg, mmap, file)
     }
 
     /// Returns the length of the memory mapping in bytes
     #[inline]
     pub fn length(&self) -> usize {
-        self.mmap.length()
+        self.inner.length
     }
 
     /// Get reference to configuration of [`MemMap`]
@@ -438,7 +570,31 @@ where
     /// Get reference to underlying [`File`]
     #[inline]
     pub fn file(&self) -> &File {
-        &self.file
+        self.file.as_ref().expect("file exists")
+    }
+
+    /// Fetch the latest assigned durability epoch
+    #[inline]
+    pub fn current_epoch(&self) -> TEpoch {
+        self.inner.completion.read_current_epoch()
+    }
+
+    /// Fetch the latest durable epoch
+    #[inline]
+    pub fn durable_epoch(&self) -> TEpoch {
+        self.inner.completion.read_durable_epoch()
+    }
+
+    /// Fetch reference to underlying durability [`Completion`]
+    #[inline]
+    pub fn completion(&self) -> &Arc<Completion> {
+        &self.inner.completion
+    }
+
+    /// Synchronize dirty pages and file metadata to stable storage
+    #[inline]
+    pub fn sync(&self) -> FrozenResult<()> {
+        self.inner.sync_internal()
     }
 
     /// Reads an element of type `T` from the memory mapping at the specified `index`
@@ -452,6 +608,7 @@ where
     ///
     /// ```
     /// use frozen_core::memmap::{MemMap, MemMapCfg};
+    /// use std::time::Duration;
     ///
     /// let dir = tempfile::tempdir().unwrap();
     /// let cfg = MemMapCfg {
@@ -459,7 +616,7 @@ where
     ///     path: dir.path().join("read_test.bin"),
     ///     version: 1,
     ///     initial_t: 4,
-    ///     sync_interval: None,
+    ///     sync_interval: Duration::from_millis(100),
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -480,12 +637,20 @@ where
             return err::default_error(err::HCF).with_module(mid);
         }
 
-        let ptr = unsafe { self.mmap.as_ptr::<T>(offset) };
+        let guard = self.inner.mmap.read().unwrap_or_else(|e| e.into_inner());
+        let mmap = match guard.as_ref() {
+            Some(m) => m,
+            None => return err::default_error(err::INV).with_module(mid),
+        };
+
+        let ptr = unsafe { mmap.as_ptr::<T>(offset) };
         let val = unsafe { ptr.read() };
         Ok(val)
     }
 
     /// Writes an element `val` of type `T` into the memory mapping at the specified `index`
+    ///
+    /// Returns an [`AckTicket`] representing the durability acknowledgement of this write operation
     ///
     /// ## Constraints
     ///
@@ -496,6 +661,7 @@ where
     ///
     /// ```
     /// use frozen_core::memmap::{MemMap, MemMapCfg};
+    /// use std::time::Duration;
     ///
     /// let dir = tempfile::tempdir().unwrap();
     /// let cfg = MemMapCfg {
@@ -503,15 +669,15 @@ where
     ///     path: dir.path().join("write_test.bin"),
     ///     version: 1,
     ///     initial_t: 4,
-    ///     sync_interval: None,
+    ///     sync_interval: Duration::from_millis(100),
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
-    /// mmap.write(&100u64, 2).unwrap();
+    /// let ticket = mmap.write(&100u64, 2).unwrap();
     /// assert_eq!(mmap.read(2).unwrap(), 100u64);
     /// ```
     #[inline(always)]
-    pub fn write(&self, val: &T, index: usize) -> FrozenResult<()> {
+    pub fn write(&self, val: &T, index: usize) -> FrozenResult<AckTicket> {
         let mid = self.cfg.module_id;
         let size = core::mem::size_of::<T>();
 
@@ -524,19 +690,66 @@ where
             return err::default_error(err::HCF).with_module(mid);
         }
 
-        let ptr = unsafe { self.mmap.as_mut_ptr::<T>(offset) };
+        let guard = self.inner.mmap.read().unwrap_or_else(|e| e.into_inner());
+        let mmap = match guard.as_ref() {
+            Some(m) => m,
+            None => return err::default_error(err::INV).with_module(mid),
+        };
+
+        let ptr = unsafe { mmap.as_mut_ptr::<T>(offset) };
         unsafe { core::ptr::write(ptr, val.clone()) };
-        Ok(())
+
+        let epoch = self.inner.completion.increment_current_epoch();
+        Ok(AckTicket::new(epoch, self.inner.completion.clone()))
     }
 
     /// Deletes the [`MemMap`] and underlying [`File`] entry from the storage device
     ///
     /// Consumes `self` by value to release the memory mapping and unlink the file
-    pub fn delete(self) -> FrozenResult<()> {
+    pub fn delete(mut self) -> FrozenResult<()> {
         let mid = self.cfg.module_id;
-        let MemMap { cfg: _, mmap, file, _marker: _ } = self;
-        mmap.unmap().with_module(mid)?;
+        self.inner.shutdown.store(true, atomic::Ordering::Release);
+        {
+            let mut guard = self.inner.sync_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = true;
+        }
+        self.inner.sync_condvar.notify_all();
+
+        if let Some(handle) = self.bg_thread.take() {
+            let _ = handle.join();
+        }
+
+        let mut guard = self.inner.mmap.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(mmap) = guard.take() {
+            mmap.unmap().with_module(mid)?;
+        }
+
+        let file = match self.file.take() {
+            Some(f) => f,
+            None => return err::default_error(err::INV).with_module(mid),
+        };
+
         file.delete().with_module(mid)
+    }
+}
+
+impl<T> Drop for MemMap<T>
+where
+    T: Sized + Clone,
+{
+    fn drop(&mut self) {
+        self.inner.shutdown.store(true, atomic::Ordering::Release);
+        {
+            let mut guard = self.inner.sync_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = true;
+        }
+        self.inner.sync_condvar.notify_all();
+
+        if let Some(handle) = self.bg_thread.take() {
+            let _ = handle.join();
+        }
+
+        let _ = self.inner.sync_internal();
     }
 }
 
@@ -594,7 +807,7 @@ mod tests {
             path,
             version: 1,
             initial_t: INIT_T,
-            sync_interval: Some(Duration::from_millis(100)),
+            sync_interval: Duration::from_millis(100),
         };
 
         (dir, cfg)
@@ -618,12 +831,11 @@ mod tests {
     #[test]
     fn ok_new_sets_file_sync_interval_none() {
         let (_dir, cfg) = tmp_cfg();
-        assert!(cfg.sync_interval.is_some());
 
         let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
         assert_eq!(mmap.length(), core::mem::size_of::<u64>() * INIT_T);
         assert_eq!(mmap.file().cfg().sync_interval, None);
-        assert_eq!(mmap.cfg().sync_interval, Some(Duration::from_millis(100)));
+        assert_eq!(mmap.cfg().sync_interval, Duration::from_millis(100));
     }
 
     #[test]
@@ -684,7 +896,7 @@ mod tests {
             path: non_existent_dir.join("file.bin"),
             version: 1,
             initial_t: INIT_T,
-            sync_interval: None,
+            sync_interval: Duration::from_millis(100),
         };
 
         let err_new = MemMap::<u64>::new(cfg.clone()).unwrap_err();
@@ -708,7 +920,7 @@ mod tests {
             path: file_path.join("subfile.bin"),
             version: 1,
             initial_t: INIT_T,
-            sync_interval: None,
+            sync_interval: Duration::from_millis(100),
         };
 
         let err_new = MemMap::<u64>::new(cfg.clone()).unwrap_err();
@@ -728,7 +940,7 @@ mod tests {
             path: std::path::PathBuf::from(""),
             version: 1,
             initial_t: INIT_T,
-            sync_interval: None,
+            sync_interval: Duration::from_millis(100),
         };
 
         let err_new = MemMap::<u64>::new(cfg.clone()).unwrap_err();
@@ -749,7 +961,7 @@ mod tests {
             path: dir.path().to_path_buf(),
             version: 1,
             initial_t: INIT_T,
-            sync_interval: None,
+            sync_interval: Duration::from_millis(100),
         };
 
         let err_new = MemMap::<u64>::new(cfg.clone()).unwrap_err();
@@ -769,7 +981,7 @@ mod tests {
             path: std::path::PathBuf::from("/"),
             version: 1,
             initial_t: INIT_T,
-            sync_interval: None,
+            sync_interval: Duration::from_millis(100),
         };
 
         let err_new = MemMap::<u64>::new(cfg.clone()).unwrap_err();
@@ -800,7 +1012,7 @@ mod tests {
             path: std::path::PathBuf::from("data.bin"),
             version: 1,
             initial_t: 2,
-            sync_interval: None,
+            sync_interval: Duration::from_millis(100),
         };
         assert_eq!(cfg.versioned_path(), std::path::PathBuf::from("data_1.bin"));
 
@@ -810,7 +1022,7 @@ mod tests {
             path: std::path::PathBuf::from("datastore"),
             version: 2,
             initial_t: 2,
-            sync_interval: None,
+            sync_interval: Duration::from_millis(100),
         };
         assert_eq!(cfg.versioned_path(), std::path::PathBuf::from("datastore_2"));
 
@@ -820,7 +1032,7 @@ mod tests {
             path: std::path::PathBuf::from("archive.tar.gz"),
             version: 3,
             initial_t: 2,
-            sync_interval: None,
+            sync_interval: Duration::from_millis(100),
         };
         assert_eq!(cfg.versioned_path(), std::path::PathBuf::from("archive.tar_3.gz"));
 
@@ -830,7 +1042,7 @@ mod tests {
             path: std::path::PathBuf::from("/var/data/store.db"),
             version: 10,
             initial_t: 2,
-            sync_interval: None,
+            sync_interval: Duration::from_millis(100),
         };
         assert_eq!(cfg.versioned_path(), std::path::PathBuf::from("/var/data/store_10.db"));
 
@@ -840,7 +1052,7 @@ mod tests {
             path: std::path::PathBuf::from("dir/sub/file.dat"),
             version: 0,
             initial_t: 2,
-            sync_interval: None,
+            sync_interval: Duration::from_millis(100),
         };
         assert_eq!(cfg.versioned_path(), std::path::PathBuf::from("dir/sub/file_0.dat"));
 
@@ -850,7 +1062,7 @@ mod tests {
             path: std::path::PathBuf::from(".env"),
             version: 5,
             initial_t: 2,
-            sync_interval: None,
+            sync_interval: Duration::from_millis(100),
         };
         assert_eq!(cfg.versioned_path(), std::path::PathBuf::from(".env_5"));
 
@@ -860,7 +1072,7 @@ mod tests {
             path: std::path::PathBuf::from(".config.json"),
             version: 1,
             initial_t: 2,
-            sync_interval: None,
+            sync_interval: Duration::from_millis(100),
         };
         assert_eq!(cfg.versioned_path(), std::path::PathBuf::from(".config_1.json"));
     }
@@ -875,7 +1087,7 @@ mod tests {
             path: base_path.clone(),
             version: 1,
             initial_t: 2,
-            sync_interval: None,
+            sync_interval: Duration::from_millis(100),
         };
         assert_eq!(cfg_v1.versioned_path(), dir.path().join("store_1.dat"));
 
@@ -884,7 +1096,7 @@ mod tests {
             path: base_path.clone(),
             version: 2,
             initial_t: 4,
-            sync_interval: None,
+            sync_interval: Duration::from_millis(100),
         };
         assert_eq!(cfg_v2.versioned_path(), dir.path().join("store_2.dat"));
 
@@ -911,8 +1123,9 @@ mod tests {
         let mmap = MemMap::<u64>::new(cfg).unwrap();
 
         assert_eq!(mmap.read(0).unwrap(), 0);
-        assert!(mmap.write(&0xDEAD_BEEF_CAFE_BABE, 0).is_ok());
+        let ticket = mmap.write(&0xDEAD_BEEF_CAFE_BABE, 0).unwrap();
         assert_eq!(mmap.read(0).unwrap(), 0xDEAD_BEEF_CAFE_BABE);
+        assert_eq!(ticket.epoch(), 1);
     }
 
     #[test]
@@ -988,10 +1201,73 @@ mod tests {
         {
             let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
             mmap.write(&0xCAFE_BABE_1234_5678, 1).unwrap();
-            mmap.file().sync().unwrap();
+            mmap.sync().unwrap();
         }
 
         let reopened = MemMap::<u64>::open(cfg).unwrap();
         assert_eq!(reopened.read(1).unwrap(), 0xCAFE_BABE_1234_5678);
+    }
+
+    #[test]
+    fn ok_background_sync_advances_epoch() {
+        let (_dir, mut cfg) = tmp_cfg();
+        cfg.sync_interval = Duration::from_millis(25);
+
+        let mmap = MemMap::<u64>::new(cfg).unwrap();
+        let ticket = mmap.write(&0x1234, 0).unwrap();
+        let epoch = ticket.wait().unwrap();
+
+        assert_eq!(epoch, ticket.epoch());
+        assert!(ticket.is_durable());
+        assert!(mmap.durable_epoch() >= ticket.epoch());
+    }
+
+    #[test]
+    fn ok_ticket_force_wakes_bg_worker() {
+        let (_dir, mut cfg) = tmp_cfg();
+        // Long interval to prove force wakes up immediately
+        cfg.sync_interval = Duration::from_secs(10);
+
+        let mmap = MemMap::<u64>::new(cfg).unwrap();
+        let ticket = mmap.write(&0xABCD, 0).unwrap();
+        assert!(!ticket.is_durable());
+
+        let start = std::time::Instant::now();
+        let epoch = ticket.force().unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(epoch, ticket.epoch());
+        assert!(ticket.is_durable());
+        assert!(elapsed < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn ok_drop_persists_unflushed_writes() {
+        let (_dir, mut cfg) = tmp_cfg();
+        cfg.sync_interval = Duration::from_secs(30);
+
+        {
+            let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
+            let _ticket = mmap.write(&0xBEEF_CAFE, 0).unwrap();
+            drop(mmap);
+        }
+
+        let reopened = MemMap::<u64>::open(cfg).unwrap();
+        assert_eq!(reopened.read(0).unwrap(), 0xBEEF_CAFE);
+    }
+
+    #[test]
+    fn ok_manual_sync_advances_durable_epoch() {
+        let (_dir, mut cfg) = tmp_cfg();
+        cfg.sync_interval = Duration::from_secs(60);
+
+        let mmap = MemMap::<u64>::new(cfg).unwrap();
+        let ticket = mmap.write(&0x9999, 1).unwrap();
+        assert_eq!(mmap.current_epoch(), 1);
+        assert_eq!(mmap.durable_epoch(), 0);
+
+        mmap.sync().unwrap();
+        assert!(ticket.is_durable());
+        assert_eq!(mmap.durable_epoch(), 1);
     }
 }

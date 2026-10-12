@@ -57,6 +57,9 @@ pub(super) struct WINMemMap {
     length: usize,
 }
 
+unsafe impl Send for WINMemMap {}
+unsafe impl Sync for WINMemMap {}
+
 impl Drop for WINMemMap {
     /// Automatically releases mapped memory via `UnmapViewOfFile` when going out of scope if not explicitly unmapped
     fn drop(&mut self) {
