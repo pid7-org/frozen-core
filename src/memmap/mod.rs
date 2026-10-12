@@ -5,6 +5,7 @@
 use crate::{
     error::{BindModule, ErrCode, FrozenError, FrozenResult},
     file::{File, FileCfg},
+    hints,
 };
 use core::marker::PhantomData;
 
@@ -440,6 +441,94 @@ where
         &self.file
     }
 
+    /// Reads an element of type `T` from the memory mapping at the specified `index`
+    ///
+    /// ## Constraints
+    ///
+    /// - `index * size_of::<T>()` must not overflow `usize`, otherwise returns [`err::INV`]
+    /// - Reading past the mapped memory region returns [`err::HCF`]
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::memmap::{MemMap, MemMapCfg};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = MemMapCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().join("read_test.bin"),
+    ///     version: 1,
+    ///     initial_t: 4,
+    ///     sync_interval: None,
+    /// };
+    ///
+    /// let mmap = MemMap::<u64>::new(cfg).unwrap();
+    /// mmap.write(&42u64, 0).unwrap();
+    /// assert_eq!(mmap.read(0).unwrap(), 42u64);
+    /// ```
+    #[inline(always)]
+    pub fn read(&self, index: usize) -> FrozenResult<T> {
+        let mid = self.cfg.module_id;
+        let size = core::mem::size_of::<T>();
+
+        let offset = match index.checked_mul(size) {
+            Some(off) => off,
+            None => return err::default_error(err::INV).with_module(mid),
+        };
+
+        if hints::unlikely(offset.checked_add(size).is_none_or(|end| end > self.length())) {
+            return err::default_error(err::HCF).with_module(mid);
+        }
+
+        let ptr = unsafe { self.mmap.as_ptr::<T>(offset) };
+        let val = unsafe { ptr.read() };
+        Ok(val)
+    }
+
+    /// Writes an element `val` of type `T` into the memory mapping at the specified `index`
+    ///
+    /// ## Constraints
+    ///
+    /// - `index * size_of::<T>()` must not overflow `usize`, otherwise returns [`err::INV`]
+    /// - Writing past the mapped memory region returns [`err::HCF`]
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::memmap::{MemMap, MemMapCfg};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = MemMapCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().join("write_test.bin"),
+    ///     version: 1,
+    ///     initial_t: 4,
+    ///     sync_interval: None,
+    /// };
+    ///
+    /// let mmap = MemMap::<u64>::new(cfg).unwrap();
+    /// mmap.write(&100u64, 2).unwrap();
+    /// assert_eq!(mmap.read(2).unwrap(), 100u64);
+    /// ```
+    #[inline(always)]
+    pub fn write(&self, val: &T, index: usize) -> FrozenResult<()> {
+        let mid = self.cfg.module_id;
+        let size = core::mem::size_of::<T>();
+
+        let offset = match index.checked_mul(size) {
+            Some(off) => off,
+            None => return err::default_error(err::INV).with_module(mid),
+        };
+
+        if hints::unlikely(offset.checked_add(size).is_none_or(|end| end > self.length())) {
+            return err::default_error(err::HCF).with_module(mid);
+        }
+
+        let ptr = unsafe { self.mmap.as_mut_ptr::<T>(offset) };
+        unsafe { core::ptr::write(ptr, val.clone()) };
+        Ok(())
+    }
+
     /// Deletes the [`MemMap`] and underlying [`File`] entry from the storage device
     ///
     /// Consumes `self` by value to release the memory mapping and unlink the file
@@ -814,5 +903,95 @@ mod tests {
 
         assert!(mmap_v2.delete().is_ok());
         assert!(!cfg_v2.versioned_path().exists());
+    }
+
+    #[test]
+    fn ok_write_read_single() {
+        let (_dir, cfg) = tmp_cfg();
+        let mmap = MemMap::<u64>::new(cfg).unwrap();
+
+        assert_eq!(mmap.read(0).unwrap(), 0);
+        assert!(mmap.write(&0xDEAD_BEEF_CAFE_BABE, 0).is_ok());
+        assert_eq!(mmap.read(0).unwrap(), 0xDEAD_BEEF_CAFE_BABE);
+    }
+
+    #[test]
+    fn ok_write_read_multiple_indices() {
+        let (_dir, cfg) = tmp_cfg();
+        let mmap = MemMap::<u64>::new(cfg).unwrap();
+
+        for i in 0..INIT_T {
+            let val = (i as u64 + 1) * 0x1111_2222_3333_4444;
+            mmap.write(&val, i).unwrap();
+        }
+
+        for i in 0..INIT_T {
+            let expected = (i as u64 + 1) * 0x1111_2222_3333_4444;
+            assert_eq!(mmap.read(i).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn ok_write_read_struct() {
+        let (_dir, cfg) = tmp_cfg();
+        let mmap = MemMap::<ValidT>::new(cfg).unwrap();
+
+        let val0 = ValidT { a: 10, b: 20 };
+        let val1 = ValidT { a: 100, b: 200 };
+
+        mmap.write(&val0, 0).unwrap();
+        mmap.write(&val1, 1).unwrap();
+
+        let r0 = mmap.read(0).unwrap();
+        let r1 = mmap.read(1).unwrap();
+
+        assert_eq!(r0.a, 10);
+        assert_eq!(r0.b, 20);
+        assert_eq!(r1.a, 100);
+        assert_eq!(r1.b, 200);
+    }
+
+    #[test]
+    fn err_write_read_out_of_bounds() {
+        let (_dir, cfg) = tmp_cfg();
+        let mmap = MemMap::<u64>::new(cfg).unwrap();
+
+        // INIT_T is 4, valid indices are 0..=3
+        let err_r = mmap.read(INIT_T).unwrap_err();
+        assert_eq!(err_r.reason, err::HCF.reason);
+
+        let err_w = mmap.write(&12345, INIT_T).unwrap_err();
+        assert_eq!(err_w.reason, err::HCF.reason);
+
+        let err_r_large = mmap.read(100).unwrap_err();
+        assert_eq!(err_r_large.reason, err::HCF.reason);
+
+        let err_w_large = mmap.write(&12345, 100).unwrap_err();
+        assert_eq!(err_w_large.reason, err::HCF.reason);
+    }
+
+    #[test]
+    fn err_write_read_overflow_index() {
+        let (_dir, cfg) = tmp_cfg();
+        let mmap = MemMap::<u64>::new(cfg).unwrap();
+
+        let err_r = mmap.read(usize::MAX).unwrap_err();
+        assert_eq!(err_r.reason, err::INV.reason);
+
+        let err_w = mmap.write(&12345, usize::MAX).unwrap_err();
+        assert_eq!(err_w.reason, err::INV.reason);
+    }
+
+    #[test]
+    fn ok_durability_across_reopen() {
+        let (_dir, cfg) = tmp_cfg();
+        {
+            let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
+            mmap.write(&0xCAFE_BABE_1234_5678, 1).unwrap();
+            mmap.file().sync().unwrap();
+        }
+
+        let reopened = MemMap::<u64>::open(cfg).unwrap();
+        assert_eq!(reopened.read(1).unwrap(), 0xCAFE_BABE_1234_5678);
     }
 }
