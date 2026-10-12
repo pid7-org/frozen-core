@@ -1,6 +1,32 @@
-//! NA
-
-#![allow(unused)]
+//! Memory-mapped typed slot storage with per-slot concurrency and epoch durability
+//!
+//! ## Example
+//!
+//! ```
+//! use frozen_core::memmap::{MemMap, MemMapCfg};
+//! use std::time::Duration;
+//!
+//! let dir = tempfile::tempdir().unwrap();
+//! let path = dir.path().join("memmap_demo.bin");
+//!
+//! let cfg = MemMapCfg {
+//!     module_id: 1,
+//!     path,
+//!     version: 1,
+//!     initial_t: 8,
+//!     sync_interval: Duration::from_millis(50),
+//! };
+//!
+//! let memmap = MemMap::<u64>::new(cfg).unwrap();
+//! assert_eq!(memmap.length(), 8 * std::mem::size_of::<u64>());
+//!
+//! let ticket = memmap.write(&0xDEAD_BEEF_CAFE_BABE, 0).unwrap();
+//! ticket.wait().unwrap();
+//! assert!(ticket.is_durable());
+//!
+//! assert_eq!(memmap.read(0).unwrap(), 0xDEAD_BEEF_CAFE_BABE);
+//! assert!(memmap.delete().is_ok());
+//! ```
 
 use crate::{
     ack::{AckTicket, Completion, SyncTrigger, TEpoch},
@@ -96,11 +122,6 @@ pub(in crate::memmap) mod err {
     }
 
     #[inline]
-    pub(in crate::memmap) fn make_error(code: ErrCode) -> FrozenError {
-        FrozenError::unbound(ERRDOMAIN, code, "")
-    }
-
-    #[inline]
     pub(in crate::memmap) fn make_raw_error<E: std::fmt::Display>(
         code: ErrCode,
         error: E,
@@ -136,17 +157,23 @@ pub struct MemMapCfg {
 
     /// Base path for/of the file
     ///
-    /// *NOTE:* The caller must make sure that the path represents a file and all the parent directories included
-    /// in the path do exist. The actual file created on disk is derived by appending the [`version`](Self::version)
-    /// to the base file name (e.g. `data.bin` with version `1` becomes `data_1.bin`).
+    /// ## Notes
+    ///
+    /// - The caller must make sure that the path represents a file and all the
+    ///   parent directories included in the path do exist
+    /// - The actual file created on disk is derived by appending the
+    ///   [`version`](Self::version) to the base file name (e.g. `data.bin`
+    ///   with version `1` becomes `data_1.bin`)
     pub path: std::path::PathBuf,
 
     /// Schema or layout version of the underlying memory-mapped file
     ///
     /// Because the binary layout on disk is constructed according to the initial type `T` and structural parameters,
-    /// [`MemMap`] strictly requires type invariants across a file's lifetime. When an application evolves its data
-    /// structures or migrates `T`, incrementing `version` ensures a new versioned backing file (`<name>_<ver>`) is
-    /// created on disk without corrupting or clashing with previously persisted data.
+    /// [`MemMap`] strictly requires type invariants across a file's lifetime
+    ///
+    /// When an application evolves its data structures or migrates `T`,
+    /// incrementing `version` ensures a new versioned backing file (`<name>_<ver>`) is
+    /// created on disk without corrupting or clashing with previously persisted data
     pub version: u32,
 
     /// Number of `T` elements to pre-allocate on fs when [`MemMap`] is initialized
@@ -161,9 +188,29 @@ pub struct MemMapCfg {
 }
 
 impl MemMapCfg {
-    /// Computes the versioned file path by appending `_{version}` to the file stem/name
+    /// Computes the versioned file path by appending `_{version}` to the base file stem
+    ///
+    /// Preserves file extension if present (e.g., `data.bin` with version `1` becomes `data_1.bin`)
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::memmap::MemMapCfg;
+    /// use std::path::PathBuf;
+    /// use std::time::Duration;
+    ///
+    /// let cfg = MemMapCfg {
+    ///     module_id: 1,
+    ///     path: PathBuf::from("store.db"),
+    ///     version: 3,
+    ///     initial_t: 10,
+    ///     sync_interval: Duration::from_millis(100),
+    /// };
+    ///
+    /// assert_eq!(cfg.versioned_path(), PathBuf::from("store_3.db"));
+    /// ```
     #[inline]
-    fn versioned_path(&self) -> std::path::PathBuf {
+    pub fn versioned_path(&self) -> std::path::PathBuf {
         let parent = self.path.parent();
         let stem = self.path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
         let extension = self.path.extension().and_then(|e| e.to_str());
@@ -199,6 +246,7 @@ impl SlotLocks {
         for _ in 0..total_slots {
             slots.push(atomic::AtomicU32::new(0));
         }
+
         Self { locks: slots.into_boxed_slice() }
     }
 
@@ -327,9 +375,7 @@ impl MemMapInner {
             return Ok(());
         }
 
-        // Two-phase flush: flush mapped pages from VM to file writeback, then sync file descriptor for durability
         let sync_res = mmap.sync(self.length);
-
         match sync_res {
             Ok(()) => {
                 self.completion.mark_epoch_as_durable(target_epoch);
@@ -349,7 +395,50 @@ impl MemMapInner {
     }
 }
 
-/// Custom memory-mapped file abstraction with background synchronization and durability tracking
+/// Custom memory-mapped typed array storage with slot-level locking and epoch durability
+///
+/// `MemMap<T>` maps an on-disk [`File`] into process virtual address space as a contiguous array
+/// of fixed-size slots of type `T`
+///
+/// It provides,
+///
+/// - **Slot Synchronization**: Per-slot reader-writer spinlocks (`SlotLocks`) protecting each index
+///   against concurrent write-write and read-write hazards with backoff spin/yield/sleep stages.
+/// - **Epoch Durability**: Monotonically advancing write epoch counter incremented on each mutation,
+///   tracked via [`AckTicket`] and synchronized in the background by a dedicated worker.
+/// - **Process Isolation**: Advisory kernel-level locking (`flock`/`LockFileEx`) ensuring exclusive
+///   file ownership by a single running instance.
+///
+/// ## Constraints
+///
+/// - `T` must be sized and cloneable (`T: Sized + Clone`)
+/// - `T` must be 8-byte aligned (`core::mem::align_of::<T>() == 8`)
+/// - `size_of::<T>()` must be non-zero, a multiple of 8, and must not exceed the host page size
+/// - `T` must not implement `Drop` (`!core::mem::needs_drop::<T>()`)
+/// - Type layout is immutable across file lifetime; schema changes require bumping [`MemMapCfg::version`]
+///
+/// ## Example
+///
+/// ```
+/// use frozen_core::memmap::{MemMap, MemMapCfg};
+/// use std::time::Duration;
+///
+/// let dir = tempfile::tempdir().unwrap();
+/// let cfg = MemMapCfg {
+///     module_id: 1,
+///     path: dir.path().join("storage.bin"),
+///     version: 1,
+///     initial_t: 4,
+///     sync_interval: Duration::from_millis(100),
+/// };
+///
+/// let memmap = MemMap::<u64>::new(cfg).unwrap();
+/// assert_eq!(memmap.length(), 4 * std::mem::size_of::<u64>());
+///
+/// let ticket = memmap.write(&12345u64, 0).unwrap();
+/// assert_eq!(memmap.read(0).unwrap(), 12345u64);
+/// assert!(memmap.delete().is_ok());
+/// ```
 pub struct MemMap<T: Sized + Clone> {
     cfg: MemMapCfg,
     file: Option<File>,
@@ -510,21 +599,17 @@ where
 
     /// Creates and memory-maps a new [`File`] at `cfg.versioned_path()`
     ///
-    /// *NOTE:* Returns an error if the file already exists on fs, use
-    /// [`MemMap::open`] to open an pre-existing file
+    /// Allocates an underlying file with capacity for `initial_t * size_of::<T>()` bytes,
+    /// acquires an exclusive advisory lock on the descriptor, establishes the memory mapping,
+    /// and spawns the background worker for periodic durability flushing
     ///
-    /// ## Type `T`
+    /// ## Constraints
     ///
-    /// The type `T` must never change across the entire lifetime of the file
-    ///
-    /// In case, `T` needs to be updated, use [`MemMapCfg::version`] to create a
-    /// new instace of [`MemMap`] to exists alongside the old one
-    ///
-    /// ## Kernal Lock
-    ///
-    /// Acquires an exclusive advisory lock on the underlying descriptor, to
-    /// prevent running two simultaneous instances alongside each other by the
-    /// same process
+    /// - Returns [`err::EXS`] if the versioned file already exists on the filesystem; Use
+    ///   [`MemMap::open`] or [`MemMap::open_or_create`] instead
+    /// - Returns [`err::PTH`] or [`err::DIR`] if the base path or its parent directory is invalid
+    /// - Enforces all structural type invariants for `T` (`align == 8`, `size % 8 == 0`, `size <= page_size`, no `Drop`)
+    /// - An exclusive advisory lock is acquired on creation; concurrent callers on the same file path fail
     ///
     /// ## Example
     ///
@@ -579,7 +664,18 @@ where
         Self::from_components(cfg, mmap, file)
     }
 
-    /// NA
+    /// Opens an existing memory-mapped [`File`] at `cfg.versioned_path()`
+    ///
+    /// Opens the underlying versioned file, verifies its length matches the requested layout,
+    /// acquires an exclusive advisory lock on the descriptor, maps its memory region, and
+    /// spawns the background flush worker
+    ///
+    /// ## Constraints
+    ///
+    /// - Returns [`err::NEX`] if the backing file does not exist on disk
+    /// - Returns [`err::PTH`] if the path resolves to a directory
+    /// - Fails with advisory lock error if another handle currently owns the exclusive lock
+    /// - Type `T` invariants must strictly match the binary layout originally written to the file
     ///
     /// ## Example
     ///
@@ -624,7 +720,17 @@ where
         Self::from_components(cfg, mmap, file)
     }
 
-    /// NA
+    /// Opens an existing memory-mapped [`File`] or creates a new one if it does not yet exist
+    ///
+    /// Idempotent entrypoint that transparently delegates to either open or creation semantics
+    /// based on filesystem presence, maintaining consistent advisory locking and background flushing
+    ///
+    /// ## Constraints
+    ///
+    /// - Returns [`err::PTH`] if the resolved path points to an existing directory
+    /// - Returns [`err::DIR`] if parent directory does not exist
+    /// - Fails if another handle currently owns the advisory lock on the target file
+    /// - All structural `T` invariants (`align`, `size`, `needs_drop`) are strictly validated
     ///
     /// ## Example
     ///
@@ -667,42 +773,196 @@ where
     }
 
     /// Returns the length of the memory mapping in bytes
+    ///
+    /// Corresponds to `initial_t * size_of::<T>()`
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::memmap::{MemMap, MemMapCfg};
+    /// use std::time::Duration;
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = MemMapCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().join("length_demo.bin"),
+    ///     version: 1,
+    ///     initial_t: 8,
+    ///     sync_interval: Duration::from_millis(100),
+    /// };
+    ///
+    /// let mmap = MemMap::<u64>::new(cfg).unwrap();
+    /// assert_eq!(mmap.length(), 8 * std::mem::size_of::<u64>());
+    /// ```
     #[inline]
     pub fn length(&self) -> usize {
         self.inner.length
     }
 
-    /// Get reference to configuration of [`MemMap`]
+    /// Returns a reference to the active [`MemMapCfg`] configuration
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::memmap::{MemMap, MemMapCfg};
+    /// use std::time::Duration;
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = MemMapCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().join("cfg_demo.bin"),
+    ///     version: 2,
+    ///     initial_t: 4,
+    ///     sync_interval: Duration::from_millis(100),
+    /// };
+    ///
+    /// let mmap = MemMap::<u64>::new(cfg).unwrap();
+    /// assert_eq!(mmap.cfg().version, 2);
+    /// assert_eq!(mmap.cfg().initial_t, 4);
+    /// ```
     #[inline]
     pub fn cfg(&self) -> &MemMapCfg {
         &self.cfg
     }
 
-    /// Get reference to underlying [`File`]
+    /// Returns a reference to the underlying [`File`] descriptor wrapper
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::memmap::{MemMap, MemMapCfg};
+    /// use std::time::Duration;
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = MemMapCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().join("file_demo.bin"),
+    ///     version: 1,
+    ///     initial_t: 4,
+    ///     sync_interval: Duration::from_millis(100),
+    /// };
+    ///
+    /// let mmap = MemMap::<u64>::new(cfg).unwrap();
+    /// assert_eq!(mmap.file().length(), 4 * std::mem::size_of::<u64>());
+    /// ```
     #[inline]
     pub fn file(&self) -> &File {
         self.file.as_ref().expect("file exists")
     }
 
     /// Fetch the latest assigned durability epoch
+    ///
+    /// The current epoch monotonically increments on each [`MemMap::write`] call.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::memmap::{MemMap, MemMapCfg};
+    /// use std::time::Duration;
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = MemMapCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().join("epoch_demo.bin"),
+    ///     version: 1,
+    ///     initial_t: 4,
+    ///     sync_interval: Duration::from_millis(100),
+    /// };
+    ///
+    /// let mmap = MemMap::<u64>::new(cfg).unwrap();
+    /// assert_eq!(mmap.current_epoch(), 0);
+    /// mmap.write(&999u64, 0).unwrap();
+    /// assert_eq!(mmap.current_epoch(), 1);
+    /// ```
     #[inline]
     pub fn current_epoch(&self) -> TEpoch {
         self.inner.completion.read_current_epoch()
     }
 
-    /// Fetch the latest durable epoch
+    /// Fetch the latest confirmed durable epoch flushed to persistent storage
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::memmap::{MemMap, MemMapCfg};
+    /// use std::time::Duration;
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = MemMapCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().join("durable_demo.bin"),
+    ///     version: 1,
+    ///     initial_t: 4,
+    ///     sync_interval: Duration::from_millis(100),
+    /// };
+    ///
+    /// let mmap = MemMap::<u64>::new(cfg).unwrap();
+    /// let ticket = mmap.write(&100u64, 0).unwrap();
+    /// mmap.sync().unwrap();
+    /// assert_eq!(mmap.durable_epoch(), ticket.epoch());
+    /// ```
     #[inline]
     pub fn durable_epoch(&self) -> TEpoch {
         self.inner.completion.read_durable_epoch()
     }
 
-    /// Fetch reference to underlying durability [`Completion`]
+    /// Fetch reference to underlying durability [`Completion`] controller
+    ///
+    /// Enables registration of custom wait queues or listeners for epoch completions.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::memmap::{MemMap, MemMapCfg};
+    /// use std::time::Duration;
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = MemMapCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().join("completion_demo.bin"),
+    ///     version: 1,
+    ///     initial_t: 4,
+    ///     sync_interval: Duration::from_millis(100),
+    /// };
+    ///
+    /// let mmap = MemMap::<u64>::new(cfg).unwrap();
+    /// assert_eq!(mmap.completion().read_current_epoch(), 0);
+    /// ```
     #[inline]
     pub fn completion(&self) -> &Arc<Completion> {
         &self.inner.completion
     }
 
     /// Synchronize dirty pages and file metadata to stable storage
+    ///
+    /// Performs a synchronous two-phase flush:
+    /// 1. Flushes modified virtual memory pages to host cache via [`PlatformMemMap::sync`].
+    /// 2. Advances the durable epoch to the current write epoch and awakens all pending listeners.
+    ///
+    /// Returns `Ok(())` immediately if no writes have occurred since the last sync.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::memmap::{MemMap, MemMapCfg};
+    /// use std::time::Duration;
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = MemMapCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().join("sync_demo.bin"),
+    ///     version: 1,
+    ///     initial_t: 4,
+    ///     sync_interval: Duration::from_secs(60),
+    /// };
+    ///
+    /// let mmap = MemMap::<u64>::new(cfg).unwrap();
+    /// let ticket = mmap.write(&0xCAFE_BABE, 1).unwrap();
+    /// assert!(!ticket.is_durable());
+    ///
+    /// mmap.sync().unwrap();
+    /// assert!(ticket.is_durable());
+    /// ```
     #[inline]
     pub fn sync(&self) -> FrozenResult<()> {
         self.inner.sync_internal()
@@ -820,7 +1080,38 @@ where
 
     /// Deletes the [`MemMap`] and underlying [`File`] entry from the storage device
     ///
-    /// Consumes `self` by value to release the memory mapping and unlink the file
+    /// Consumes `self` by value to release resources in deterministic order,
+    ///
+    /// - Signals the background flush worker to stop and waits for its thread join
+    /// - Unmaps the active memory mapping from virtual address space
+    /// - Closes and unlinks the backing versioned file from the filesystem
+    ///
+    /// ## Constraints
+    ///
+    /// - Consumes `self` by value; after deletion, the instance can no longer be accessed
+    /// - Returns [`err::INV`] if the underlying file handle was already released
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::memmap::{MemMap, MemMapCfg};
+    /// use std::time::Duration;
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = MemMapCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().join("delete_demo.bin"),
+    ///     version: 1,
+    ///     initial_t: 4,
+    ///     sync_interval: Duration::from_millis(100),
+    /// };
+    ///
+    /// let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
+    /// assert!(cfg.versioned_path().exists());
+    ///
+    /// mmap.delete().unwrap();
+    /// assert!(!cfg.versioned_path().exists());
+    /// ```
     pub fn delete(mut self) -> FrozenResult<()> {
         let mid = self.cfg.module_id;
         self.inner.shutdown.store(true, atomic::Ordering::Release);
@@ -949,7 +1240,6 @@ mod tests {
 
         let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
         assert_eq!(mmap.length(), core::mem::size_of::<u64>() * INIT_T);
-        assert_eq!(mmap.file().cfg().sync_interval, None);
         assert_eq!(mmap.cfg().sync_interval, Duration::from_millis(100));
     }
 
@@ -978,7 +1268,6 @@ mod tests {
 
         let opened = MemMap::<u64>::open(cfg).unwrap();
         assert_eq!(opened.length(), core::mem::size_of::<u64>() * INIT_T);
-        assert_eq!(opened.file().cfg().sync_interval, None);
     }
 
     #[test]
@@ -994,12 +1283,10 @@ mod tests {
         {
             let mmap = MemMap::<u64>::open_or_create(cfg.clone()).unwrap();
             assert_eq!(mmap.length(), core::mem::size_of::<u64>() * INIT_T);
-            assert_eq!(mmap.file().cfg().sync_interval, None);
         }
 
         let reopened = MemMap::<u64>::open_or_create(cfg).unwrap();
         assert_eq!(reopened.length(), core::mem::size_of::<u64>() * INIT_T);
-        assert_eq!(reopened.file().cfg().sync_interval, None);
     }
 
     #[test]
@@ -1316,7 +1603,7 @@ mod tests {
         {
             let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
             mmap.write(&0xCAFE_BABE_1234_5678, 1).unwrap();
-            mmap.sync().unwrap();
+            mmap.inner.sync_internal().unwrap();
         }
 
         let reopened = MemMap::<u64>::open(cfg).unwrap();
@@ -1369,21 +1656,6 @@ mod tests {
 
         let reopened = MemMap::<u64>::open(cfg).unwrap();
         assert_eq!(reopened.read(0).unwrap(), 0xBEEF_CAFE);
-    }
-
-    #[test]
-    fn ok_manual_sync_advances_durable_epoch() {
-        let (_dir, mut cfg) = tmp_cfg();
-        cfg.sync_interval = Duration::from_secs(60);
-
-        let mmap = MemMap::<u64>::new(cfg).unwrap();
-        let ticket = mmap.write(&0x9999, 1).unwrap();
-        assert_eq!(mmap.current_epoch(), 1);
-        assert_eq!(mmap.durable_epoch(), 0);
-
-        mmap.sync().unwrap();
-        assert!(ticket.is_durable());
-        assert_eq!(mmap.durable_epoch(), 1);
     }
 
     #[test]
@@ -1627,7 +1899,7 @@ mod tests {
             h.join().unwrap();
         }
 
-        assert!(mmap.sync().is_ok());
+        assert!(mmap.inner.sync_internal().is_ok());
     }
 
     #[test]
@@ -1662,7 +1934,7 @@ mod tests {
             h.join().unwrap();
         }
 
-        assert!(mmap.durable_epoch() >= mmap.current_epoch());
+        assert!(mmap.durable_epoch() >= mmap.inner.completion.read_current_epoch());
     }
 
     #[test]

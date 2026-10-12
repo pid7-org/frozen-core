@@ -32,6 +32,7 @@ pub(in crate::memmap) trait MemMapInterface: Sized + Send + Sync {
     /// Inspects the resident set status of each page in the mapped range
     ///
     /// A page index `i` is included if the corresponding page is present in physical memory
+    #[allow(unused)]
     fn active_page_indices(&self) -> FrozenResult<Vec<usize>>;
 
     /// Evicts selected memory pages from physical memory
@@ -46,6 +47,7 @@ pub(in crate::memmap) trait MemMapInterface: Sized + Send + Sync {
     /// Duplicate page indices are deduplicated
     ///
     /// If `indices` is empty, this operation is a safe no-op
+    #[allow(unused)]
     fn evict_pages(&self, indices: &[usize]) -> FrozenResult<()>;
 
     /// Syncs in-cache data updates on the storage device

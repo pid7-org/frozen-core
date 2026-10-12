@@ -404,6 +404,7 @@ fn msync_raw(ptr: TPtr, length: size_t) -> FrozenResult<()> {
 }
 
 /// Advises the kernel to discard/evict mapped pages w/ `madvise(MADV_DONTNEED)`
+#[allow(unused)]
 fn madvise_raw(ptr: *mut c_void, length: size_t) -> FrozenResult<()> {
     if hints::unlikely(ptr.is_null()) {
         return raw_error(err::NMM, "cannot advise unmapped null pointer");
@@ -505,10 +506,8 @@ mod tests {
 
         #[test]
         fn ok_err_msg() {
-            unsafe {
-                let msg = err_msg(libc::ENOENT);
-                assert!(!msg.is_empty(), "ENOENT must produce message");
-            }
+            let msg = err_msg(libc::ENOENT);
+            assert!(!msg.is_empty(), "ENOENT must produce message");
         }
     }
 
@@ -646,13 +645,12 @@ mod tests {
         #[test]
         fn ok_active_pages_consecutive_consistency() {
             let (_dir, file, total_len) = new_paged_tmp(2);
-            unsafe {
-                let mmap = POSIXMemMap::new(file.fd(), total_len).unwrap();
-                let first = mmap.active_page_indices().unwrap();
-                let second = mmap.active_page_indices().unwrap();
-                assert_eq!(first, second);
-                mmap.unmap().unwrap();
-            }
+
+            let mmap = POSIXMemMap::new(file.fd(), total_len).unwrap();
+            let first = mmap.active_page_indices().unwrap();
+            let second = mmap.active_page_indices().unwrap();
+            assert_eq!(first, second);
+            mmap.unmap().unwrap();
         }
     }
 
@@ -680,11 +678,10 @@ mod tests {
         #[test]
         fn ok_evict_empty_indices() {
             let (_dir, file, total_len) = new_paged_tmp(2);
-            unsafe {
-                let mmap = POSIXMemMap::new(file.fd(), total_len).unwrap();
-                assert!(mmap.evict_pages(&[]).is_ok());
-                mmap.unmap().unwrap();
-            }
+
+            let mmap = POSIXMemMap::new(file.fd(), total_len).unwrap();
+            assert!(mmap.evict_pages(&[]).is_ok());
+            mmap.unmap().unwrap();
         }
 
         #[test]
@@ -765,16 +762,15 @@ mod tests {
         #[test]
         fn err_evict_out_of_bounds() {
             let (_dir, file, total_len) = new_paged_tmp(2);
-            unsafe {
-                let mmap = POSIXMemMap::new(file.fd(), total_len).unwrap();
-                let err = mmap.evict_pages(&[2]).unwrap_err();
-                assert_eq!(err.reason, err::HCF.reason);
 
-                let err_large = mmap.evict_pages(&[100]).unwrap_err();
-                assert_eq!(err_large.reason, err::HCF.reason);
+            let mmap = POSIXMemMap::new(file.fd(), total_len).unwrap();
+            let err = mmap.evict_pages(&[2]).unwrap_err();
+            assert_eq!(err.reason, err::HCF.reason);
 
-                mmap.unmap().unwrap();
-            }
+            let err_large = mmap.evict_pages(&[100]).unwrap_err();
+            assert_eq!(err_large.reason, err::HCF.reason);
+
+            mmap.unmap().unwrap();
         }
 
         #[test]
@@ -817,10 +813,8 @@ mod tests {
         fn ok_map_unmap_cycle() {
             let (_dir, file) = new_tmp();
 
-            unsafe {
-                let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
-                mmap.unmap().unwrap();
-            }
+            let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
+            mmap.unmap().unwrap();
         }
 
         #[test]
@@ -842,10 +836,8 @@ mod tests {
         fn ok_unmap_consumes_self() {
             let (_dir, file) = new_tmp();
 
-            unsafe {
-                let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
-                assert!(mmap.unmap().is_ok());
-            }
+            let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
+            assert!(mmap.unmap().is_ok());
         }
 
         #[test]
@@ -871,19 +863,17 @@ mod tests {
         #[test]
         fn err_map_on_invalid_length() {
             let (_dir, file) = new_tmp();
-            unsafe {
-                let err = POSIXMemMap::new(file.fd(), 0).unwrap_err();
-                assert_eq!(err.reason, err::HCF.reason);
-            }
+
+            let err = POSIXMemMap::new(file.fd(), 0).unwrap_err();
+            assert_eq!(err.reason, err::HCF.reason);
         }
 
         #[test]
         fn err_map_on_invalid_fd() {
             let (_dir, _) = new_tmp();
-            unsafe {
-                let err = POSIXMemMap::new(-1, LENGTH).unwrap_err();
-                assert_eq!(err.reason, err::HCF.reason);
-            }
+
+            let err = POSIXMemMap::new(-1, LENGTH).unwrap_err();
+            assert_eq!(err.reason, err::HCF.reason);
         }
 
         #[test]
@@ -923,38 +913,32 @@ mod tests {
         fn ok_sync() {
             let (_dir, file) = new_tmp();
 
-            unsafe {
-                let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
-                mmap.sync(LENGTH).unwrap();
-                mmap.unmap().unwrap();
-            }
+            let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
+            mmap.sync(LENGTH).unwrap();
+            mmap.unmap().unwrap();
         }
 
         #[test]
         fn ok_sync_after_sync() {
             let (_dir, file) = new_tmp();
 
-            unsafe {
-                let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
+            let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
 
-                mmap.sync(LENGTH).unwrap();
-                mmap.sync(LENGTH).unwrap();
-                mmap.sync(LENGTH).unwrap();
-                mmap.sync(LENGTH).unwrap();
+            mmap.sync(LENGTH).unwrap();
+            mmap.sync(LENGTH).unwrap();
+            mmap.sync(LENGTH).unwrap();
+            mmap.sync(LENGTH).unwrap();
 
-                mmap.unmap().unwrap();
-            }
+            mmap.unmap().unwrap();
         }
 
         #[test]
         fn ok_sync_zero_length() {
             let (_dir, file) = new_tmp();
 
-            unsafe {
-                let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
-                assert!(mmap.sync(0).is_ok());
-                mmap.unmap().unwrap();
-            }
+            let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
+            assert!(mmap.sync(0).is_ok());
+            mmap.unmap().unwrap();
         }
 
         #[test]
@@ -1221,11 +1205,10 @@ mod tests {
         #[test]
         fn ok_explicit_unmap_prevents_drop_double_unmap() {
             let (_dir, file) = new_tmp();
-            unsafe {
-                let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
-                assert!(mmap.unmap().is_ok());
-                // explicit unmap consumed mmap; drop should be a safe no-op without double-unmap
-            }
+
+            let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
+            assert!(mmap.unmap().is_ok());
+            // explicit unmap consumed mmap; drop should be a safe no-op without double-unmap
         }
 
         #[test]
