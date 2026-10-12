@@ -180,11 +180,119 @@ impl MemMapCfg {
     }
 }
 
+/// Bitmask for exclusive writer flag in [`SlotLocks`]
+const WRITER_BIT: u32 = 0x8000_0000;
+
+/// Contention spin thresholds for slot locking backoff
+const L1_CONTENTION: usize = 0x10;
+const L2_CONTENTION: usize = 0x20;
+
+/// Table of reader-writer spinlocks per slot for memory-mapped items
+#[derive(Debug)]
+struct SlotLocks {
+    locks: Box<[atomic::AtomicU32]>,
+}
+
+impl SlotLocks {
+    fn new(total_slots: usize) -> Self {
+        let mut slots = Vec::with_capacity(total_slots);
+        for _ in 0..total_slots {
+            slots.push(atomic::AtomicU32::new(0));
+        }
+        Self { locks: slots.into_boxed_slice() }
+    }
+
+    #[inline(always)]
+    fn read_lock(&self, index: usize) -> SlotReadGuard<'_> {
+        let val = &self.locks[index];
+        let mut spins = 0;
+
+        loop {
+            let state = val.load(atomic::Ordering::Relaxed);
+            if hints::likely(state & WRITER_BIT == 0)
+                && val
+                    .compare_exchange_weak(
+                        state,
+                        state + 1,
+                        atomic::Ordering::Acquire,
+                        atomic::Ordering::Relaxed,
+                    )
+                    .is_ok()
+            {
+                return SlotReadGuard(val);
+            }
+
+            if hints::likely(spins < L1_CONTENTION) {
+                std::hint::spin_loop();
+            } else if spins < L2_CONTENTION {
+                std::thread::yield_now();
+            } else {
+                let ns = 0x30 << (spins - L2_CONTENTION).min(0x0A);
+                std::thread::sleep(std::time::Duration::from_nanos(ns));
+            }
+
+            spins += 1;
+        }
+    }
+
+    #[inline(always)]
+    fn write_lock(&self, index: usize) -> SlotWriteGuard<'_> {
+        let val = &self.locks[index];
+        let mut spins = 0;
+
+        loop {
+            if val
+                .compare_exchange_weak(
+                    0,
+                    WRITER_BIT,
+                    atomic::Ordering::Acquire,
+                    atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                return SlotWriteGuard(val);
+            }
+
+            if hints::likely(spins < L1_CONTENTION) {
+                std::hint::spin_loop();
+            } else if spins < L2_CONTENTION {
+                std::thread::yield_now();
+            } else {
+                let ns = 0x30 << (spins - L2_CONTENTION).min(0x0A);
+                std::thread::sleep(std::time::Duration::from_nanos(ns));
+            }
+
+            spins += 1;
+        }
+    }
+}
+
+/// RAII read guard for a slot lock
+struct SlotReadGuard<'a>(&'a atomic::AtomicU32);
+
+impl Drop for SlotReadGuard<'_> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, atomic::Ordering::Release);
+    }
+}
+
+/// RAII write guard for a slot lock
+struct SlotWriteGuard<'a>(&'a atomic::AtomicU32);
+
+impl Drop for SlotWriteGuard<'_> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        self.0.store(0, atomic::Ordering::Release);
+    }
+}
+
 /// Internal shared state for [`MemMap`]
 #[derive(Debug)]
 struct MemMapInner {
     cfg: MemMapCfg,
     mmap: RwLock<Option<PlatformMemMap>>,
+    slot_locks: SlotLocks,
     length: usize,
     completion: Arc<Completion>,
     sync_condvar: Condvar,
@@ -332,10 +440,13 @@ where
         let length = mmap.length();
         let completion = Arc::new(Completion::default());
         let sync_interval = cfg.sync_interval;
+        let total_slots = length / core::mem::size_of::<T>();
+        let slot_locks = SlotLocks::new(total_slots);
 
         let inner = Arc::new(MemMapInner {
             cfg: cfg.clone(),
             mmap: RwLock::new(Some(mmap)),
+            slot_locks,
             length,
             completion: completion.clone(),
             sync_condvar: Condvar::new(),
@@ -637,6 +748,8 @@ where
             return err::default_error(err::HCF).with_module(mid);
         }
 
+        let _slot_guard = self.inner.slot_locks.read_lock(index);
+
         let guard = self.inner.mmap.read().unwrap_or_else(|e| e.into_inner());
         let mmap = match guard.as_ref() {
             Some(m) => m,
@@ -689,6 +802,8 @@ where
         if hints::unlikely(offset.checked_add(size).is_none_or(|end| end > self.length())) {
             return err::default_error(err::HCF).with_module(mid);
         }
+
+        let _slot_guard = self.inner.slot_locks.write_lock(index);
 
         let guard = self.inner.mmap.read().unwrap_or_else(|e| e.into_inner());
         let mmap = match guard.as_ref() {
@@ -1269,5 +1384,65 @@ mod tests {
         mmap.sync().unwrap();
         assert!(ticket.is_durable());
         assert_eq!(mmap.durable_epoch(), 1);
+    }
+
+    #[test]
+    fn ok_concurrent_slot_locking() {
+        let (_dir, mut cfg) = tmp_cfg();
+        cfg.initial_t = 8;
+        cfg.sync_interval = Duration::from_secs(60);
+
+        let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let mut handles = Vec::new();
+
+        // 4 writer threads, each writing to index 0 repeatedly
+        for t in 0..4 {
+            let mmap_clone = Arc::clone(&mmap);
+            let barrier_clone = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier_clone.wait();
+                for i in 0..500 {
+                    let val = ((t + 1) as u64) << 32 | (i as u64);
+                    let _ = mmap_clone.write(&val, 0).unwrap();
+                }
+            }));
+        }
+
+        // 4 reader threads, reading from index 0 repeatedly
+        for _ in 0..4 {
+            let mmap_clone = Arc::clone(&mmap);
+            let barrier_clone = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier_clone.wait();
+                for _ in 0..1000 {
+                    let val = mmap_clone.read(0).unwrap();
+                    let thread_id = (val >> 32) as usize;
+                    assert!(thread_id <= 4, "read value must be valid without torn reads");
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Parallel reads across different and same indices
+        let barrier2 = Arc::new(std::sync::Barrier::new(4));
+        let mut read_handles = Vec::new();
+        for _ in 0..4 {
+            let mmap_clone = Arc::clone(&mmap);
+            let barrier_clone = Arc::clone(&barrier2);
+            read_handles.push(std::thread::spawn(move || {
+                barrier_clone.wait();
+                for _ in 0..500 {
+                    let _ = mmap_clone.read(0).unwrap();
+                }
+            }));
+        }
+
+        for h in read_handles {
+            h.join().unwrap();
+        }
     }
 }
