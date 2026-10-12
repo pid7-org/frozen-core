@@ -1445,4 +1445,286 @@ mod tests {
             h.join().unwrap();
         }
     }
+
+    #[test]
+    fn err_concurrent_new_same_path() {
+        let (_dir, cfg) = tmp_cfg();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        let t1 = {
+            let cfg = cfg.clone();
+            let b = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                b.wait();
+                MemMap::<u64>::new(cfg)
+            })
+        };
+
+        let t2 = {
+            let b = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                b.wait();
+                MemMap::<u64>::new(cfg)
+            })
+        };
+
+        let r1 = t1.join().unwrap();
+        let r2 = t2.join().unwrap();
+
+        match (r1, r2) {
+            (Ok(m), Err(e)) | (Err(e), Ok(m)) => {
+                assert_eq!(e.reason, err::EXS.reason);
+                assert!(m.delete().is_ok());
+            }
+            (Ok(_), Ok(_)) => {
+                panic!("Concurrent MemMap::new on identical path must not both succeed");
+            }
+            (Err(e1), Err(e2)) => {
+                panic!("Unexpected error on both threads: {:?}, {:?}", e1, e2);
+            }
+        }
+    }
+
+    #[test]
+    fn err_concurrent_open_same_path() {
+        let (_dir, cfg) = tmp_cfg();
+        {
+            let m = MemMap::<u64>::new(cfg.clone()).unwrap();
+            assert_eq!(m.length(), core::mem::size_of::<u64>() * INIT_T);
+        }
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        let t1 = {
+            let cfg = cfg.clone();
+            let b = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                b.wait();
+                MemMap::<u64>::open(cfg)
+            })
+        };
+
+        let t2 = {
+            let b = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                b.wait();
+                MemMap::<u64>::open(cfg)
+            })
+        };
+
+        let r1 = t1.join().unwrap();
+        let r2 = t2.join().unwrap();
+
+        match (r1, r2) {
+            (Ok(m), Err(e)) | (Err(e), Ok(m)) => {
+                assert_eq!(e.domain, 0x08, "Error domain must be File (0x08)");
+                assert_eq!(
+                    e.reason, 0x1C,
+                    "Concurrent open should yield LCK (0x1C) from kernel flock: {:?}",
+                    e
+                );
+                assert!(m.delete().is_ok());
+            }
+            (Ok(_), Ok(_)) => {
+                panic!("Exclusive advisory lock violation: both concurrent open calls succeeded");
+            }
+            (Err(e1), Err(e2)) => {
+                panic!("Unexpected failure of both threads: {:?}, {:?}", e1, e2);
+            }
+        }
+    }
+
+    #[test]
+    fn ok_reopen_after_drop_releases_lock() {
+        let (_dir, cfg) = tmp_cfg();
+        let m1 = MemMap::<u64>::new(cfg.clone()).unwrap();
+        m1.write(&0x1122_3344, 0).unwrap();
+        drop(m1);
+
+        let m2 = MemMap::<u64>::open(cfg).unwrap();
+        assert_eq!(m2.read(0).unwrap(), 0x1122_3344);
+        assert!(m2.delete().is_ok());
+    }
+
+    #[test]
+    fn ok_delete_and_recreate_cycle() {
+        let (_dir, cfg) = tmp_cfg();
+        for i in 0..4 {
+            let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
+            let val = (i as u64 + 1) * 0xAA55;
+            mmap.write(&val, 0).unwrap();
+            assert_eq!(mmap.read(0).unwrap(), val);
+            assert!(mmap.delete().is_ok());
+            assert!(!cfg.versioned_path().exists());
+        }
+    }
+
+    #[test]
+    fn ok_concurrent_distinct_slots_no_contention() {
+        let (_dir, mut cfg) = tmp_cfg();
+        const THREADS: usize = 8;
+        cfg.initial_t = THREADS;
+        cfg.sync_interval = Duration::from_secs(60);
+
+        let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+        let mut handles = Vec::with_capacity(THREADS);
+
+        for t in 0..THREADS {
+            let mmap_clone = Arc::clone(&mmap);
+            let barrier_clone = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier_clone.wait();
+                for i in 0..1000 {
+                    let val = (t as u64) << 32 | (i as u64);
+                    let _ = mmap_clone.write(&val, t).unwrap();
+                    let read_val = mmap_clone.read(t).unwrap();
+                    assert_eq!(read_val >> 32, t as u64);
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        for t in 0..THREADS {
+            let val = mmap.read(t).unwrap();
+            assert_eq!(val >> 32, t as u64);
+        }
+    }
+
+    #[test]
+    fn ok_stress_interleaved_reads_writes() {
+        let (_dir, mut cfg) = tmp_cfg();
+        const NUM_SLOTS: usize = 16;
+        const NUM_THREADS: usize = 8;
+        cfg.initial_t = NUM_SLOTS;
+        cfg.sync_interval = Duration::from_millis(50);
+
+        let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
+        let barrier = Arc::new(std::sync::Barrier::new(NUM_THREADS));
+        let mut handles = Vec::with_capacity(NUM_THREADS);
+
+        for t in 0..NUM_THREADS {
+            let mmap_clone = Arc::clone(&mmap);
+            let barrier_clone = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier_clone.wait();
+                for i in 0..1500 {
+                    let slot = (t + i) % NUM_SLOTS;
+                    if i % 2 == 0 {
+                        let val = ((t + 1) as u64) << 32 | (i as u64);
+                        let _ = mmap_clone.write(&val, slot).unwrap();
+                    } else {
+                        let _ = mmap_clone.read(slot).unwrap();
+                    }
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert!(mmap.sync().is_ok());
+    }
+
+    #[test]
+    fn ok_concurrent_writers_with_background_sync() {
+        let (_dir, mut cfg) = tmp_cfg();
+        cfg.initial_t = 8;
+        cfg.sync_interval = Duration::from_millis(5);
+
+        let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let mut handles = Vec::new();
+
+        for t in 0..4 {
+            let mmap_clone = Arc::clone(&mmap);
+            let barrier_clone = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier_clone.wait();
+                let mut tickets = Vec::with_capacity(50);
+                for i in 0..50 {
+                    let val = (t as u64) * 1000 + i as u64;
+                    tickets.push(mmap_clone.write(&val, t).unwrap());
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                for ticket in tickets {
+                    let _ = ticket.wait().unwrap();
+                    assert!(ticket.is_durable());
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert!(mmap.durable_epoch() >= mmap.current_epoch());
+    }
+
+    #[test]
+    fn ok_concurrent_ticket_force_stress() {
+        let (_dir, mut cfg) = tmp_cfg();
+        cfg.initial_t = 8;
+        cfg.sync_interval = Duration::from_secs(30);
+
+        let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let mut handles = Vec::new();
+
+        for t in 0..4 {
+            let mmap_clone = Arc::clone(&mmap);
+            let barrier_clone = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier_clone.wait();
+                for i in 0..20 {
+                    let val = (t as u64) * 100 + i as u64;
+                    let ticket = mmap_clone.write(&val, t).unwrap();
+                    let durable_epoch = ticket.force().unwrap();
+                    assert!(ticket.is_durable());
+                    assert!(durable_epoch >= ticket.epoch());
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn ok_exact_boundary_indices() {
+        let (_dir, cfg) = tmp_cfg();
+        let mmap = MemMap::<u64>::new(cfg).unwrap();
+
+        // Valid boundary: INIT_T - 1
+        assert!(mmap.write(&0xF00D, INIT_T - 1).is_ok());
+        assert_eq!(mmap.read(INIT_T - 1).unwrap(), 0xF00D);
+
+        // Invalid boundary: INIT_T
+        assert_eq!(mmap.write(&0xBAD, INIT_T).unwrap_err().reason, err::HCF.reason);
+        assert_eq!(mmap.read(INIT_T).unwrap_err().reason, err::HCF.reason);
+    }
+
+    #[test]
+    fn ok_large_slot_count_initialization() {
+        let (_dir, mut cfg) = tmp_cfg();
+        const LARGE_COUNT: usize = 10_000;
+        cfg.initial_t = LARGE_COUNT;
+
+        let mmap = MemMap::<u64>::new(cfg).unwrap();
+        assert_eq!(mmap.length(), LARGE_COUNT * core::mem::size_of::<u64>());
+
+        // First, middle, last
+        assert!(mmap.write(&1, 0).is_ok());
+        assert!(mmap.write(&5000, 5000).is_ok());
+        assert!(mmap.write(&9999, LARGE_COUNT - 1).is_ok());
+
+        assert_eq!(mmap.read(0).unwrap(), 1);
+        assert_eq!(mmap.read(5000).unwrap(), 5000);
+        assert_eq!(mmap.read(LARGE_COUNT - 1).unwrap(), 9999);
+    }
 }
