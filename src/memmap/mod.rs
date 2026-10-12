@@ -99,16 +99,18 @@ pub(in crate::memmap) mod err {
 /// ## Example
 ///
 /// ```
-/// use frozen_core::memmap::MemMapCfg
+/// use frozen_core::memmap::MemMapCfg;
 /// use std::time::Duration;
 ///
 /// let cfg = MemMapCfg {
 ///     module_id: 1,
 ///     path: std::path::PathBuf::from("test.db"),
+///     version: 1,
 ///     initial_t: 0x10,
 ///     sync_interval: Some(Duration::from_millis(0x64)),
 /// };
 ///
+/// assert_eq!(cfg.version, 1);
 /// assert_eq!(cfg.initial_t, 0x10);
 /// assert_eq!(cfg.sync_interval, Some(Duration::from_millis(0x64)));
 /// ```
@@ -117,11 +119,20 @@ pub struct MemMapCfg {
     /// Identifier used while error propagation
     pub module_id: u8,
 
-    /// Absolute path for/of the file
+    /// Base path for/of the file
     ///
     /// *NOTE:* The caller must make sure that the path represents a file and all the parent directories included
-    /// in the path do exists
+    /// in the path do exist. The actual file created on disk is derived by appending the [`version`](Self::version)
+    /// to the base file name (e.g. `data.bin` with version `1` becomes `data_1.bin`).
     pub path: std::path::PathBuf,
+
+    /// Schema or layout version of the underlying memory-mapped file
+    ///
+    /// Because the binary layout on disk is constructed according to the initial type `T` and structural parameters,
+    /// [`MemMap`] strictly requires type invariants across a file's lifetime. When an application evolves its data
+    /// structures or migrates `T`, incrementing `version` ensures a new versioned backing file (`<name>_<ver>`) is
+    /// created on disk without corrupting or clashing with previously persisted data.
+    pub version: u32,
 
     /// Number of `T` elements to pre-allocate on fs when [`MemMap`] is initialized
     ///
@@ -133,6 +144,30 @@ pub struct MemMapCfg {
     /// If `Some(duration)`, a background worker thread is spawned which flushes dirty pages at this interval; and
     /// if `None`, background sync is disabled and durability advances via manual sync
     pub sync_interval: Option<std::time::Duration>,
+}
+
+impl MemMapCfg {
+    /// Computes the versioned file path by appending `_{version}` to the file stem/name
+    ///
+    /// For example:
+    /// - `PathBuf::from("/tmp/store.db")` with `version: 1` -> `/tmp/store_1.db`
+    /// - `PathBuf::from("/tmp/store")` with `version: 2` -> `/tmp/store_2`
+    #[inline]
+    pub fn versioned_path(&self) -> std::path::PathBuf {
+        let parent = self.path.parent();
+        let stem = self.path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let extension = self.path.extension().and_then(|e| e.to_str());
+
+        let versioned_filename = match extension {
+            Some(ext) if !ext.is_empty() => format!("{}_{}.{}", stem, self.version, ext),
+            _ => format!("{}_{}", stem, self.version),
+        };
+
+        match parent {
+            Some(p) if !p.as_os_str().is_empty() => p.join(versioned_filename),
+            _ => std::path::PathBuf::from(versioned_filename),
+        }
+    }
 }
 
 /// Custom memory-mapped file implementation managing an underlying [`File`]
@@ -199,14 +234,14 @@ impl<T> MemMap<T> {
     fn file_cfg(cfg: &MemMapCfg) -> FileCfg {
         FileCfg {
             module_id: cfg.module_id,
-            path: cfg.path.clone(),
+            path: cfg.versioned_path(),
             buffer_size: core::mem::size_of::<T>(),
             initial_available_buffers: cfg.initial_t,
             sync_interval: None,
         }
     }
 
-    /// Creates and memory-maps a new [`File`] at `cfg.path`
+    /// Creates and memory-maps a new [`File`] at `cfg.versioned_path()`
     ///
     /// ## Invariant: Constant Type `T`
     ///
@@ -236,6 +271,7 @@ impl<T> MemMap<T> {
     /// let cfg = MemMapCfg {
     ///     module_id: 1,
     ///     path: dir.path().join("new_memmap.bin"),
+    ///     version: 1,
     ///     initial_t: 4,
     ///     sync_interval: None,
     /// };
@@ -287,6 +323,7 @@ impl<T> MemMap<T> {
     /// let cfg = MemMapCfg {
     ///     module_id: 1,
     ///     path: dir.path().join("open_memmap.bin"),
+    ///     version: 1,
     ///     initial_t: 4,
     ///     sync_interval: None,
     /// };
@@ -332,6 +369,7 @@ impl<T> MemMap<T> {
     /// let cfg = MemMapCfg {
     ///     module_id: 1,
     ///     path: dir.path().join("open_or_create_memmap.bin"),
+    ///     version: 1,
     ///     initial_t: 2,
     ///     sync_interval: None,
     /// };
@@ -437,6 +475,7 @@ mod tests {
         let cfg = MemMapCfg {
             module_id: MID,
             path,
+            version: 1,
             initial_t: INIT_T,
             sync_interval: Some(Duration::from_millis(100)),
         };
@@ -481,7 +520,7 @@ mod tests {
     fn err_new_when_t_invalid() {
         let (_dir, cfg) = tmp_cfg();
         assert_eq!(MemMap::<DropT>::new(cfg.clone()).unwrap_err().reason, err::DRP.reason);
-        assert!(!cfg.path.exists());
+        assert!(!cfg.versioned_path().exists());
     }
 
     #[test]
@@ -520,10 +559,50 @@ mod tests {
     #[test]
     fn ok_delete() {
         let (_dir, cfg) = tmp_cfg();
-        let path = cfg.path.clone();
+        let path = cfg.versioned_path();
         let mmap = MemMap::<u64>::new(cfg).unwrap();
         assert!(path.exists());
         assert!(mmap.delete().is_ok());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn ok_versioned_path_and_multiversion() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_path = dir.path().join("store.dat");
+
+        let cfg_v1 = MemMapCfg {
+            module_id: MID,
+            path: base_path.clone(),
+            version: 1,
+            initial_t: 2,
+            sync_interval: None,
+        };
+        assert_eq!(cfg_v1.versioned_path(), dir.path().join("store_1.dat"));
+
+        let cfg_v2 = MemMapCfg {
+            module_id: MID,
+            path: base_path.clone(),
+            version: 2,
+            initial_t: 4,
+            sync_interval: None,
+        };
+        assert_eq!(cfg_v2.versioned_path(), dir.path().join("store_2.dat"));
+
+        // Both versions can coexist independently on disk
+        let mmap_v1 = MemMap::<u64>::new(cfg_v1.clone()).unwrap();
+        let mmap_v2 = MemMap::<ValidT>::new(cfg_v2.clone()).unwrap();
+
+        assert!(cfg_v1.versioned_path().exists());
+        assert!(cfg_v2.versioned_path().exists());
+        assert_eq!(mmap_v1.length(), core::mem::size_of::<u64>() * 2);
+        assert_eq!(mmap_v2.length(), core::mem::size_of::<ValidT>() * 4);
+
+        assert!(mmap_v1.delete().is_ok());
+        assert!(!cfg_v1.versioned_path().exists());
+        assert!(cfg_v2.versioned_path().exists());
+
+        assert!(mmap_v2.delete().is_ok());
+        assert!(!cfg_v2.versioned_path().exists());
     }
 }
