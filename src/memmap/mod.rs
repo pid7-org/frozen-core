@@ -65,6 +65,18 @@ pub(in crate::memmap) mod err {
     pub const INV: ErrCode =
         ErrCode::new(0x18, "`size_of::<T>()` must not exceed system page size");
 
+    /// parent directory does not exist
+    pub const DIR: ErrCode = ErrCode::new(0x1A, "directory does not exist");
+
+    /// invalid path to file
+    pub const PTH: ErrCode = ErrCode::new(0x1C, "invalid path to file");
+
+    /// file already exists
+    pub const EXS: ErrCode = ErrCode::new(0x1E, "file already exists");
+
+    /// file does not exist
+    pub const NEX: ErrCode = ErrCode::new(0x20, "file does not exist");
+
     #[inline]
     pub(in crate::memmap) fn raw_error<R, E: std::fmt::Display>(
         code: ErrCode,
@@ -148,12 +160,8 @@ pub struct MemMapCfg {
 
 impl MemMapCfg {
     /// Computes the versioned file path by appending `_{version}` to the file stem/name
-    ///
-    /// For example:
-    /// - `PathBuf::from("/tmp/store.db")` with `version: 1` -> `/tmp/store_1.db`
-    /// - `PathBuf::from("/tmp/store")` with `version: 2` -> `/tmp/store_2`
     #[inline]
-    pub fn versioned_path(&self) -> std::path::PathBuf {
+    fn versioned_path(&self) -> std::path::PathBuf {
         let parent = self.path.parent();
         let stem = self.path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
         let extension = self.path.extension().and_then(|e| e.to_str());
@@ -170,27 +178,18 @@ impl MemMapCfg {
     }
 }
 
-/// Custom memory-mapped file implementation managing an underlying [`File`]
-///
-/// ## Invariant: Constant Type `T` Across File Lifetime
-///
-/// The type `T` must never change across [`new`](MemMap::new), [`open`](MemMap::open), or
-/// [`open_or_create`](MemMap::open_or_create) operations for the same underlying file
-///
-/// It should remain a constant type for the entire lifetime of the file
-///
-/// `core::mem::size_of::<T>()` is used as the internal buffer addressing unit
-///
-/// There are deliberately no runtime metadata safeguards or header checks to enforce this invariant;
-/// upholding type consistency is left entirely to caller discipline as documented
-pub struct MemMap<T> {
+/// NA
+pub struct MemMap<T: Sized + Clone> {
     cfg: MemMapCfg,
     mmap: PlatformMemMap,
     file: File,
     _marker: PhantomData<T>,
 }
 
-impl<T> core::fmt::Debug for MemMap<T> {
+impl<T> core::fmt::Debug for MemMap<T>
+where
+    T: Sized + Clone,
+{
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("MemMap")
             .field("cfg", &self.cfg)
@@ -200,10 +199,12 @@ impl<T> core::fmt::Debug for MemMap<T> {
     }
 }
 
-unsafe impl<T> Send for MemMap<T> {}
-unsafe impl<T> Sync for MemMap<T> {}
+unsafe impl<T> Send for MemMap<T> where T: Sized + Clone {}
 
-impl<T> MemMap<T> {
+impl<T> MemMap<T>
+where
+    T: Sized + Clone,
+{
     fn validate_t(mid: u8) -> FrozenResult<()> {
         if core::mem::needs_drop::<T>() {
             return err::default_error(err::DRP).with_module(mid);
@@ -231,6 +232,31 @@ impl<T> MemMap<T> {
         Ok(())
     }
 
+    fn validate_path(cfg: &MemMapCfg) -> FrozenResult<()> {
+        let mid = cfg.module_id;
+
+        if cfg.path.as_os_str().is_empty() {
+            return err::default_error(err::PTH).with_module(mid);
+        }
+
+        let stem = cfg.path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        if stem.is_empty() {
+            return err::default_error(err::PTH).with_module(mid);
+        }
+
+        if cfg.path.exists() && cfg.path.is_dir() {
+            return err::default_error(err::PTH).with_module(mid);
+        }
+
+        if let Some(parent) = cfg.path.parent() {
+            if !parent.as_os_str().is_empty() && (!parent.exists() || !parent.is_dir()) {
+                return err::default_error(err::DIR).with_module(mid);
+            }
+        }
+
+        Ok(())
+    }
+
     fn file_cfg(cfg: &MemMapCfg) -> FileCfg {
         FileCfg {
             module_id: cfg.module_id,
@@ -243,24 +269,21 @@ impl<T> MemMap<T> {
 
     /// Creates and memory-maps a new [`File`] at `cfg.versioned_path()`
     ///
-    /// ## Invariant: Constant Type `T`
+    /// *NOTE:* Returns an error if the file already exists on fs, use
+    /// [`MemMap::open`] to open an pre-existing file
+    ///
+    /// ## Type `T`
     ///
     /// The type `T` must never change across the entire lifetime of the file
     ///
-    /// No header safeguards exist on purpose; ensuring type consistency is caller responsibility
+    /// In case, `T` needs to be updated, use [`MemMapCfg::version`] to create a
+    /// new instace of [`MemMap`] to exists alongside the old one
     ///
-    /// ## TOCTAU Safe
+    /// ## Kernal Lock
     ///
-    /// If the file already exists, an error is returned to guard against TOCTOU overwrites
-    ///
-    /// ## Exclusive Lock
-    ///
-    /// Acquires an exclusive advisory lock on the underlying descriptor
-    ///
-    /// ## Background Sync
-    ///
-    /// Internally configures the underlying [`File`] with `sync_interval: None`, delegating
-    /// background sync management to [`MemMap`]
+    /// Acquires an exclusive advisory lock on the underlying descriptor, to
+    /// prevent running two simultaneous instances alongside each other by the
+    /// same process
     ///
     /// ## Example
     ///
@@ -283,11 +306,22 @@ impl<T> MemMap<T> {
     /// assert!(MemMap::<u64>::new(cfg).is_err());
     /// ```
     pub fn new(cfg: MemMapCfg) -> FrozenResult<Self> {
-        let mid = cfg.module_id;
-        Self::validate_t(mid)?;
+        Self::validate_t(cfg.module_id)?;
+        Self::validate_path(&cfg)?;
+
+        let vpath = cfg.versioned_path();
+        if vpath.exists() {
+            return err::default_error(err::EXS).with_module(cfg.module_id);
+        }
 
         let file_cfg = Self::file_cfg(&cfg);
-        let file = File::new(file_cfg)?;
+        let file = match File::new(file_cfg) {
+            Ok(f) => f,
+            Err(e) if e.reason == err::EXS.reason => {
+                return err::default_error(err::EXS).with_module(cfg.module_id);
+            }
+            Err(e) => return Err(e),
+        };
 
         let mmap = match PlatformMemMap::new(file.fd(), file.length()) {
             Ok(m) => m,
@@ -295,24 +329,15 @@ impl<T> MemMap<T> {
                 if let Err(del_err) = file.delete() {
                     e.add_suppressed(del_err);
                 }
-                return Err(e.with_module(mid));
+
+                return Err(e.with_module(cfg.module_id));
             }
         };
 
         Ok(Self { cfg, mmap, file, _marker: PhantomData })
     }
 
-    /// Open an existing [`MemMap`] while validating layout invariants
-    ///
-    /// ## Invariant: Constant Type `T`
-    ///
-    /// The type `T` must never change across the entire lifetime of the file
-    ///
-    /// No header safeguards existvon purpose; ensuring type consistency is caller responsibility
-    ///
-    /// ## Background Sync
-    ///
-    /// Internally configures the underlying [`File`] with `sync_interval: None`
+    /// NA
     ///
     /// ## Example
     ///
@@ -337,28 +362,26 @@ impl<T> MemMap<T> {
     /// assert_eq!(opened.length(), std::mem::size_of::<u64>() * 4);
     /// ```
     pub fn open(cfg: MemMapCfg) -> FrozenResult<Self> {
-        let mid = cfg.module_id;
-        Self::validate_t(mid)?;
+        Self::validate_t(cfg.module_id)?;
+        Self::validate_path(&cfg)?;
+
+        let vpath = cfg.versioned_path();
+        if !vpath.exists() {
+            return err::default_error(err::NEX).with_module(cfg.module_id);
+        }
+        if vpath.is_dir() {
+            return err::default_error(err::PTH).with_module(cfg.module_id);
+        }
 
         let file_cfg = Self::file_cfg(&cfg);
         let file = File::open(file_cfg)?;
 
-        let mmap = PlatformMemMap::new(file.fd(), file.length()).with_module(mid)?;
+        let mmap = PlatformMemMap::new(file.fd(), file.length()).with_module(cfg.module_id)?;
 
         Ok(Self { cfg, mmap, file, _marker: PhantomData })
     }
 
-    /// Open an existing [`MemMap`] or create it if it does not yet exist
-    ///
-    /// ## Invariant: Constant Type `T`
-    ///
-    /// The type `T` must never change across the entire lifetime of the file
-    ///
-    /// No header safeguards exist on purpose; ensuring type consistency is caller responsibility
-    ///
-    /// ## Background Sync
-    ///
-    /// Internally configures the underlying [`File`] with `sync_interval: None`
+    /// NA
     ///
     /// ## Example
     ///
@@ -383,13 +406,18 @@ impl<T> MemMap<T> {
     /// assert_eq!(reopened.length(), std::mem::size_of::<u64>() * 2);
     /// ```
     pub fn open_or_create(cfg: MemMapCfg) -> FrozenResult<Self> {
-        let mid = cfg.module_id;
-        Self::validate_t(mid)?;
+        Self::validate_t(cfg.module_id)?;
+        Self::validate_path(&cfg)?;
+
+        let vpath = cfg.versioned_path();
+        if vpath.exists() && vpath.is_dir() {
+            return err::default_error(err::PTH).with_module(cfg.module_id);
+        }
 
         let file_cfg = Self::file_cfg(&cfg);
         let file = File::open_or_create(file_cfg)?;
 
-        let mmap = PlatformMemMap::new(file.fd(), file.length()).with_module(mid)?;
+        let mmap = PlatformMemMap::new(file.fd(), file.length()).with_module(cfg.module_id)?;
 
         Ok(Self { cfg, mmap, file, _marker: PhantomData })
     }
@@ -431,27 +459,27 @@ mod tests {
     const MID: u8 = 0;
     const INIT_T: usize = 4;
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     #[repr(C, align(8))]
     struct ValidT {
         a: u64,
         b: u64,
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     #[repr(C)]
     struct BadAlignT {
         a: u32,
         b: u32,
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     #[repr(C)]
     struct BadSizeT {
         a: [u8; 12],
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     #[repr(C, align(8))]
     struct DropT(u64);
 
@@ -459,11 +487,11 @@ mod tests {
         fn drop(&mut self) {}
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     #[repr(C, align(8))]
     struct ZstT;
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     #[repr(C, align(8))]
     struct OversizedT {
         data: [u8; 8192],
@@ -513,7 +541,8 @@ mod tests {
     fn err_new_when_file_exists() {
         let (_dir, cfg) = tmp_cfg();
         let _mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
-        assert!(MemMap::<u64>::new(cfg).is_err());
+        let err = MemMap::<u64>::new(cfg).unwrap_err();
+        assert_eq!(err.reason, err::EXS.reason);
     }
 
     #[test]
@@ -539,7 +568,8 @@ mod tests {
     #[test]
     fn err_open_when_file_missing() {
         let (_dir, cfg) = tmp_cfg();
-        assert!(MemMap::<u64>::open(cfg).is_err());
+        let err = MemMap::<u64>::open(cfg).unwrap_err();
+        assert_eq!(err.reason, err::NEX.reason);
     }
 
     #[test]
@@ -557,6 +587,113 @@ mod tests {
     }
 
     #[test]
+    fn err_path_when_dir_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let non_existent_dir = dir.path().join("missing_dir_xyz");
+        let cfg = MemMapCfg {
+            module_id: MID,
+            path: non_existent_dir.join("file.bin"),
+            version: 1,
+            initial_t: INIT_T,
+            sync_interval: None,
+        };
+
+        let err_new = MemMap::<u64>::new(cfg.clone()).unwrap_err();
+        assert_eq!(err_new.reason, err::DIR.reason);
+
+        let err_open = MemMap::<u64>::open(cfg.clone()).unwrap_err();
+        assert_eq!(err_open.reason, err::DIR.reason);
+
+        let err_open_or_create = MemMap::<u64>::open_or_create(cfg).unwrap_err();
+        assert_eq!(err_open_or_create.reason, err::DIR.reason);
+    }
+
+    #[test]
+    fn err_path_when_parent_is_not_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("regular_file");
+        std::fs::write(&file_path, b"test").unwrap();
+
+        let cfg = MemMapCfg {
+            module_id: MID,
+            path: file_path.join("subfile.bin"),
+            version: 1,
+            initial_t: INIT_T,
+            sync_interval: None,
+        };
+
+        let err_new = MemMap::<u64>::new(cfg.clone()).unwrap_err();
+        assert_eq!(err_new.reason, err::DIR.reason);
+
+        let err_open = MemMap::<u64>::open(cfg.clone()).unwrap_err();
+        assert_eq!(err_open.reason, err::DIR.reason);
+
+        let err_open_or_create = MemMap::<u64>::open_or_create(cfg).unwrap_err();
+        assert_eq!(err_open_or_create.reason, err::DIR.reason);
+    }
+
+    #[test]
+    fn err_path_when_empty() {
+        let cfg = MemMapCfg {
+            module_id: MID,
+            path: std::path::PathBuf::from(""),
+            version: 1,
+            initial_t: INIT_T,
+            sync_interval: None,
+        };
+
+        let err_new = MemMap::<u64>::new(cfg.clone()).unwrap_err();
+        assert_eq!(err_new.reason, err::PTH.reason);
+
+        let err_open = MemMap::<u64>::open(cfg.clone()).unwrap_err();
+        assert_eq!(err_open.reason, err::PTH.reason);
+
+        let err_open_or_create = MemMap::<u64>::open_or_create(cfg).unwrap_err();
+        assert_eq!(err_open_or_create.reason, err::PTH.reason);
+    }
+
+    #[test]
+    fn err_path_when_is_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = MemMapCfg {
+            module_id: MID,
+            path: dir.path().to_path_buf(),
+            version: 1,
+            initial_t: INIT_T,
+            sync_interval: None,
+        };
+
+        let err_new = MemMap::<u64>::new(cfg.clone()).unwrap_err();
+        assert_eq!(err_new.reason, err::PTH.reason);
+
+        let err_open = MemMap::<u64>::open(cfg.clone()).unwrap_err();
+        assert_eq!(err_open.reason, err::PTH.reason);
+
+        let err_open_or_create = MemMap::<u64>::open_or_create(cfg).unwrap_err();
+        assert_eq!(err_open_or_create.reason, err::PTH.reason);
+    }
+
+    #[test]
+    fn err_path_when_no_filename() {
+        let cfg = MemMapCfg {
+            module_id: MID,
+            path: std::path::PathBuf::from("/"),
+            version: 1,
+            initial_t: INIT_T,
+            sync_interval: None,
+        };
+
+        let err_new = MemMap::<u64>::new(cfg.clone()).unwrap_err();
+        assert_eq!(err_new.reason, err::PTH.reason);
+
+        let err_open = MemMap::<u64>::open(cfg.clone()).unwrap_err();
+        assert_eq!(err_open.reason, err::PTH.reason);
+
+        let err_open_or_create = MemMap::<u64>::open_or_create(cfg).unwrap_err();
+        assert_eq!(err_open_or_create.reason, err::PTH.reason);
+    }
+
+    #[test]
     fn ok_delete() {
         let (_dir, cfg) = tmp_cfg();
         let path = cfg.versioned_path();
@@ -564,6 +701,79 @@ mod tests {
         assert!(path.exists());
         assert!(mmap.delete().is_ok());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn ok_versioned_path_resolution() {
+        // Simple file with extension
+        let cfg = MemMapCfg {
+            module_id: MID,
+            path: std::path::PathBuf::from("data.bin"),
+            version: 1,
+            initial_t: 2,
+            sync_interval: None,
+        };
+        assert_eq!(cfg.versioned_path(), std::path::PathBuf::from("data_1.bin"));
+
+        // File without extension
+        let cfg = MemMapCfg {
+            module_id: MID,
+            path: std::path::PathBuf::from("datastore"),
+            version: 2,
+            initial_t: 2,
+            sync_interval: None,
+        };
+        assert_eq!(cfg.versioned_path(), std::path::PathBuf::from("datastore_2"));
+
+        // Multi-part extension
+        let cfg = MemMapCfg {
+            module_id: MID,
+            path: std::path::PathBuf::from("archive.tar.gz"),
+            version: 3,
+            initial_t: 2,
+            sync_interval: None,
+        };
+        assert_eq!(cfg.versioned_path(), std::path::PathBuf::from("archive.tar_3.gz"));
+
+        // Absolute path with directories
+        let cfg = MemMapCfg {
+            module_id: MID,
+            path: std::path::PathBuf::from("/var/data/store.db"),
+            version: 10,
+            initial_t: 2,
+            sync_interval: None,
+        };
+        assert_eq!(cfg.versioned_path(), std::path::PathBuf::from("/var/data/store_10.db"));
+
+        // Relative path with directories
+        let cfg = MemMapCfg {
+            module_id: MID,
+            path: std::path::PathBuf::from("dir/sub/file.dat"),
+            version: 0,
+            initial_t: 2,
+            sync_interval: None,
+        };
+        assert_eq!(cfg.versioned_path(), std::path::PathBuf::from("dir/sub/file_0.dat"));
+
+        // Dotfile without extension
+        let cfg = MemMapCfg {
+            module_id: MID,
+            path: std::path::PathBuf::from(".env"),
+            version: 5,
+            initial_t: 2,
+            sync_interval: None,
+        };
+        assert_eq!(cfg.versioned_path(), std::path::PathBuf::from(".env_5"));
+
+        // Dotfile with extension
+        let cfg = MemMapCfg {
+            module_id: MID,
+            path: std::path::PathBuf::from(".config.json"),
+            version: 1,
+            initial_t: 2,
+            sync_interval: None,
+        };
+        assert_eq!(cfg.versioned_path(), std::path::PathBuf::from(".config_1.json"));
     }
 
     #[test]
