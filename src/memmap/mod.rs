@@ -1824,7 +1824,7 @@ mod tests {
     #[derive(Debug, Clone)]
     #[repr(C)]
     struct BadSizeT {
-        a: [u8; 12],
+        a: [u8; 0x0C],
     }
 
     #[derive(Debug, Clone)]
@@ -1842,7 +1842,7 @@ mod tests {
     #[derive(Debug, Clone)]
     #[repr(C, align(8))]
     struct OversizedT {
-        data: [u8; 131_072],
+        data: [u8; 0x20000],
     }
 
     fn tmp_cfg() -> (tempfile::TempDir, MemMapCfg) {
@@ -1853,7 +1853,7 @@ mod tests {
             path,
             version: 1,
             initial_t: INIT_T,
-            sync_interval: Some(Duration::from_millis(100)),
+            sync_interval: Some(Duration::from_millis(0x64)),
         };
 
         (dir, cfg)
@@ -1880,7 +1880,7 @@ mod tests {
 
         let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
         assert_eq!(mmap.length(), core::mem::size_of::<u64>() * INIT_T);
-        assert_eq!(mmap.cfg().sync_interval, Some(Duration::from_millis(100)));
+        assert_eq!(mmap.cfg().sync_interval, Some(Duration::from_millis(0x64)));
     }
 
     #[test]
@@ -1938,7 +1938,7 @@ mod tests {
             path: non_existent_dir.join("file.bin"),
             version: 1,
             initial_t: INIT_T,
-            sync_interval: Some(Duration::from_millis(100)),
+            sync_interval: Some(Duration::from_millis(0x64)),
         };
 
         let err_new = MemMap::<u64>::new(cfg.clone()).unwrap_err();
@@ -1962,7 +1962,7 @@ mod tests {
             path: file_path.join("subfile.bin"),
             version: 1,
             initial_t: INIT_T,
-            sync_interval: Some(Duration::from_millis(100)),
+            sync_interval: Some(Duration::from_millis(0x64)),
         };
 
         let err_new = MemMap::<u64>::new(cfg.clone()).unwrap_err();
@@ -1982,7 +1982,7 @@ mod tests {
             path: std::path::PathBuf::from(""),
             version: 1,
             initial_t: INIT_T,
-            sync_interval: Some(Duration::from_millis(100)),
+            sync_interval: Some(Duration::from_millis(0x64)),
         };
 
         let err_new = MemMap::<u64>::new(cfg.clone()).unwrap_err();
@@ -2003,7 +2003,7 @@ mod tests {
             path: dir.path().to_path_buf(),
             version: 1,
             initial_t: INIT_T,
-            sync_interval: Some(Duration::from_millis(100)),
+            sync_interval: Some(Duration::from_millis(0x64)),
         };
 
         let err_new = MemMap::<u64>::new(cfg.clone()).unwrap_err();
@@ -2023,7 +2023,7 @@ mod tests {
             path: std::path::PathBuf::from("/"),
             version: 1,
             initial_t: INIT_T,
-            sync_interval: Some(Duration::from_millis(100)),
+            sync_interval: Some(Duration::from_millis(0x64)),
         };
 
         let err_new = MemMap::<u64>::new(cfg.clone()).unwrap_err();
@@ -2054,7 +2054,7 @@ mod tests {
             path: std::path::PathBuf::from("data.bin"),
             version: 1,
             initial_t: 2,
-            sync_interval: Some(Duration::from_millis(100)),
+            sync_interval: Some(Duration::from_millis(0x64)),
         };
         assert_eq!(cfg.versioned_path(), std::path::PathBuf::from("data_1.bin"));
 
@@ -2064,7 +2064,7 @@ mod tests {
             path: std::path::PathBuf::from("datastore"),
             version: 2,
             initial_t: 2,
-            sync_interval: Some(Duration::from_millis(100)),
+            sync_interval: Some(Duration::from_millis(0x64)),
         };
         assert_eq!(cfg.versioned_path(), std::path::PathBuf::from("datastore_2"));
 
@@ -2074,7 +2074,7 @@ mod tests {
             path: std::path::PathBuf::from("archive.tar.gz"),
             version: 3,
             initial_t: 2,
-            sync_interval: Some(Duration::from_millis(100)),
+            sync_interval: Some(Duration::from_millis(0x64)),
         };
         assert_eq!(cfg.versioned_path(), std::path::PathBuf::from("archive.tar_3.gz"));
 
@@ -2082,9 +2082,9 @@ mod tests {
         let cfg = MemMapCfg {
             module_id: MID,
             path: std::path::PathBuf::from("/var/data/store.db"),
-            version: 10,
+            version: 0x0A,
             initial_t: 2,
-            sync_interval: Some(Duration::from_millis(100)),
+            sync_interval: Some(Duration::from_millis(0x64)),
         };
         assert_eq!(cfg.versioned_path(), std::path::PathBuf::from("/var/data/store_10.db"));
 
@@ -2094,7 +2094,7 @@ mod tests {
             path: std::path::PathBuf::from("dir/sub/file.dat"),
             version: 0,
             initial_t: 2,
-            sync_interval: Some(Duration::from_millis(100)),
+            sync_interval: Some(Duration::from_millis(0x64)),
         };
         assert_eq!(cfg.versioned_path(), std::path::PathBuf::from("dir/sub/file_0.dat"));
 
@@ -2104,7 +2104,7 @@ mod tests {
             path: std::path::PathBuf::from(".env"),
             version: 5,
             initial_t: 2,
-            sync_interval: Some(Duration::from_millis(100)),
+            sync_interval: Some(Duration::from_millis(0x64)),
         };
         assert_eq!(cfg.versioned_path(), std::path::PathBuf::from(".env_5"));
 
@@ -2114,7 +2114,7 @@ mod tests {
             path: std::path::PathBuf::from(".config.json"),
             version: 1,
             initial_t: 2,
-            sync_interval: Some(Duration::from_millis(100)),
+            sync_interval: Some(Duration::from_millis(0x64)),
         };
         assert_eq!(cfg.versioned_path(), std::path::PathBuf::from(".config_1.json"));
     }
@@ -2129,7 +2129,7 @@ mod tests {
             path: base_path.clone(),
             version: 1,
             initial_t: 2,
-            sync_interval: Some(Duration::from_millis(100)),
+            sync_interval: Some(Duration::from_millis(0x64)),
         };
         assert_eq!(cfg_v1.versioned_path(), dir.path().join("store_1.dat"));
 
@@ -2138,7 +2138,7 @@ mod tests {
             path: base_path.clone(),
             version: 2,
             initial_t: 4,
-            sync_interval: Some(Duration::from_millis(100)),
+            sync_interval: Some(Duration::from_millis(0x64)),
         };
         assert_eq!(cfg_v2.versioned_path(), dir.path().join("store_2.dat"));
 
@@ -2191,8 +2191,8 @@ mod tests {
         let (_dir, cfg) = tmp_cfg();
         let mmap = MemMap::<ValidT>::new(cfg).unwrap();
 
-        let val0 = ValidT { a: 10, b: 20 };
-        let val1 = ValidT { a: 100, b: 200 };
+        let val0 = ValidT { a: 0x0A, b: 0x14 };
+        let val1 = ValidT { a: 0x64, b: 0xC8 };
 
         mmap.write(&val0, 0).unwrap();
         mmap.write(&val1, 1).unwrap();
@@ -2200,10 +2200,10 @@ mod tests {
         let r0 = mmap.read(0).unwrap();
         let r1 = mmap.read(1).unwrap();
 
-        assert_eq!(r0.a, 10);
-        assert_eq!(r0.b, 20);
-        assert_eq!(r1.a, 100);
-        assert_eq!(r1.b, 200);
+        assert_eq!(r0.a, 0x0A);
+        assert_eq!(r0.b, 0x14);
+        assert_eq!(r1.a, 0x64);
+        assert_eq!(r1.b, 0xC8);
     }
 
     #[test]
@@ -2215,13 +2215,13 @@ mod tests {
         let err_r = mmap.read(INIT_T).unwrap_err();
         assert_eq!(err_r.reason, err::HCF.reason);
 
-        let err_w = mmap.write(&12345, INIT_T).unwrap_err();
+        let err_w = mmap.write(&0x3039, INIT_T).unwrap_err();
         assert_eq!(err_w.reason, err::HCF.reason);
 
-        let err_r_large = mmap.read(100).unwrap_err();
+        let err_r_large = mmap.read(0x64).unwrap_err();
         assert_eq!(err_r_large.reason, err::HCF.reason);
 
-        let err_w_large = mmap.write(&12345, 100).unwrap_err();
+        let err_w_large = mmap.write(&0x3039, 0x64).unwrap_err();
         assert_eq!(err_w_large.reason, err::HCF.reason);
     }
 
@@ -2233,7 +2233,7 @@ mod tests {
         let err_r = mmap.read(usize::MAX).unwrap_err();
         assert_eq!(err_r.reason, err::INV.reason);
 
-        let err_w = mmap.write(&12345, usize::MAX).unwrap_err();
+        let err_w = mmap.write(&0x3039, usize::MAX).unwrap_err();
         assert_eq!(err_w.reason, err::INV.reason);
     }
 
@@ -2253,7 +2253,7 @@ mod tests {
     #[test]
     fn ok_background_sync_advances_epoch() {
         let (_dir, mut cfg) = tmp_cfg();
-        cfg.sync_interval = Some(Duration::from_millis(25));
+        cfg.sync_interval = Some(Duration::from_millis(0x19));
 
         let mmap = MemMap::<u64>::new(cfg).unwrap();
         let ticket = mmap.write(&0x1234, 0).unwrap();
@@ -2268,7 +2268,7 @@ mod tests {
     fn ok_ticket_force_wakes_bg_worker() {
         let (_dir, mut cfg) = tmp_cfg();
         // Long interval to prove force wakes up immediately
-        cfg.sync_interval = Some(Duration::from_secs(10));
+        cfg.sync_interval = Some(Duration::from_secs(0x0A));
 
         let mmap = MemMap::<u64>::new(cfg).unwrap();
         let ticket = mmap.write(&0xABCD, 0).unwrap();
@@ -2286,7 +2286,7 @@ mod tests {
     #[test]
     fn ok_drop_persists_unflushed_writes() {
         let (_dir, mut cfg) = tmp_cfg();
-        cfg.sync_interval = Some(Duration::from_secs(30));
+        cfg.sync_interval = Some(Duration::from_secs(0x1E));
 
         {
             let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
@@ -2302,7 +2302,7 @@ mod tests {
     fn ok_concurrent_slot_locking() {
         let (_dir, mut cfg) = tmp_cfg();
         cfg.initial_t = 8;
-        cfg.sync_interval = Some(Duration::from_secs(60));
+        cfg.sync_interval = Some(Duration::from_secs(0x3C));
 
         let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
         let barrier = Arc::new(std::sync::Barrier::new(8));
@@ -2314,8 +2314,8 @@ mod tests {
             let barrier_clone = Arc::clone(&barrier);
             handles.push(std::thread::spawn(move || {
                 barrier_clone.wait();
-                for i in 0..500 {
-                    let val = ((t + 1) as u64) << 32 | (i as u64);
+                for i in 0..0x1F4 {
+                    let val = ((t + 1) as u64) << 0x20 | (i as u64);
                     let _ = mmap_clone.write(&val, 0).unwrap();
                 }
             }));
@@ -2327,9 +2327,9 @@ mod tests {
             let barrier_clone = Arc::clone(&barrier);
             handles.push(std::thread::spawn(move || {
                 barrier_clone.wait();
-                for _ in 0..1000 {
+                for _ in 0..0x3E8 {
                     let val = mmap_clone.read(0).unwrap();
-                    let thread_id = (val >> 32) as usize;
+                    let thread_id = (val >> 0x20) as usize;
                     assert!(thread_id <= 4, "read value must be valid without torn reads");
                 }
             }));
@@ -2347,7 +2347,7 @@ mod tests {
             let barrier_clone = Arc::clone(&barrier2);
             read_handles.push(std::thread::spawn(move || {
                 barrier_clone.wait();
-                for _ in 0..500 {
+                for _ in 0..0x1F4 {
                     let _ = mmap_clone.read(0).unwrap();
                 }
             }));
@@ -2476,7 +2476,7 @@ mod tests {
         let (_dir, mut cfg) = tmp_cfg();
         const THREADS: usize = 8;
         cfg.initial_t = THREADS;
-        cfg.sync_interval = Some(Duration::from_secs(60));
+        cfg.sync_interval = Some(Duration::from_secs(0x3C));
 
         let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
         let barrier = Arc::new(std::sync::Barrier::new(THREADS));
@@ -2487,11 +2487,11 @@ mod tests {
             let barrier_clone = Arc::clone(&barrier);
             handles.push(std::thread::spawn(move || {
                 barrier_clone.wait();
-                for i in 0..1000 {
-                    let val = (t as u64) << 32 | (i as u64);
+                for i in 0..0x3E8 {
+                    let val = (t as u64) << 0x20 | (i as u64);
                     let _ = mmap_clone.write(&val, t).unwrap();
                     let read_val = mmap_clone.read(t).unwrap();
-                    assert_eq!(read_val >> 32, t as u64);
+                    assert_eq!(read_val >> 0x20, t as u64);
                 }
             }));
         }
@@ -2502,17 +2502,17 @@ mod tests {
 
         for t in 0..THREADS {
             let val = mmap.read(t).unwrap();
-            assert_eq!(val >> 32, t as u64);
+            assert_eq!(val >> 0x20, t as u64);
         }
     }
 
     #[test]
     fn ok_stress_interleaved_reads_writes() {
         let (_dir, mut cfg) = tmp_cfg();
-        const NUM_SLOTS: usize = 16;
+        const NUM_SLOTS: usize = 0x10;
         const NUM_THREADS: usize = 8;
         cfg.initial_t = NUM_SLOTS;
-        cfg.sync_interval = Some(Duration::from_millis(50));
+        cfg.sync_interval = Some(Duration::from_millis(0x32));
 
         let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
         let barrier = Arc::new(std::sync::Barrier::new(NUM_THREADS));
@@ -2523,10 +2523,10 @@ mod tests {
             let barrier_clone = Arc::clone(&barrier);
             handles.push(std::thread::spawn(move || {
                 barrier_clone.wait();
-                for i in 0..1500 {
+                for i in 0..0x5DC {
                     let slot = (t + i) % NUM_SLOTS;
                     if i % 2 == 0 {
-                        let val = ((t + 1) as u64) << 32 | (i as u64);
+                        let val = ((t + 1) as u64) << 0x20 | (i as u64);
                         let _ = mmap_clone.write(&val, slot).unwrap();
                     } else {
                         let _ = mmap_clone.read(slot).unwrap();
@@ -2557,9 +2557,9 @@ mod tests {
             let barrier_clone = Arc::clone(&barrier);
             handles.push(std::thread::spawn(move || {
                 barrier_clone.wait();
-                let mut tickets = Vec::with_capacity(50);
-                for i in 0..50 {
-                    let val = (t as u64) * 1000 + i as u64;
+                let mut tickets = Vec::with_capacity(0x32);
+                for i in 0..0x32 {
+                    let val = (t as u64) * 0x3E8 + i as u64;
                     tickets.push(mmap_clone.write(&val, t).unwrap());
                     std::thread::sleep(Duration::from_millis(1));
                 }
@@ -2581,7 +2581,7 @@ mod tests {
     fn ok_concurrent_ticket_force_stress() {
         let (_dir, mut cfg) = tmp_cfg();
         cfg.initial_t = 8;
-        cfg.sync_interval = Some(Duration::from_secs(30));
+        cfg.sync_interval = Some(Duration::from_secs(0x1E));
 
         let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
         let barrier = Arc::new(std::sync::Barrier::new(4));
@@ -2592,8 +2592,8 @@ mod tests {
             let barrier_clone = Arc::clone(&barrier);
             handles.push(std::thread::spawn(move || {
                 barrier_clone.wait();
-                for i in 0..20 {
-                    let val = (t as u64) * 100 + i as u64;
+                for i in 0..0x14 {
+                    let val = (t as u64) * 0x64 + i as u64;
                     let ticket = mmap_clone.write(&val, t).unwrap();
                     let durable_epoch = ticket.force().unwrap();
                     assert!(ticket.is_durable());
@@ -2624,7 +2624,7 @@ mod tests {
     #[test]
     fn ok_large_slot_count_initialization() {
         let (_dir, mut cfg) = tmp_cfg();
-        const LARGE_COUNT: usize = 10_000;
+        const LARGE_COUNT: usize = 0x2710;
         cfg.initial_t = LARGE_COUNT;
 
         let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -2632,12 +2632,12 @@ mod tests {
 
         // First, middle, last
         assert!(mmap.write(&1, 0).is_ok());
-        assert!(mmap.write(&5000, 5000).is_ok());
-        assert!(mmap.write(&9999, LARGE_COUNT - 1).is_ok());
+        assert!(mmap.write(&0x1388, 0x1388).is_ok());
+        assert!(mmap.write(&0x270F, LARGE_COUNT - 1).is_ok());
 
         assert_eq!(mmap.read(0).unwrap(), 1);
-        assert_eq!(mmap.read(5000).unwrap(), 5000);
-        assert_eq!(mmap.read(LARGE_COUNT - 1).unwrap(), 9999);
+        assert_eq!(mmap.read(0x1388).unwrap(), 0x1388);
+        assert_eq!(mmap.read(LARGE_COUNT - 1).unwrap(), 0x270F);
     }
 
     #[test]
@@ -2692,7 +2692,7 @@ mod tests {
     #[test]
     fn ok_bg_worker_parks_when_idle_and_unparks_on_write() {
         let (_dir, mut cfg) = tmp_cfg();
-        cfg.sync_interval = Some(Duration::from_millis(15));
+        cfg.sync_interval = Some(Duration::from_millis(0x0F));
 
         let mmap = MemMap::<u64>::new(cfg).unwrap();
 
@@ -2724,7 +2724,7 @@ mod tests {
     #[test]
     fn ok_batched_writes_while_active_remain_unparked() {
         let (_dir, mut cfg) = tmp_cfg();
-        cfg.sync_interval = Some(Duration::from_millis(30));
+        cfg.sync_interval = Some(Duration::from_millis(0x1E));
 
         let mmap = MemMap::<u64>::new(cfg).unwrap();
 
@@ -2760,12 +2760,12 @@ mod tests {
     #[test]
     fn ok_concurrent_stress_park_unpark_no_lost_wakeups() {
         let (_dir, mut cfg) = tmp_cfg();
-        cfg.initial_t = 16;
+        cfg.initial_t = 0x10;
         cfg.sync_interval = Some(Duration::from_millis(5));
 
         let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
         const THREADS: usize = 4;
-        const WRITES_PER_THREAD: usize = 25;
+        const WRITES_PER_THREAD: usize = 0x19;
         let mut handles = Vec::with_capacity(THREADS);
 
         for t in 0..THREADS {
@@ -2773,14 +2773,14 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 let mut tickets = Vec::with_capacity(WRITES_PER_THREAD);
                 for i in 0..WRITES_PER_THREAD {
-                    let val = (t as u64) << 32 | (i as u64);
+                    let val = (t as u64) << 0x20 | (i as u64);
                     let slot = t;
                     let ticket = mmap_clone.write(&val, slot).unwrap();
                     tickets.push(ticket);
 
                     // Alternate between short sleep (allowing worker to park) and rapid writes
                     if i % 5 == 0 {
-                        std::thread::sleep(Duration::from_millis(15));
+                        std::thread::sleep(Duration::from_millis(0x0F));
                     }
                 }
 
@@ -2801,7 +2801,7 @@ mod tests {
     #[test]
     fn ok_spurious_wakeup_resumes_park_immediately() {
         let (_dir, mut cfg) = tmp_cfg();
-        cfg.sync_interval = Some(Duration::from_secs(10)); // Long interval
+        cfg.sync_interval = Some(Duration::from_secs(0x0A)); // Long interval
 
         let mmap = MemMap::<u64>::new(cfg).unwrap();
 
@@ -2814,12 +2814,12 @@ mod tests {
 
         // Send spurious condvar notification without any writes
         mmap.inner.sync_condvar.notify_one();
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(0x0A));
 
         // Because no writes occurred, worker should detect spurious wakeup and re-park immediately
         // rather than sleeping for the 10-second interval
         let start = std::time::Instant::now();
-        while !mmap.is_parked() && start.elapsed() < Duration::from_millis(500) {
+        while !mmap.is_parked() && start.elapsed() < Duration::from_millis(0x1F4) {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(mmap.is_parked());
@@ -2949,22 +2949,22 @@ mod tests {
             let (_dir, cfg) = tmp_cfg();
             let mmap = MemMap::<u64>::new(cfg).unwrap();
 
-            mmap.write(&10u64, 0).unwrap();
+            mmap.write(&0x0Au64, 0).unwrap();
             mmap.grow(2).unwrap();
-            mmap.write(&20u64, INIT_T).unwrap();
+            mmap.write(&0x14u64, INIT_T).unwrap();
             mmap.grow(3).unwrap();
-            mmap.write(&30u64, INIT_T + 2).unwrap();
+            mmap.write(&0x1Eu64, INIT_T + 2).unwrap();
 
-            assert_eq!(mmap.read(0).unwrap(), 10u64);
-            assert_eq!(mmap.read(INIT_T).unwrap(), 20u64);
-            assert_eq!(mmap.read(INIT_T + 2).unwrap(), 30u64);
+            assert_eq!(mmap.read(0).unwrap(), 0x0Au64);
+            assert_eq!(mmap.read(INIT_T).unwrap(), 0x14u64);
+            assert_eq!(mmap.read(INIT_T + 2).unwrap(), 0x1Eu64);
             assert_eq!(mmap.length(), (INIT_T + 5) * core::mem::size_of::<u64>());
         }
 
         #[test]
         fn ok_concurrent_grow_and_reads_writes() {
             let (_dir, mut cfg) = tmp_cfg();
-            cfg.sync_interval = Some(Duration::from_millis(10));
+            cfg.sync_interval = Some(Duration::from_millis(0x0A));
             let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
 
             let num_writers = 4;
@@ -2973,8 +2973,8 @@ mod tests {
             for w in 0..num_writers {
                 let m = Arc::clone(&mmap);
                 handles.push(std::thread::spawn(move || {
-                    for i in 0..50 {
-                        let _ = m.write(&((w * 1000 + i) as u64), w % INIT_T);
+                    for i in 0..0x32 {
+                        let _ = m.write(&((w * 0x3E8 + i) as u64), w % INIT_T);
                         let _ = m.read(w % INIT_T);
                     }
                 }));
@@ -3068,10 +3068,10 @@ mod tests {
             assert!(mmap.grow(usize::MAX).is_err());
 
             // The instance and background sync worker remain healthy
-            let ticket = mmap.write(&42u64, 0).unwrap();
+            let ticket = mmap.write(&0x2Au64, 0).unwrap();
             mmap.sync().unwrap();
             assert!(ticket.is_durable());
-            assert_eq!(mmap.read(0).unwrap(), 42u64);
+            assert_eq!(mmap.read(0).unwrap(), 0x2Au64);
         }
     }
 
@@ -3087,20 +3087,20 @@ mod tests {
             assert_eq!(mmap.read(0).unwrap(), 0);
 
             // Successful CAS: 0 -> 100
-            let t1 = mmap.compare_and_write(&0, &100, 0).unwrap();
-            assert_eq!(mmap.read(0).unwrap(), 100);
+            let t1 = mmap.compare_and_write(&0, &0x64, 0).unwrap();
+            assert_eq!(mmap.read(0).unwrap(), 0x64);
             assert_eq!(mmap.current_epoch(), 1);
 
             // Failed CAS: expected 0, but current is 100
-            let err = mmap.compare_and_write(&0, &200, 0).unwrap_err();
+            let err = mmap.compare_and_write(&0, &0xC8, 0).unwrap_err();
             assert_eq!(err.reason, err::CAS.reason);
             assert!(err.context.contains("slot data has changed"));
-            assert_eq!(mmap.read(0).unwrap(), 100);
+            assert_eq!(mmap.read(0).unwrap(), 0x64);
             assert_eq!(mmap.current_epoch(), 1); // Epoch does not advance on failure
 
             // Successful CAS: 100 -> 200
-            let t2 = mmap.compare_and_write(&100, &200, 0).unwrap();
-            assert_eq!(mmap.read(0).unwrap(), 200);
+            let t2 = mmap.compare_and_write(&0x64, &0xC8, 0).unwrap();
+            assert_eq!(mmap.read(0).unwrap(), 0xC8);
             assert_eq!(mmap.current_epoch(), 2);
             assert!(t2.epoch() > t1.epoch());
         }
@@ -3114,9 +3114,9 @@ mod tests {
 
             let mut tx = mmap.new_tx();
             assert!(tx.is_empty());
-            tx.write(&0, &111, 0).unwrap();
-            tx.write(&0, &222, 1).unwrap();
-            tx.write(&0, &333, 2).unwrap();
+            tx.write(&0, &0x6F, 0).unwrap();
+            tx.write(&0, &0xDE, 1).unwrap();
+            tx.write(&0, &0x14D, 2).unwrap();
             assert_eq!(tx.len(), 3);
 
             let ticket = tx.commit().unwrap();
@@ -3126,9 +3126,9 @@ mod tests {
             assert_eq!(epoch_after, epoch_before + 1);
             assert_eq!(ticket.epoch(), epoch_after);
 
-            assert_eq!(mmap.read(0).unwrap(), 111);
-            assert_eq!(mmap.read(1).unwrap(), 222);
-            assert_eq!(mmap.read(2).unwrap(), 333);
+            assert_eq!(mmap.read(0).unwrap(), 0x6F);
+            assert_eq!(mmap.read(1).unwrap(), 0xDE);
+            assert_eq!(mmap.read(2).unwrap(), 0x14D);
 
             ticket.wait().unwrap();
             assert!(ticket.is_durable());
@@ -3140,13 +3140,13 @@ mod tests {
             let mmap = MemMap::<u64>::new(cfg).unwrap();
 
             // Prepare slot 1 with a different value
-            mmap.write(&999, 1).unwrap();
+            mmap.write(&0x3E7, 1).unwrap();
             let epoch_before = mmap.current_epoch();
 
             let mut tx = mmap.new_tx();
-            tx.write(&0, &10, 0).unwrap(); // Expected 0, currently 0 (would succeed)
-            tx.write(&0, &20, 1).unwrap(); // Expected 0, currently 999 (will fail!)
-            tx.write(&0, &30, 2).unwrap(); // Expected 0, currently 0
+            tx.write(&0, &0x0A, 0).unwrap(); // Expected 0, currently 0 (would succeed)
+            tx.write(&0, &0x14, 1).unwrap(); // Expected 0, currently 999 (will fail!)
+            tx.write(&0, &0x1E, 2).unwrap(); // Expected 0, currently 0
 
             let err = tx.commit().unwrap_err();
             assert_eq!(err.reason, err::CAS.reason);
@@ -3154,7 +3154,7 @@ mod tests {
 
             // Verify NONE of the slots were modified (all-or-nothing rollback)
             assert_eq!(mmap.read(0).unwrap(), 0);
-            assert_eq!(mmap.read(1).unwrap(), 999);
+            assert_eq!(mmap.read(1).unwrap(), 0x3E7);
             assert_eq!(mmap.read(2).unwrap(), 0);
 
             // Epoch must NOT have advanced
@@ -3167,25 +3167,25 @@ mod tests {
             let mmap = MemMap::<u64>::new(cfg).unwrap();
 
             // Simulate concurrent write modifying slot 1
-            mmap.write(&42, 1).unwrap();
+            mmap.write(&0x2A, 1).unwrap();
 
             // First attempt assuming slot 1 is 0 fails
             let mut tx1 = mmap.new_tx();
-            tx1.write(&0, &100, 0).unwrap();
-            tx1.write(&0, &200, 1).unwrap();
+            tx1.write(&0, &0x64, 0).unwrap();
+            tx1.write(&0, &0xC8, 1).unwrap();
             assert_eq!(tx1.commit().unwrap_err().reason, err::CAS.reason);
 
             // Caller observes current slot 1 value is 42, retries transaction with updated precondition
             let curr_val = mmap.read(1).unwrap();
-            assert_eq!(curr_val, 42);
+            assert_eq!(curr_val, 0x2A);
 
             let mut tx2 = mmap.new_tx();
-            tx2.write(&0, &100, 0).unwrap();
-            tx2.write(&42, &200, 1).unwrap();
+            tx2.write(&0, &0x64, 0).unwrap();
+            tx2.write(&0x2A, &0xC8, 1).unwrap();
             let ticket = tx2.commit().unwrap();
 
-            assert_eq!(mmap.read(0).unwrap(), 100);
-            assert_eq!(mmap.read(1).unwrap(), 200);
+            assert_eq!(mmap.read(0).unwrap(), 0x64);
+            assert_eq!(mmap.read(1).unwrap(), 0xC8);
             ticket.wait().unwrap();
             assert!(ticket.is_durable());
         }
@@ -3196,8 +3196,8 @@ mod tests {
             let mmap = MemMap::<u64>::new(cfg).unwrap();
 
             let mut tx = mmap.new_tx();
-            tx.write(&0, &10, 2).unwrap();
-            let err = tx.write(&0, &20, 1).unwrap_err();
+            tx.write(&0, &0x0A, 2).unwrap();
+            let err = tx.write(&0, &0x14, 1).unwrap_err();
             assert_eq!(err.reason, err::HCF.reason);
             assert!(err.context.contains("strictly ordered"));
         }
@@ -3208,8 +3208,8 @@ mod tests {
             let mmap = MemMap::<u64>::new(cfg).unwrap();
 
             let mut tx = mmap.new_tx();
-            tx.write(&0, &10, 1).unwrap();
-            let err = tx.write(&0, &20, 1).unwrap_err();
+            tx.write(&0, &0x0A, 1).unwrap();
+            let err = tx.write(&0, &0x14, 1).unwrap_err();
             assert_eq!(err.reason, err::HCF.reason);
             assert!(err.context.contains("strictly ordered"));
         }
@@ -3220,7 +3220,7 @@ mod tests {
             let mmap = MemMap::<u64>::new(cfg).unwrap();
 
             let mut tx = mmap.new_tx();
-            let err = tx.write(&0, &10, INIT_T).unwrap_err();
+            let err = tx.write(&0, &0x0A, INIT_T).unwrap_err();
             assert_eq!(err.reason, err::HCF.reason);
         }
 
@@ -3243,8 +3243,8 @@ mod tests {
             let epoch_before = mmap.current_epoch();
             {
                 let mut tx = mmap.new_tx();
-                tx.write(&0, &777, 0).unwrap();
-                tx.write(&0, &888, 1).unwrap();
+                tx.write(&0, &0x309, 0).unwrap();
+                tx.write(&0, &0x378, 1).unwrap();
                 // tx dropped without calling commit()
             }
 
@@ -3256,7 +3256,7 @@ mod tests {
         #[test]
         fn ok_tx_concurrent_non_overlapping() {
             let (_dir, mut cfg) = tmp_cfg();
-            cfg.initial_t = 16;
+            cfg.initial_t = 0x10;
             let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
 
             let mut handles = Vec::new();
@@ -3265,10 +3265,10 @@ mod tests {
                 handles.push(std::thread::spawn(move || {
                     let base = (thread_id as usize) * 4;
                     let mut tx = m.new_tx();
-                    tx.write(&0, &(thread_id * 10 + 1), base).unwrap();
-                    tx.write(&0, &(thread_id * 10 + 2), base + 1).unwrap();
-                    tx.write(&0, &(thread_id * 10 + 3), base + 2).unwrap();
-                    tx.write(&0, &(thread_id * 10 + 4), base + 3).unwrap();
+                    tx.write(&0, &(thread_id * 0x0A + 1), base).unwrap();
+                    tx.write(&0, &(thread_id * 0x0A + 2), base + 1).unwrap();
+                    tx.write(&0, &(thread_id * 0x0A + 3), base + 2).unwrap();
+                    tx.write(&0, &(thread_id * 0x0A + 4), base + 3).unwrap();
                     let ticket = tx.commit().unwrap();
                     ticket.wait().unwrap();
                 }));
@@ -3280,10 +3280,10 @@ mod tests {
 
             for thread_id in 0..4u64 {
                 let base = (thread_id as usize) * 4;
-                assert_eq!(mmap.read(base).unwrap(), thread_id * 10 + 1);
-                assert_eq!(mmap.read(base + 1).unwrap(), thread_id * 10 + 2);
-                assert_eq!(mmap.read(base + 2).unwrap(), thread_id * 10 + 3);
-                assert_eq!(mmap.read(base + 3).unwrap(), thread_id * 10 + 4);
+                assert_eq!(mmap.read(base).unwrap(), thread_id * 0x0A + 1);
+                assert_eq!(mmap.read(base + 1).unwrap(), thread_id * 0x0A + 2);
+                assert_eq!(mmap.read(base + 2).unwrap(), thread_id * 0x0A + 3);
+                assert_eq!(mmap.read(base + 3).unwrap(), thread_id * 0x0A + 4);
             }
         }
 
@@ -3315,23 +3315,23 @@ mod tests {
 
             // Wait for worker to park
             let mut parked = false;
-            for _ in 0..100 {
+            for _ in 0..0x64 {
                 if mmap.is_parked() {
                     parked = true;
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(10));
+                std::thread::sleep(Duration::from_millis(0x0A));
             }
             assert!(parked);
 
             let mut tx = mmap.new_tx();
-            tx.write(&0, &555, 0).unwrap();
+            tx.write(&0, &0x22B, 0).unwrap();
             let ticket = tx.commit().unwrap();
 
             // Background worker was unparked and should make ticket durable
             ticket.wait().unwrap();
             assert!(ticket.is_durable());
-            assert_eq!(mmap.read(0).unwrap(), 555);
+            assert_eq!(mmap.read(0).unwrap(), 0x22B);
         }
     }
 
@@ -3341,7 +3341,7 @@ mod tests {
         #[test]
         fn ok_page_size_returns_valid_power_of_two() {
             let page_size = MemMap::<u64>::page_size().unwrap();
-            assert!(page_size >= 4096);
+            assert!(page_size >= 0x1000);
             assert!(page_size.is_power_of_two());
         }
 

@@ -36,7 +36,7 @@ type TPtr = *mut u8;
 const CLOSED_HANDLE: isize = -1isize;
 
 /// Win32 error code representing an invalid file
-const ERROR_FILE_INVALID: u32 = 1006;
+const ERROR_FILE_INVALID: u32 = 0x3EE;
 
 /// Max allowed retries for transient lock or sharing violations
 const MAX_RETRIES: usize = 0x80;
@@ -107,7 +107,7 @@ impl MemMapInterface for WINMemMap {
         unsafe { GetSystemInfo(&mut sys_info) };
 
         let page_size = sys_info.dwPageSize as usize;
-        if hints::unlikely(!page_size.is_power_of_two() || page_size < 4096) {
+        if hints::unlikely(!page_size.is_power_of_two() || page_size < 0x1000) {
             return raw_error(
                 err::HCF,
                 format!(
@@ -330,7 +330,7 @@ fn mmap_raw(handle: isize, length: usize) -> FrozenResult<TPtr> {
     }
 
     let h_file = handle as usize as HANDLE;
-    let max_size_hi = (length >> 32) as u32;
+    let max_size_hi = (length >> 0x20) as u32;
     let max_size_lo = (length & 0xFFFF_FFFF) as u32;
 
     let mut retries = 0;
@@ -586,7 +586,7 @@ mod tests {
             let size = WINMemMap::page_size().expect("page_size must succeed");
             assert!(size.is_power_of_two(), "page size must be a power of two, got {size}");
             assert!(
-                size >= 4096,
+                size >= 0x1000,
                 "page size must be at least 4096 bytes on supported 64-bit systems, got {size}"
             );
         }
@@ -602,7 +602,7 @@ mod tests {
         #[test]
         fn ok_page_size_consistency() {
             let first = WINMemMap::page_size().unwrap();
-            for _ in 0..1000 {
+            for _ in 0..0x3E8 {
                 assert_eq!(WINMemMap::page_size().unwrap(), first);
             }
         }
@@ -611,9 +611,9 @@ mod tests {
         fn ok_page_size_across_threads() {
             let expected = WINMemMap::page_size().unwrap();
             let mut handles = Vec::new();
-            for _ in 0..16 {
+            for _ in 0..0x10 {
                 let handle = std::thread::spawn(move || {
-                    for _ in 0..100 {
+                    for _ in 0..0x64 {
                         assert_eq!(WINMemMap::page_size().unwrap(), expected);
                     }
                 });
@@ -832,7 +832,7 @@ mod tests {
             let err = mmap.evict_pages(&[2]).unwrap_err();
             assert_eq!(err.reason, err::HCF.reason);
 
-            let err_large = mmap.evict_pages(&[100]).unwrap_err();
+            let err_large = mmap.evict_pages(&[0x64]).unwrap_err();
             assert_eq!(err_large.reason, err::HCF.reason);
 
             mmap.unmap().unwrap();
