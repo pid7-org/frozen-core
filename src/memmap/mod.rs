@@ -825,31 +825,6 @@ where
         &self.cfg
     }
 
-    /// Returns a reference to the underlying [`File`] descriptor wrapper
-    ///
-    /// ## Example
-    ///
-    /// ```
-    /// use frozen_core::memmap::{MemMap, MemMapCfg};
-    /// use std::time::Duration;
-    ///
-    /// let dir = tempfile::tempdir().unwrap();
-    /// let cfg = MemMapCfg {
-    ///     module_id: 1,
-    ///     path: dir.path().join("file_demo.bin"),
-    ///     version: 1,
-    ///     initial_t: 4,
-    ///     sync_interval: Duration::from_millis(100),
-    /// };
-    ///
-    /// let mmap = MemMap::<u64>::new(cfg).unwrap();
-    /// assert_eq!(mmap.file().length(), 4 * std::mem::size_of::<u64>());
-    /// ```
-    #[inline]
-    pub fn file(&self) -> &File {
-        self.file.as_ref().expect("file exists")
-    }
-
     /// Fetch the latest assigned durability epoch
     ///
     /// The current epoch monotonically increments on each [`MemMap::write`] call.
@@ -906,38 +881,12 @@ where
         self.inner.completion.read_durable_epoch()
     }
 
-    /// Fetch reference to underlying durability [`Completion`] controller
-    ///
-    /// Enables registration of custom wait queues or listeners for epoch completions.
-    ///
-    /// ## Example
-    ///
-    /// ```
-    /// use frozen_core::memmap::{MemMap, MemMapCfg};
-    /// use std::time::Duration;
-    ///
-    /// let dir = tempfile::tempdir().unwrap();
-    /// let cfg = MemMapCfg {
-    ///     module_id: 1,
-    ///     path: dir.path().join("completion_demo.bin"),
-    ///     version: 1,
-    ///     initial_t: 4,
-    ///     sync_interval: Duration::from_millis(100),
-    /// };
-    ///
-    /// let mmap = MemMap::<u64>::new(cfg).unwrap();
-    /// assert_eq!(mmap.completion().read_current_epoch(), 0);
-    /// ```
-    #[inline]
-    pub fn completion(&self) -> &Arc<Completion> {
-        &self.inner.completion
-    }
-
     /// Synchronize dirty pages and file metadata to stable storage
     ///
-    /// Performs a synchronous two-phase flush:
-    /// 1. Flushes modified virtual memory pages to host cache via [`PlatformMemMap::sync`].
-    /// 2. Advances the durable epoch to the current write epoch and awakens all pending listeners.
+    /// Performs a synchronous two-phase flush,
+    ///
+    /// - Flushes modified virtual memory pages to host cache via [`PlatformMemMap::sync`]
+    /// - Advances the durable epoch to the current write epoch and awakens all pending listeners
     ///
     /// Returns `Ok(())` immediately if no writes have occurred since the last sync.
     ///
@@ -1202,7 +1151,7 @@ mod tests {
     #[derive(Debug, Clone)]
     #[repr(C, align(8))]
     struct OversizedT {
-        data: [u8; 8192],
+        data: [u8; 131_072],
     }
 
     fn tmp_cfg() -> (tempfile::TempDir, MemMapCfg) {
