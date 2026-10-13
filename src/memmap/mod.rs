@@ -594,6 +594,12 @@ where
                                 continue;
                             }
 
+                            if worker_inner.completion.read_current_epoch()
+                                == worker_inner.completion.read_durable_epoch()
+                            {
+                                continue;
+                            }
+
                             let (new_guard, _) = worker_inner
                                 .sync_condvar
                                 .wait_timeout(guard, interval)
@@ -1068,11 +1074,16 @@ where
 
         let ptr = unsafe { mmap.as_mut_ptr::<T>(offset) };
         unsafe { core::ptr::write(ptr, val.clone()) };
+        drop(guard);
+        drop(_slot_guard);
 
         let epoch = self.inner.completion.increment_current_epoch();
 
-        if self.inner.is_parked.swap(false, atomic::Ordering::AcqRel) {
-            self.inner.sync_condvar.notify_one();
+        if self.inner.is_parked.load(atomic::Ordering::Acquire) {
+            let _guard = self.inner.sync_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            if self.inner.is_parked.swap(false, atomic::Ordering::AcqRel) {
+                self.inner.sync_condvar.notify_one();
+            }
         }
 
         Ok(AckTicket::new(epoch, self.inner.completion.clone()))
@@ -2120,5 +2131,73 @@ mod tests {
         assert_eq!(mmap.read(0).unwrap(), 0x1111);
         assert_eq!(mmap.read(1).unwrap(), 0x2222);
         assert_eq!(mmap.read(2).unwrap(), 0x3333);
+    }
+
+    #[test]
+    fn ok_concurrent_stress_park_unpark_no_lost_wakeups() {
+        let (_dir, mut cfg) = tmp_cfg();
+        cfg.initial_t = 16;
+        cfg.sync_interval = Some(Duration::from_millis(5));
+
+        let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
+        const THREADS: usize = 4;
+        const WRITES_PER_THREAD: usize = 25;
+        let mut handles = Vec::with_capacity(THREADS);
+
+        for t in 0..THREADS {
+            let mmap_clone = Arc::clone(&mmap);
+            handles.push(std::thread::spawn(move || {
+                let mut tickets = Vec::with_capacity(WRITES_PER_THREAD);
+                for i in 0..WRITES_PER_THREAD {
+                    let val = (t as u64) << 32 | (i as u64);
+                    let slot = t;
+                    let ticket = mmap_clone.write(&val, slot).unwrap();
+                    tickets.push(ticket);
+
+                    // Alternate between short sleep (allowing worker to park) and rapid writes
+                    if i % 5 == 0 {
+                        std::thread::sleep(Duration::from_millis(15));
+                    }
+                }
+
+                for ticket in tickets {
+                    ticket.wait().unwrap();
+                    assert!(ticket.is_durable());
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert!(mmap.durable_epoch() >= mmap.inner.completion.read_current_epoch());
+    }
+
+    #[test]
+    fn ok_spurious_wakeup_resumes_park_immediately() {
+        let (_dir, mut cfg) = tmp_cfg();
+        cfg.sync_interval = Some(Duration::from_secs(10)); // Long interval
+
+        let mmap = MemMap::<u64>::new(cfg).unwrap();
+
+        // Wait until parked
+        let start = std::time::Instant::now();
+        while !mmap.is_parked() && start.elapsed() < Duration::from_secs(1) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(mmap.is_parked());
+
+        // Send spurious condvar notification without any writes
+        mmap.inner.sync_condvar.notify_one();
+        std::thread::sleep(Duration::from_millis(10));
+
+        // Because no writes occurred, worker should detect spurious wakeup and re-park immediately
+        // rather than sleeping for the 10-second interval
+        let start = std::time::Instant::now();
+        while !mmap.is_parked() && start.elapsed() < Duration::from_millis(500) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(mmap.is_parked());
     }
 }
