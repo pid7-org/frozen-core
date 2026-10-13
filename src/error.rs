@@ -507,7 +507,7 @@ mod tests {
         let bound_res = res.with_module(0x07);
         assert_eq!(bound_res.unwrap_err().module, 0x07);
 
-        let ok_res: FrozenResult<i32> = Ok(10);
-        assert_eq!(ok_res.with_module(0x07).unwrap(), 10);
+        let ok_res: FrozenResult<i32> = Ok(0x0A);
+        assert_eq!(ok_res.with_module(0x07).unwrap(), 0x0A);
     }
 }
