@@ -347,6 +347,7 @@ struct MemMapInner {
     sync_condvar: Condvar,
     sync_mutex: Mutex<bool>,
     shutdown: atomic::AtomicBool,
+    is_parked: atomic::AtomicBool,
 }
 
 impl SyncTrigger for MemMapInner {
@@ -546,6 +547,7 @@ where
             sync_condvar: Condvar::new(),
             sync_mutex: Mutex::new(false),
             shutdown: atomic::AtomicBool::new(false),
+            is_parked: atomic::AtomicBool::new(false),
         });
 
         let weak_inner: std::sync::Weak<dyn SyncTrigger> =
@@ -570,12 +572,43 @@ where
                             continue;
                         }
 
-                        let (new_guard, _) = worker_inner
-                            .sync_condvar
-                            .wait_timeout(guard, interval)
-                            .unwrap_or_else(|e| e.into_inner());
+                        let target_epoch = worker_inner.completion.read_current_epoch();
+                        let durable_epoch = worker_inner.completion.read_durable_epoch();
 
-                        guard = new_guard;
+                        if target_epoch == durable_epoch {
+                            worker_inner.is_parked.store(true, atomic::Ordering::Release);
+
+                            if worker_inner.completion.read_current_epoch() != durable_epoch {
+                                worker_inner.is_parked.store(false, atomic::Ordering::Release);
+                                continue;
+                            }
+
+                            let new_guard = worker_inner
+                                .sync_condvar
+                                .wait(guard)
+                                .unwrap_or_else(|e| e.into_inner());
+                            guard = new_guard;
+                            worker_inner.is_parked.store(false, atomic::Ordering::Release);
+
+                            if worker_inner.shutdown.load(atomic::Ordering::Acquire) || *guard {
+                                continue;
+                            }
+
+                            let (new_guard, _) = worker_inner
+                                .sync_condvar
+                                .wait_timeout(guard, interval)
+                                .unwrap_or_else(|e| e.into_inner());
+                            guard = new_guard;
+                        } else {
+                            worker_inner.is_parked.store(false, atomic::Ordering::Release);
+
+                            let (new_guard, _) = worker_inner
+                                .sync_condvar
+                                .wait_timeout(guard, interval)
+                                .unwrap_or_else(|e| e.into_inner());
+                            guard = new_guard;
+                        }
+
                         if worker_inner.shutdown.load(atomic::Ordering::Acquire) {
                             break;
                         }
@@ -1037,7 +1070,17 @@ where
         unsafe { core::ptr::write(ptr, val.clone()) };
 
         let epoch = self.inner.completion.increment_current_epoch();
+
+        if self.inner.is_parked.swap(false, atomic::Ordering::AcqRel) {
+            self.inner.sync_condvar.notify_one();
+        }
+
         Ok(AckTicket::new(epoch, self.inner.completion.clone()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_parked(&self) -> bool {
+        self.inner.is_parked.load(atomic::Ordering::Acquire)
     }
 
     /// Deletes the [`MemMap`] and underlying [`File`] entry from the storage device
@@ -2009,5 +2052,73 @@ mod tests {
 
         let reopened = MemMap::<u64>::open(cfg).unwrap();
         assert_eq!(reopened.read(0).unwrap(), 0xCAFE_F00D);
+    }
+
+    #[test]
+    fn ok_bg_worker_parks_when_idle_and_unparks_on_write() {
+        let (_dir, mut cfg) = tmp_cfg();
+        cfg.sync_interval = Some(Duration::from_millis(15));
+
+        let mmap = MemMap::<u64>::new(cfg).unwrap();
+
+        // Initially without writes, the worker thread should park within a short delay
+        let start = std::time::Instant::now();
+        while !mmap.is_parked() && start.elapsed() < Duration::from_secs(1) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(mmap.is_parked());
+
+        // First write should unpark the worker
+        let ticket = mmap.write(&0x9999, 0).unwrap();
+        assert!(!mmap.is_parked());
+
+        // Ticket should become durable via the unparked background thread
+        let epoch = ticket.wait().unwrap();
+        assert_eq!(epoch, ticket.epoch());
+        assert!(ticket.is_durable());
+        assert_eq!(mmap.read(0).unwrap(), 0x9999);
+
+        // After flushing, worker should re-park when no new writes arrive
+        let start = std::time::Instant::now();
+        while !mmap.is_parked() && start.elapsed() < Duration::from_secs(1) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(mmap.is_parked());
+    }
+
+    #[test]
+    fn ok_batched_writes_while_active_remain_unparked() {
+        let (_dir, mut cfg) = tmp_cfg();
+        cfg.sync_interval = Some(Duration::from_millis(30));
+
+        let mmap = MemMap::<u64>::new(cfg).unwrap();
+
+        // Wait until parked
+        let start = std::time::Instant::now();
+        while !mmap.is_parked() && start.elapsed() < Duration::from_secs(1) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(mmap.is_parked());
+
+        // First write unparks
+        let t1 = mmap.write(&0x1111, 0).unwrap();
+        assert!(!mmap.is_parked());
+
+        // Subsequent rapid writes find worker already unparked (is_parked == false)
+        let t2 = mmap.write(&0x2222, 1).unwrap();
+        let t3 = mmap.write(&0x3333, 2).unwrap();
+        assert!(!mmap.is_parked());
+
+        // All tickets become durable
+        t1.wait().unwrap();
+        t2.wait().unwrap();
+        t3.wait().unwrap();
+
+        assert!(t1.is_durable());
+        assert!(t2.is_durable());
+        assert!(t3.is_durable());
+        assert_eq!(mmap.read(0).unwrap(), 0x1111);
+        assert_eq!(mmap.read(1).unwrap(), 0x2222);
+        assert_eq!(mmap.read(2).unwrap(), 0x3333);
     }
 }
