@@ -713,13 +713,11 @@ mod tests {
         #[test]
         fn ok_active_pages_consecutive_consistency() {
             let (_dir, file, total_len) = new_paged_tmp(2);
-            unsafe {
-                let mmap = WINMemMap::new(file.fd(), total_len).unwrap();
-                let first = mmap.active_page_indices().unwrap();
-                let second = mmap.active_page_indices().unwrap();
-                assert_eq!(first, second);
-                mmap.unmap().unwrap();
-            }
+            let mmap = WINMemMap::new(file.fd(), total_len).unwrap();
+            let first = mmap.active_page_indices().unwrap();
+            let second = mmap.active_page_indices().unwrap();
+            assert_eq!(first, second);
+            mmap.unmap().unwrap();
         }
     }
 
@@ -747,11 +745,9 @@ mod tests {
         #[test]
         fn ok_evict_empty_indices() {
             let (_dir, file, total_len) = new_paged_tmp(2);
-            unsafe {
-                let mmap = WINMemMap::new(file.fd(), total_len).unwrap();
-                assert!(mmap.evict_pages(&[]).is_ok());
-                mmap.unmap().unwrap();
-            }
+            let mmap = WINMemMap::new(file.fd(), total_len).unwrap();
+            assert!(mmap.evict_pages(&[]).is_ok());
+            mmap.unmap().unwrap();
         }
 
         #[test]
@@ -832,16 +828,14 @@ mod tests {
         #[test]
         fn err_evict_out_of_bounds() {
             let (_dir, file, total_len) = new_paged_tmp(2);
-            unsafe {
-                let mmap = WINMemMap::new(file.fd(), total_len).unwrap();
-                let err = mmap.evict_pages(&[2]).unwrap_err();
-                assert_eq!(err.reason, err::HCF.reason);
+            let mmap = WINMemMap::new(file.fd(), total_len).unwrap();
+            let err = mmap.evict_pages(&[2]).unwrap_err();
+            assert_eq!(err.reason, err::HCF.reason);
 
-                let err_large = mmap.evict_pages(&[100]).unwrap_err();
-                assert_eq!(err_large.reason, err::HCF.reason);
+            let err_large = mmap.evict_pages(&[100]).unwrap_err();
+            assert_eq!(err_large.reason, err::HCF.reason);
 
-                mmap.unmap().unwrap();
-            }
+            mmap.unmap().unwrap();
         }
 
         #[test]
@@ -868,10 +862,8 @@ mod tests {
         fn ok_map_unmap_cycle() {
             let (_dir, file) = new_tmp();
 
-            unsafe {
-                let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
-                mmap.unmap().unwrap();
-            }
+            let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
+            mmap.unmap().unwrap();
         }
 
         #[test]
@@ -893,10 +885,8 @@ mod tests {
         fn ok_unmap_consumes_self() {
             let (_dir, file) = new_tmp();
 
-            unsafe {
-                let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
-                assert!(mmap.unmap().is_ok());
-            }
+            let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
+            assert!(mmap.unmap().is_ok());
         }
 
         #[test]
@@ -922,27 +912,30 @@ mod tests {
         #[test]
         fn err_map_on_invalid_length() {
             let (_dir, file) = new_tmp();
-            unsafe {
-                let err = WINMemMap::new(file.fd(), 0).unwrap_err();
-                assert_eq!(err.reason, err::HCF.reason);
-            }
+            let err = WINMemMap::new(file.fd(), 0).unwrap_err();
+            assert_eq!(err.reason, err::HCF.reason);
         }
 
         #[test]
         fn err_map_on_invalid_handle() {
             let (_dir, _) = new_tmp();
-            unsafe {
-                let err = WINMemMap::new(-1isize, LENGTH).unwrap_err();
-                assert_eq!(err.reason, err::HCF.reason);
+            let err = WINMemMap::new(-1isize, LENGTH).unwrap_err();
+            assert_eq!(err.reason, err::HCF.reason);
 
-                let err_zero = WINMemMap::new(0isize, LENGTH).unwrap_err();
-                assert_eq!(err_zero.reason, err::HCF.reason);
-            }
+            let err_zero = WINMemMap::new(0isize, LENGTH).unwrap_err();
+            assert_eq!(err_zero.reason, err::HCF.reason);
         }
 
         #[test]
         fn err_map_on_read_only_handle() {
             use std::os::windows::ffi::OsStrExt;
+            use windows_sys::Win32::{
+                Foundation::GENERIC_READ,
+                Storage::FileSystem::{
+                    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
+                    FILE_SHARE_WRITE, OPEN_EXISTING,
+                },
+            };
 
             let (dir, file) = new_tmp();
             drop(file);
@@ -964,9 +957,9 @@ mod tests {
             };
             assert_ne!(handle, INVALID_HANDLE_VALUE, "open read-only must succeed");
 
+            let err = WINMemMap::new(handle as isize, LENGTH).unwrap_err();
+            assert_eq!(err.reason, err::PRM.reason);
             unsafe {
-                let err = WINMemMap::new(handle as isize, LENGTH).unwrap_err();
-                assert_eq!(err.reason, err::PRM.reason);
                 CloseHandle(handle);
             }
         }
@@ -991,38 +984,32 @@ mod tests {
         fn ok_sync() {
             let (_dir, file) = new_tmp();
 
-            unsafe {
-                let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
-                mmap.sync(LENGTH).unwrap();
-                mmap.unmap().unwrap();
-            }
+            let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
+            mmap.sync(LENGTH).unwrap();
+            mmap.unmap().unwrap();
         }
 
         #[test]
         fn ok_sync_after_sync() {
             let (_dir, file) = new_tmp();
 
-            unsafe {
-                let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
+            let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
 
-                mmap.sync(LENGTH).unwrap();
-                mmap.sync(LENGTH).unwrap();
-                mmap.sync(LENGTH).unwrap();
-                mmap.sync(LENGTH).unwrap();
+            mmap.sync(LENGTH).unwrap();
+            mmap.sync(LENGTH).unwrap();
+            mmap.sync(LENGTH).unwrap();
+            mmap.sync(LENGTH).unwrap();
 
-                mmap.unmap().unwrap();
-            }
+            mmap.unmap().unwrap();
         }
 
         #[test]
         fn ok_sync_zero_length() {
             let (_dir, file) = new_tmp();
 
-            unsafe {
-                let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
-                assert!(mmap.sync(0).is_ok());
-                mmap.unmap().unwrap();
-            }
+            let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
+            assert!(mmap.sync(0).is_ok());
+            mmap.unmap().unwrap();
         }
 
         #[test]
@@ -1290,10 +1277,8 @@ mod tests {
         #[test]
         fn ok_explicit_unmap_prevents_drop_double_unmap() {
             let (_dir, file) = new_tmp();
-            unsafe {
-                let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
-                assert!(mmap.unmap().is_ok());
-            }
+            let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
+            assert!(mmap.unmap().is_ok());
         }
 
         #[test]
