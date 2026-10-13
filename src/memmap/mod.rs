@@ -855,6 +855,22 @@ where
         Self::from_components(cfg, mmap, file)
     }
 
+    /// Returns the system memory page size in bytes queried from kernel settings
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::memmap::MemMap;
+    ///
+    /// let page_size = MemMap::<u64>::page_size().unwrap();
+    /// assert!(page_size >= 4096);
+    /// assert!(page_size.is_power_of_two());
+    /// ```
+    #[inline]
+    pub fn page_size() -> FrozenResult<usize> {
+        PlatformMemMap::page_size()
+    }
+
     /// Returns the length of the memory mapping in bytes
     ///
     /// Corresponds to `initial_t * size_of::<T>()`
@@ -3316,6 +3332,43 @@ mod tests {
             ticket.wait().unwrap();
             assert!(ticket.is_durable());
             assert_eq!(mmap.read(0).unwrap(), 555);
+        }
+    }
+
+    mod memmap_page_size {
+        use super::*;
+
+        #[test]
+        fn ok_page_size_returns_valid_power_of_two() {
+            let page_size = MemMap::<u64>::page_size().unwrap();
+            assert!(page_size >= 4096);
+            assert!(page_size.is_power_of_two());
+        }
+
+        #[test]
+        fn ok_page_size_consistency() {
+            let ps1 = MemMap::<u64>::page_size().unwrap();
+            let ps2 = MemMap::<u64>::page_size().unwrap();
+            let ps3 = MemMap::<ValidT>::page_size().unwrap();
+            assert_eq!(ps1, ps2);
+            assert_eq!(ps1, ps3);
+        }
+
+        #[test]
+        fn ok_page_size_across_threads() {
+            let expected = MemMap::<u64>::page_size().unwrap();
+            let mut handles = Vec::new();
+
+            for _ in 0..8 {
+                handles.push(std::thread::spawn(move || {
+                    let ps = MemMap::<u64>::page_size().unwrap();
+                    assert_eq!(ps, expected);
+                }));
+            }
+
+            for h in handles {
+                h.join().unwrap();
+            }
         }
     }
 }
