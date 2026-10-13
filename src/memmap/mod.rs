@@ -14,7 +14,7 @@
 //!     path,
 //!     version: 1,
 //!     initial_t: 8,
-//!     sync_interval: Duration::from_millis(50),
+//!     sync_interval: Some(Duration::from_millis(50)),
 //! };
 //!
 //! let memmap = MemMap::<u64>::new(cfg).unwrap();
@@ -143,12 +143,12 @@ pub(in crate::memmap) mod err {
 ///     path: std::path::PathBuf::from("test.db"),
 ///     version: 1,
 ///     initial_t: 0x10,
-///     sync_interval: Duration::from_millis(0x64),
+///     sync_interval: Some(Duration::from_millis(0x64)),
 /// };
 ///
 /// assert_eq!(cfg.version, 1);
 /// assert_eq!(cfg.initial_t, 0x10);
-/// assert_eq!(cfg.sync_interval, Duration::from_millis(0x64));
+/// assert_eq!(cfg.sync_interval, Some(Duration::from_millis(0x64)));
 /// ```
 #[derive(Debug, Clone)]
 pub struct MemMapCfg {
@@ -181,10 +181,11 @@ pub struct MemMapCfg {
     /// Initial file length will be `core::mem::size_of::<T>() * initial_t` (bytes)
     pub initial_t: usize,
 
-    /// Interval for the background sync thread
+    /// Optional interval for the background sync thread
     ///
-    /// The background worker thread flushes dirty mapped pages and file state to disk at this interval
-    pub sync_interval: std::time::Duration,
+    /// If `Some(duration)`, a background worker thread is spawned which flushes dirty mapped pages at this interval; and
+    /// if `None`, background sync is disabled and durability advances via manual sync or forced tickets
+    pub sync_interval: Option<std::time::Duration>,
 }
 
 impl MemMapCfg {
@@ -204,7 +205,7 @@ impl MemMapCfg {
     ///     path: PathBuf::from("store.db"),
     ///     version: 3,
     ///     initial_t: 10,
-    ///     sync_interval: Duration::from_millis(100),
+    ///     sync_interval: Some(Duration::from_millis(100)),
     /// };
     ///
     /// assert_eq!(cfg.versioned_path(), PathBuf::from("store_3.db"));
@@ -350,13 +351,17 @@ struct MemMapInner {
 
 impl SyncTrigger for MemMapInner {
     fn trigger_sync(&self) -> FrozenResult<()> {
-        {
-            let mut guard = self.sync_mutex.lock().unwrap_or_else(|e| e.into_inner());
-            *guard = true;
-        }
+        if self.cfg.sync_interval.is_some() {
+            {
+                let mut guard = self.sync_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                *guard = true;
+            }
 
-        self.sync_condvar.notify_one();
-        Ok(())
+            self.sync_condvar.notify_one();
+            Ok(())
+        } else {
+            self.sync_internal()
+        }
     }
 }
 
@@ -429,7 +434,7 @@ impl MemMapInner {
 ///     path: dir.path().join("storage.bin"),
 ///     version: 1,
 ///     initial_t: 4,
-///     sync_interval: Duration::from_millis(100),
+///     sync_interval: Some(Duration::from_millis(100)),
 /// };
 ///
 /// let memmap = MemMap::<u64>::new(cfg).unwrap();
@@ -547,54 +552,63 @@ where
             Arc::downgrade(&inner) as std::sync::Weak<dyn SyncTrigger>;
         completion.set_sync_trigger(weak_inner);
 
-        let worker_inner = Arc::clone(&inner);
-        let handle =
-            std::thread::Builder::new().name("frozen-mmap-sync-worker".into()).spawn(move || {
-                let mut guard = worker_inner.sync_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        let bg_thread = if let Some(interval) = sync_interval {
+            let worker_inner = Arc::clone(&inner);
+            let handle = std::thread::Builder::new().name("frozen-mmap-sync-worker".into()).spawn(
+                move || {
+                    let mut guard =
+                        worker_inner.sync_mutex.lock().unwrap_or_else(|e| e.into_inner());
 
-                while !worker_inner.shutdown.load(atomic::Ordering::Acquire) {
-                    if *guard {
+                    while !worker_inner.shutdown.load(atomic::Ordering::Acquire) {
+                        if *guard {
+                            *guard = false;
+                            drop(guard);
+
+                            let _ = worker_inner.sync_internal();
+                            guard =
+                                worker_inner.sync_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                            continue;
+                        }
+
+                        let (new_guard, _) = worker_inner
+                            .sync_condvar
+                            .wait_timeout(guard, interval)
+                            .unwrap_or_else(|e| e.into_inner());
+
+                        guard = new_guard;
+                        if worker_inner.shutdown.load(atomic::Ordering::Acquire) {
+                            break;
+                        }
+
                         *guard = false;
                         drop(guard);
 
                         let _ = worker_inner.sync_internal();
                         guard = worker_inner.sync_mutex.lock().unwrap_or_else(|e| e.into_inner());
-                        continue;
                     }
+                },
+            );
 
-                    let (new_guard, _) = worker_inner
-                        .sync_condvar
-                        .wait_timeout(guard, sync_interval)
-                        .unwrap_or_else(|e| e.into_inner());
-
-                    guard = new_guard;
-                    if worker_inner.shutdown.load(atomic::Ordering::Acquire) {
-                        break;
+            let handle = match handle {
+                Ok(h) => h,
+                Err(spawn_err) => {
+                    let mut mmap_guard = inner.mmap.write().unwrap_or_else(|e| e.into_inner());
+                    let mut err = err::make_raw_error(err::FXE, spawn_err);
+                    if let Some(m) = mmap_guard.take() {
+                        if let Err(unmap_err) = m.unmap() {
+                            err.add_suppressed(unmap_err);
+                        }
                     }
-
-                    *guard = false;
-                    drop(guard);
-
-                    let _ = worker_inner.sync_internal();
-                    guard = worker_inner.sync_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                    return Err(err.with_module(cfg.module_id));
                 }
-            });
+            };
 
-        let bg_thread = match handle {
-            Ok(h) => h,
-            Err(spawn_err) => {
-                let mut mmap_guard = inner.mmap.write().unwrap_or_else(|e| e.into_inner());
-                let mut err = err::make_raw_error(err::FXE, spawn_err);
-                if let Some(m) = mmap_guard.take() {
-                    if let Err(unmap_err) = m.unmap() {
-                        err.add_suppressed(unmap_err);
-                    }
-                }
-                return Err(err.with_module(cfg.module_id));
-            }
+            Some(handle)
+        } else {
+            None
         };
 
-        Ok(Self { cfg, file: Some(file), inner, bg_thread: Some(bg_thread), _marker: PhantomData })
+        Ok(Self { cfg, file: Some(file), inner, bg_thread, _marker: PhantomData })
     }
 
     /// Creates and memory-maps a new [`File`] at `cfg.versioned_path()`
@@ -623,7 +637,7 @@ where
     ///     path: dir.path().join("new_memmap.bin"),
     ///     version: 1,
     ///     initial_t: 4,
-    ///     sync_interval: Duration::from_millis(100),
+    ///     sync_interval: Some(Duration::from_millis(100)),
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
@@ -689,7 +703,7 @@ where
     ///     path: dir.path().join("open_memmap.bin"),
     ///     version: 1,
     ///     initial_t: 4,
-    ///     sync_interval: Duration::from_millis(100),
+    ///     sync_interval: Some(Duration::from_millis(100)),
     /// };
     ///
     /// {
@@ -744,7 +758,7 @@ where
     ///     path: dir.path().join("open_or_create_memmap.bin"),
     ///     version: 1,
     ///     initial_t: 2,
-    ///     sync_interval: Duration::from_millis(100),
+    ///     sync_interval: Some(Duration::from_millis(100)),
     /// };
     ///
     /// {
@@ -788,7 +802,7 @@ where
     ///     path: dir.path().join("length_demo.bin"),
     ///     version: 1,
     ///     initial_t: 8,
-    ///     sync_interval: Duration::from_millis(100),
+    ///     sync_interval: Some(Duration::from_millis(100)),
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -813,7 +827,7 @@ where
     ///     path: dir.path().join("cfg_demo.bin"),
     ///     version: 2,
     ///     initial_t: 4,
-    ///     sync_interval: Duration::from_millis(100),
+    ///     sync_interval: Some(Duration::from_millis(100)),
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -841,7 +855,7 @@ where
     ///     path: dir.path().join("epoch_demo.bin"),
     ///     version: 1,
     ///     initial_t: 4,
-    ///     sync_interval: Duration::from_millis(100),
+    ///     sync_interval: Some(Duration::from_millis(100)),
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -868,7 +882,7 @@ where
     ///     path: dir.path().join("durable_demo.bin"),
     ///     version: 1,
     ///     initial_t: 4,
-    ///     sync_interval: Duration::from_millis(100),
+    ///     sync_interval: Some(Duration::from_millis(100)),
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -894,7 +908,6 @@ where
     ///
     /// ```
     /// use frozen_core::memmap::{MemMap, MemMapCfg};
-    /// use std::time::Duration;
     ///
     /// let dir = tempfile::tempdir().unwrap();
     /// let cfg = MemMapCfg {
@@ -902,7 +915,7 @@ where
     ///     path: dir.path().join("sync_demo.bin"),
     ///     version: 1,
     ///     initial_t: 4,
-    ///     sync_interval: Duration::from_secs(60),
+    ///     sync_interval: None,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -936,7 +949,7 @@ where
     ///     path: dir.path().join("read_test.bin"),
     ///     version: 1,
     ///     initial_t: 4,
-    ///     sync_interval: Duration::from_millis(100),
+    ///     sync_interval: Some(Duration::from_millis(100)),
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -991,7 +1004,7 @@ where
     ///     path: dir.path().join("write_test.bin"),
     ///     version: 1,
     ///     initial_t: 4,
-    ///     sync_interval: Duration::from_millis(100),
+    ///     sync_interval: Some(Duration::from_millis(100)),
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1052,7 +1065,7 @@ where
     ///     path: dir.path().join("delete_demo.bin"),
     ///     version: 1,
     ///     initial_t: 4,
-    ///     sync_interval: Duration::from_millis(100),
+    ///     sync_interval: Some(Duration::from_millis(100)),
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
@@ -1162,7 +1175,7 @@ mod tests {
             path,
             version: 1,
             initial_t: INIT_T,
-            sync_interval: Duration::from_millis(100),
+            sync_interval: Some(Duration::from_millis(100)),
         };
 
         (dir, cfg)
@@ -1189,7 +1202,7 @@ mod tests {
 
         let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
         assert_eq!(mmap.length(), core::mem::size_of::<u64>() * INIT_T);
-        assert_eq!(mmap.cfg().sync_interval, Duration::from_millis(100));
+        assert_eq!(mmap.cfg().sync_interval, Some(Duration::from_millis(100)));
     }
 
     #[test]
@@ -1247,7 +1260,7 @@ mod tests {
             path: non_existent_dir.join("file.bin"),
             version: 1,
             initial_t: INIT_T,
-            sync_interval: Duration::from_millis(100),
+            sync_interval: Some(Duration::from_millis(100)),
         };
 
         let err_new = MemMap::<u64>::new(cfg.clone()).unwrap_err();
@@ -1271,7 +1284,7 @@ mod tests {
             path: file_path.join("subfile.bin"),
             version: 1,
             initial_t: INIT_T,
-            sync_interval: Duration::from_millis(100),
+            sync_interval: Some(Duration::from_millis(100)),
         };
 
         let err_new = MemMap::<u64>::new(cfg.clone()).unwrap_err();
@@ -1291,7 +1304,7 @@ mod tests {
             path: std::path::PathBuf::from(""),
             version: 1,
             initial_t: INIT_T,
-            sync_interval: Duration::from_millis(100),
+            sync_interval: Some(Duration::from_millis(100)),
         };
 
         let err_new = MemMap::<u64>::new(cfg.clone()).unwrap_err();
@@ -1312,7 +1325,7 @@ mod tests {
             path: dir.path().to_path_buf(),
             version: 1,
             initial_t: INIT_T,
-            sync_interval: Duration::from_millis(100),
+            sync_interval: Some(Duration::from_millis(100)),
         };
 
         let err_new = MemMap::<u64>::new(cfg.clone()).unwrap_err();
@@ -1332,7 +1345,7 @@ mod tests {
             path: std::path::PathBuf::from("/"),
             version: 1,
             initial_t: INIT_T,
-            sync_interval: Duration::from_millis(100),
+            sync_interval: Some(Duration::from_millis(100)),
         };
 
         let err_new = MemMap::<u64>::new(cfg.clone()).unwrap_err();
@@ -1363,7 +1376,7 @@ mod tests {
             path: std::path::PathBuf::from("data.bin"),
             version: 1,
             initial_t: 2,
-            sync_interval: Duration::from_millis(100),
+            sync_interval: Some(Duration::from_millis(100)),
         };
         assert_eq!(cfg.versioned_path(), std::path::PathBuf::from("data_1.bin"));
 
@@ -1373,7 +1386,7 @@ mod tests {
             path: std::path::PathBuf::from("datastore"),
             version: 2,
             initial_t: 2,
-            sync_interval: Duration::from_millis(100),
+            sync_interval: Some(Duration::from_millis(100)),
         };
         assert_eq!(cfg.versioned_path(), std::path::PathBuf::from("datastore_2"));
 
@@ -1383,7 +1396,7 @@ mod tests {
             path: std::path::PathBuf::from("archive.tar.gz"),
             version: 3,
             initial_t: 2,
-            sync_interval: Duration::from_millis(100),
+            sync_interval: Some(Duration::from_millis(100)),
         };
         assert_eq!(cfg.versioned_path(), std::path::PathBuf::from("archive.tar_3.gz"));
 
@@ -1393,7 +1406,7 @@ mod tests {
             path: std::path::PathBuf::from("/var/data/store.db"),
             version: 10,
             initial_t: 2,
-            sync_interval: Duration::from_millis(100),
+            sync_interval: Some(Duration::from_millis(100)),
         };
         assert_eq!(cfg.versioned_path(), std::path::PathBuf::from("/var/data/store_10.db"));
 
@@ -1403,7 +1416,7 @@ mod tests {
             path: std::path::PathBuf::from("dir/sub/file.dat"),
             version: 0,
             initial_t: 2,
-            sync_interval: Duration::from_millis(100),
+            sync_interval: Some(Duration::from_millis(100)),
         };
         assert_eq!(cfg.versioned_path(), std::path::PathBuf::from("dir/sub/file_0.dat"));
 
@@ -1413,7 +1426,7 @@ mod tests {
             path: std::path::PathBuf::from(".env"),
             version: 5,
             initial_t: 2,
-            sync_interval: Duration::from_millis(100),
+            sync_interval: Some(Duration::from_millis(100)),
         };
         assert_eq!(cfg.versioned_path(), std::path::PathBuf::from(".env_5"));
 
@@ -1423,7 +1436,7 @@ mod tests {
             path: std::path::PathBuf::from(".config.json"),
             version: 1,
             initial_t: 2,
-            sync_interval: Duration::from_millis(100),
+            sync_interval: Some(Duration::from_millis(100)),
         };
         assert_eq!(cfg.versioned_path(), std::path::PathBuf::from(".config_1.json"));
     }
@@ -1438,7 +1451,7 @@ mod tests {
             path: base_path.clone(),
             version: 1,
             initial_t: 2,
-            sync_interval: Duration::from_millis(100),
+            sync_interval: Some(Duration::from_millis(100)),
         };
         assert_eq!(cfg_v1.versioned_path(), dir.path().join("store_1.dat"));
 
@@ -1447,7 +1460,7 @@ mod tests {
             path: base_path.clone(),
             version: 2,
             initial_t: 4,
-            sync_interval: Duration::from_millis(100),
+            sync_interval: Some(Duration::from_millis(100)),
         };
         assert_eq!(cfg_v2.versioned_path(), dir.path().join("store_2.dat"));
 
@@ -1562,7 +1575,7 @@ mod tests {
     #[test]
     fn ok_background_sync_advances_epoch() {
         let (_dir, mut cfg) = tmp_cfg();
-        cfg.sync_interval = Duration::from_millis(25);
+        cfg.sync_interval = Some(Duration::from_millis(25));
 
         let mmap = MemMap::<u64>::new(cfg).unwrap();
         let ticket = mmap.write(&0x1234, 0).unwrap();
@@ -1577,7 +1590,7 @@ mod tests {
     fn ok_ticket_force_wakes_bg_worker() {
         let (_dir, mut cfg) = tmp_cfg();
         // Long interval to prove force wakes up immediately
-        cfg.sync_interval = Duration::from_secs(10);
+        cfg.sync_interval = Some(Duration::from_secs(10));
 
         let mmap = MemMap::<u64>::new(cfg).unwrap();
         let ticket = mmap.write(&0xABCD, 0).unwrap();
@@ -1595,7 +1608,7 @@ mod tests {
     #[test]
     fn ok_drop_persists_unflushed_writes() {
         let (_dir, mut cfg) = tmp_cfg();
-        cfg.sync_interval = Duration::from_secs(30);
+        cfg.sync_interval = Some(Duration::from_secs(30));
 
         {
             let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
@@ -1611,7 +1624,7 @@ mod tests {
     fn ok_concurrent_slot_locking() {
         let (_dir, mut cfg) = tmp_cfg();
         cfg.initial_t = 8;
-        cfg.sync_interval = Duration::from_secs(60);
+        cfg.sync_interval = Some(Duration::from_secs(60));
 
         let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
         let barrier = Arc::new(std::sync::Barrier::new(8));
@@ -1785,7 +1798,7 @@ mod tests {
         let (_dir, mut cfg) = tmp_cfg();
         const THREADS: usize = 8;
         cfg.initial_t = THREADS;
-        cfg.sync_interval = Duration::from_secs(60);
+        cfg.sync_interval = Some(Duration::from_secs(60));
 
         let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
         let barrier = Arc::new(std::sync::Barrier::new(THREADS));
@@ -1821,7 +1834,7 @@ mod tests {
         const NUM_SLOTS: usize = 16;
         const NUM_THREADS: usize = 8;
         cfg.initial_t = NUM_SLOTS;
-        cfg.sync_interval = Duration::from_millis(50);
+        cfg.sync_interval = Some(Duration::from_millis(50));
 
         let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
         let barrier = Arc::new(std::sync::Barrier::new(NUM_THREADS));
@@ -1855,7 +1868,7 @@ mod tests {
     fn ok_concurrent_writers_with_background_sync() {
         let (_dir, mut cfg) = tmp_cfg();
         cfg.initial_t = 8;
-        cfg.sync_interval = Duration::from_millis(5);
+        cfg.sync_interval = Some(Duration::from_millis(5));
 
         let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
         let barrier = Arc::new(std::sync::Barrier::new(4));
@@ -1890,7 +1903,7 @@ mod tests {
     fn ok_concurrent_ticket_force_stress() {
         let (_dir, mut cfg) = tmp_cfg();
         cfg.initial_t = 8;
-        cfg.sync_interval = Duration::from_secs(30);
+        cfg.sync_interval = Some(Duration::from_secs(30));
 
         let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
         let barrier = Arc::new(std::sync::Barrier::new(4));
@@ -1947,5 +1960,54 @@ mod tests {
         assert_eq!(mmap.read(0).unwrap(), 1);
         assert_eq!(mmap.read(5000).unwrap(), 5000);
         assert_eq!(mmap.read(LARGE_COUNT - 1).unwrap(), 9999);
+    }
+
+    #[test]
+    fn ok_new_with_sync_interval_none() {
+        let (_dir, mut cfg) = tmp_cfg();
+        cfg.sync_interval = None;
+
+        let mmap = MemMap::<u64>::new(cfg).unwrap();
+        assert!(mmap.bg_thread.is_none());
+
+        let ticket = mmap.write(&0x55AA, 0).unwrap();
+        assert!(!ticket.is_durable());
+
+        mmap.sync().unwrap();
+        assert!(ticket.is_durable());
+        assert_eq!(mmap.read(0).unwrap(), 0x55AA);
+    }
+
+    #[test]
+    fn ok_ticket_force_with_sync_interval_none() {
+        let (_dir, mut cfg) = tmp_cfg();
+        cfg.sync_interval = None;
+
+        let mmap = MemMap::<u64>::new(cfg).unwrap();
+        assert!(mmap.bg_thread.is_none());
+
+        let ticket = mmap.write(&0x1122, 1).unwrap();
+        assert!(!ticket.is_durable());
+
+        let epoch = ticket.force().unwrap();
+        assert_eq!(epoch, ticket.epoch());
+        assert!(ticket.is_durable());
+        assert!(mmap.durable_epoch() >= ticket.epoch());
+    }
+
+    #[test]
+    fn ok_drop_with_sync_interval_none() {
+        let (_dir, mut cfg) = tmp_cfg();
+        cfg.sync_interval = None;
+
+        {
+            let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
+            assert!(mmap.bg_thread.is_none());
+            let _ticket = mmap.write(&0xCAFE_F00D, 0).unwrap();
+            drop(mmap);
+        }
+
+        let reopened = MemMap::<u64>::open(cfg).unwrap();
+        assert_eq!(reopened.read(0).unwrap(), 0xCAFE_F00D);
     }
 }
