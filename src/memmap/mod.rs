@@ -1326,9 +1326,7 @@ where
         let file = match self.file.take() {
             Some(f) => f,
             None => {
-                if let Err(e) = unmap_res {
-                    return Err(e);
-                }
+                unmap_res?;
                 return err::default_error(err::INV).with_module(mid);
             }
         };
@@ -1537,7 +1535,7 @@ pub struct MemMapTransaction<'a, T: Sized + Clone + PartialEq> {
     ops: Vec<(usize, T, T)>,
 }
 
-impl<'a, T> MemMapTransaction<'a, T>
+impl<T> MemMapTransaction<'_, T>
 where
     T: Sized + Clone + PartialEq,
 {
