@@ -15,9 +15,12 @@ Custom implementations and core utilities for [pid7-org](https://github.com/pid7
 
 ## Feature Flags
 
+- [`ack`](https://docs.rs/frozen-core/latest/frozen_core/ack/index.html)
 - [`error`](https://docs.rs/frozen-core/latest/frozen_core/error/index.html)
+- [`file`](https://docs.rs/frozen-core/latest/frozen_core/file/index.html)
 - [`hints`](https://docs.rs/frozen-core/latest/frozen_core/hints/index.html)
 - [`isa`](https://docs.rs/frozen-core/latest/frozen_core/isa/index.html)
+- [`memmap`](https://docs.rs/frozen-core/latest/frozen_core/memmap/index.html)
 
 ## Usage
 
