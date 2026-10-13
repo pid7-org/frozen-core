@@ -1290,19 +1290,21 @@ where
     /// use std::time::Duration;
     ///
     /// let dir = tempfile::tempdir().unwrap();
+    /// let path = dir.path().join("delete_demo.bin");
+    /// let versioned_path = dir.path().join("delete_demo_1.bin");
     /// let cfg = MemMapCfg {
     ///     module_id: 1,
-    ///     path: dir.path().join("delete_demo.bin"),
+    ///     path,
     ///     version: 1,
     ///     initial_t: 4,
     ///     sync_interval: Some(Duration::from_millis(100)),
     /// };
     ///
-    /// let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
-    /// assert!(cfg.versioned_path().exists());
+    /// let mmap = MemMap::<u64>::new(cfg).unwrap();
+    /// assert!(versioned_path.exists());
     ///
     /// mmap.delete().unwrap();
-    /// assert!(!cfg.versioned_path().exists());
+    /// assert!(!versioned_path.exists());
     /// ```
     pub fn delete(mut self) -> FrozenResult<()> {
         let mid = self.cfg.module_id;

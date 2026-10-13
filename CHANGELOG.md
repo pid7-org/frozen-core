@@ -1,5 +1,12 @@
 # Changelog
 
+## `0.0.34`
+
+- Impl of `memmap` module with POSIX and Windows backends
+- Impl of `file` module with POSIX and Windows backends
+- Reintroduced `ack` module for epoch durability tracking
+- Added suppressed error handling and dynamic module binding in `error`
+
 ## `0.0.33`
 
 - Impl of `isa` module
