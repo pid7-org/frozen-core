@@ -430,18 +430,18 @@ mod tests {
     #[test]
     fn ok_ticket_epoch_and_is_durable() {
         let completion = Arc::new(Completion::default());
-        let ticket = AckTicket::new(42, completion.clone());
+        let ticket = AckTicket::new(0x2A, completion.clone());
 
-        assert_eq!(ticket.epoch(), 42);
+        assert_eq!(ticket.epoch(), 0x2A);
         assert!(!ticket.is_durable());
 
-        completion.mark_epoch_as_durable(41);
+        completion.mark_epoch_as_durable(0x29);
         assert!(!ticket.is_durable());
 
-        completion.mark_epoch_as_durable(42);
+        completion.mark_epoch_as_durable(0x2A);
         assert!(ticket.is_durable());
 
-        completion.mark_epoch_as_durable(100);
+        completion.mark_epoch_as_durable(0x64);
         assert!(ticket.is_durable());
     }
 
@@ -454,7 +454,7 @@ mod tests {
         let t = thread::spawn({
             let completion = completion.clone();
             move || {
-                thread::sleep(Duration::from_millis(20));
+                thread::sleep(Duration::from_millis(0x14));
                 completion.mark_epoch_as_durable(epoch);
                 completion.notify_all_listeners();
             }
@@ -476,7 +476,7 @@ mod tests {
             let completion = completion.clone();
             let err = err.clone();
             move || {
-                thread::sleep(Duration::from_millis(20));
+                thread::sleep(Duration::from_millis(0x14));
                 completion.set_err(err);
                 completion.notify_all_listeners();
             }
