@@ -1142,16 +1142,30 @@ where
         }
 
         let mut guard = self.inner.mmap.write().unwrap_or_else(|e| e.into_inner());
-        if let Some(mmap) = guard.take() {
-            mmap.unmap().with_module(mid)?;
-        }
+        let unmap_res =
+            if let Some(mmap) = guard.take() { mmap.unmap().with_module(mid) } else { Ok(()) };
 
         let file = match self.file.take() {
             Some(f) => f,
-            None => return err::default_error(err::INV).with_module(mid),
+            None => {
+                if let Err(e) = unmap_res {
+                    return Err(e);
+                }
+                return err::default_error(err::INV).with_module(mid);
+            }
         };
 
-        file.delete().with_module(mid)
+        let delete_res = file.delete().with_module(mid);
+
+        match (unmap_res, delete_res) {
+            (Err(mut unmap_err), Err(del_err)) => {
+                unmap_err.add_suppressed(del_err);
+                Err(unmap_err)
+            }
+            (Err(unmap_err), Ok(())) => Err(unmap_err),
+            (Ok(()), Err(del_err)) => Err(del_err),
+            (Ok(()), Ok(())) => Ok(()),
+        }
     }
 }
 
@@ -2199,5 +2213,23 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(mmap.is_parked());
+    }
+
+    #[test]
+    fn ok_delete_cleans_up_file_when_mmap_already_unmapped() {
+        let (_dir, cfg) = tmp_cfg();
+        let path = cfg.versioned_path();
+        let mmap = MemMap::<u64>::new(cfg).unwrap();
+        assert!(path.exists());
+
+        // Simulate mmap having been taken/unmapped prior to delete
+        {
+            let mut guard = mmap.inner.mmap.write().unwrap();
+            let _ = guard.take();
+        }
+
+        // delete should still successfully clean up the backing file on disk
+        assert!(mmap.delete().is_ok());
+        assert!(!path.exists());
     }
 }
