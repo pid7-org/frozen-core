@@ -106,6 +106,9 @@ pub(in crate::memmap) mod err {
     /// file does not exist
     pub const NEX: ErrCode = ErrCode::new(0x20, "file does not exist");
 
+    /// unable to grow memory-mapped file
+    pub const GRW: ErrCode = ErrCode::new(0x22, "unable to grow memory-mapped file");
+
     #[inline]
     pub(in crate::memmap) fn raw_error<R, E: std::fmt::Display>(
         code: ErrCode,
@@ -251,6 +254,23 @@ impl SlotLocks {
         Self { locks: slots.into_boxed_slice() }
     }
 
+    fn grow(&mut self, additional_slots: usize) {
+        if additional_slots == 0 {
+            return;
+        }
+
+        let total = self.locks.len() + additional_slots;
+        let mut slots = Vec::with_capacity(total);
+        for val in self.locks.iter() {
+            slots.push(atomic::AtomicU32::new(val.load(atomic::Ordering::Relaxed)));
+        }
+        for _ in 0..additional_slots {
+            slots.push(atomic::AtomicU32::new(0));
+        }
+
+        self.locks = slots.into_boxed_slice();
+    }
+
     #[inline(always)]
     fn read_lock(&self, index: usize) -> SlotReadGuard<'_> {
         let val = &self.locks[index];
@@ -341,8 +361,8 @@ impl Drop for SlotWriteGuard<'_> {
 struct MemMapInner {
     cfg: MemMapCfg,
     mmap: RwLock<Option<PlatformMemMap>>,
-    slot_locks: SlotLocks,
-    length: usize,
+    slot_locks: RwLock<SlotLocks>,
+    length: atomic::AtomicUsize,
     completion: Arc<Completion>,
     sync_condvar: Condvar,
     sync_mutex: Mutex<bool>,
@@ -367,21 +387,16 @@ impl SyncTrigger for MemMapInner {
 }
 
 impl MemMapInner {
-    fn sync_internal(&self) -> FrozenResult<()> {
-        let guard = self.mmap.read().unwrap_or_else(|e| e.into_inner());
-        let mmap = match guard.as_ref() {
-            Some(m) => m,
-            None => return Ok(()),
-        };
-
+    /// Synchronizes dirty pages to storage if current epoch exceeds durable epoch
+    fn sync_mmap_if_needed(&self, mmap: &PlatformMemMap, sync_len: usize) -> FrozenResult<()> {
         let target_epoch = self.completion.read_current_epoch();
         let durable_epoch = self.completion.read_durable_epoch();
 
-        if target_epoch == durable_epoch {
+        if target_epoch <= durable_epoch {
             return Ok(());
         }
 
-        let sync_res = mmap.sync(self.length);
+        let sync_res = mmap.sync(sync_len);
         match sync_res {
             Ok(()) => {
                 self.completion.mark_epoch_as_durable(target_epoch);
@@ -398,6 +413,17 @@ impl MemMapInner {
                 Err(e)
             }
         }
+    }
+
+    fn sync_internal(&self) -> FrozenResult<()> {
+        let guard = self.mmap.read().unwrap_or_else(|e| e.into_inner());
+        let mmap = match guard.as_ref() {
+            Some(m) => m,
+            None => return Ok(()),
+        };
+
+        let length = self.length.load(atomic::Ordering::Acquire);
+        self.sync_mmap_if_needed(mmap, length)
     }
 }
 
@@ -541,8 +567,8 @@ where
         let inner = Arc::new(MemMapInner {
             cfg: cfg.clone(),
             mmap: RwLock::new(Some(mmap)),
-            slot_locks,
-            length,
+            slot_locks: RwLock::new(slot_locks),
+            length: atomic::AtomicUsize::new(length),
             completion: completion.clone(),
             sync_condvar: Condvar::new(),
             sync_mutex: Mutex::new(false),
@@ -849,7 +875,146 @@ where
     /// ```
     #[inline]
     pub fn length(&self) -> usize {
-        self.inner.length
+        self.inner.length.load(atomic::Ordering::Acquire)
+    }
+
+    /// Dynamically grows the memory-mapped file by `count` additional elements of type `T`
+    ///
+    /// ## Semantics
+    ///
+    /// - Halts all concurrent read and write operations across all slots for the duration of the growth
+    /// - Halts background durability flushing and manual sync operations
+    /// - If uncommitted dirty writes exist (`current_epoch > durable_epoch`), performs a durability sync
+    ///   before modifying file boundaries
+    /// - Explicitly unmaps the current virtual memory mapping
+    /// - Zero-extends the backing file on disk safely via [`File::grow`] and synchronizes file metadata
+    /// - Establishes a new memory mapping over the enlarged file range
+    /// - Dynamically expands per-slot spinlocks to accommodate new slots
+    /// - Updates tracked mapping length and advances durability epoch
+    ///
+    /// ## Crash Durability & Safety
+    ///
+    /// - Existing payload data is flushed to persistent storage before file extension, ensuring no data loss
+    /// - Disk block pre-allocation (`fallocate` / `f_preallocate`) precedes logical size expansion; out-of-space
+    ///   failures leave existing data untouched
+    /// - If file growth fails, the original memory mapping is automatically restored
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::memmap::{MemMap, MemMapCfg};
+    /// use std::time::Duration;
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = MemMapCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().join("grow_demo.bin"),
+    ///     version: 1,
+    ///     initial_t: 2,
+    ///     sync_interval: None,
+    /// };
+    ///
+    /// let mmap = MemMap::<u64>::new(cfg).unwrap();
+    /// assert_eq!(mmap.length(), 2 * std::mem::size_of::<u64>());
+    /// mmap.write(&111u64, 0).unwrap();
+    ///
+    /// mmap.grow(3).unwrap();
+    /// assert_eq!(mmap.length(), 5 * std::mem::size_of::<u64>());
+    /// assert_eq!(mmap.read(0).unwrap(), 111u64);
+    /// assert_eq!(mmap.read(4).unwrap(), 0u64);
+    /// ```
+    pub fn grow(&self, count: usize) -> FrozenResult<()> {
+        let mid = self.cfg.module_id;
+        if count == 0 {
+            return Ok(());
+        }
+
+        let size = core::mem::size_of::<T>();
+        let len_to_add = match count.checked_mul(size) {
+            Some(len) => len,
+            None => {
+                return err::raw_error(err::GRW, "file growth calculation overflowed usize")
+                    .with_module(mid);
+            }
+        };
+
+        let file = match self.file.as_ref() {
+            Some(f) => f,
+            None => return err::default_error(err::INV).with_module(mid),
+        };
+
+        // Halt all read and write ops by taking exclusive write lock on slot_locks
+        let mut slot_locks_guard = self.inner.slot_locks.write().unwrap_or_else(|e| e.into_inner());
+
+        // Halt all sync ops (including background sync worker) by taking exclusive write lock on mmap
+        let mut mmap_guard = self.inner.mmap.write().unwrap_or_else(|e| e.into_inner());
+
+        let mmap = match mmap_guard.as_ref() {
+            Some(m) => m,
+            None => return err::default_error(err::INV).with_module(mid),
+        };
+
+        let curr_len = self.inner.length.load(atomic::Ordering::Acquire);
+        let new_length = match curr_len.checked_add(len_to_add) {
+            Some(len) => len,
+            None => {
+                return err::raw_error(err::GRW, "file growth calculation overflowed usize")
+                    .with_module(mid);
+            }
+        };
+
+        // Pre-growth sync: only if needed (curr_epoch > durable_epoch)
+        self.inner.sync_mmap_if_needed(mmap, curr_len)?;
+
+        // Unmap current mapping
+        let old_mmap = match mmap_guard.take() {
+            Some(m) => m,
+            None => return err::default_error(err::INV).with_module(mid),
+        };
+
+        if let Err(e) = old_mmap.unmap().with_module(mid) {
+            if let Ok(restored) = PlatformMemMap::new(file.fd(), curr_len).with_module(mid) {
+                *mmap_guard = Some(restored);
+            }
+            return Err(e);
+        }
+
+        // Zero extend the file
+        if let Err(e) = file.grow(count).with_module(mid) {
+            if let Ok(restored) = PlatformMemMap::new(file.fd(), curr_len).with_module(mid) {
+                *mmap_guard = Some(restored);
+            }
+            return Err(e);
+        }
+
+        // Flush new file metadata to disk for crash safety
+        if let Err(e) = file.sync().with_module(mid) {
+            if let Ok(restored) = PlatformMemMap::new(file.fd(), new_length).with_module(mid) {
+                *mmap_guard = Some(restored);
+                self.inner.length.store(new_length, atomic::Ordering::Release);
+                slot_locks_guard.grow(count);
+            }
+            return Err(e);
+        }
+
+        // Re-mmap grown file
+        let new_mmap = match PlatformMemMap::new(file.fd(), new_length).with_module(mid) {
+            Ok(m) => m,
+            Err(e) => {
+                if let Ok(restored) = PlatformMemMap::new(file.fd(), curr_len).with_module(mid) {
+                    *mmap_guard = Some(restored);
+                }
+                return Err(e);
+            }
+        };
+
+        *mmap_guard = Some(new_mmap);
+        slot_locks_guard.grow(count);
+        self.inner.length.store(new_length, atomic::Ordering::Release);
+
+        self.inner.completion.increment_current_epoch();
+
+        Ok(())
     }
 
     /// Returns a reference to the active [`MemMapCfg`] configuration
@@ -1005,11 +1170,13 @@ where
             None => return err::default_error(err::INV).with_module(mid),
         };
 
+        let slot_locks_guard = self.inner.slot_locks.read().unwrap_or_else(|e| e.into_inner());
+
         if hints::unlikely(offset.checked_add(size).is_none_or(|end| end > self.length())) {
             return err::default_error(err::HCF).with_module(mid);
         }
 
-        let _slot_guard = self.inner.slot_locks.read_lock(index);
+        let _slot_guard = slot_locks_guard.read_lock(index);
 
         let guard = self.inner.mmap.read().unwrap_or_else(|e| e.into_inner());
         let mmap = match guard.as_ref() {
@@ -1019,6 +1186,9 @@ where
 
         let ptr = unsafe { mmap.as_ptr::<T>(offset) };
         let val = unsafe { ptr.read() };
+        drop(guard);
+        drop(_slot_guard);
+        drop(slot_locks_guard);
         Ok(val)
     }
 
@@ -1060,11 +1230,13 @@ where
             None => return err::default_error(err::INV).with_module(mid),
         };
 
+        let slot_locks_guard = self.inner.slot_locks.read().unwrap_or_else(|e| e.into_inner());
+
         if hints::unlikely(offset.checked_add(size).is_none_or(|end| end > self.length())) {
             return err::default_error(err::HCF).with_module(mid);
         }
 
-        let _slot_guard = self.inner.slot_locks.write_lock(index);
+        let _slot_guard = slot_locks_guard.write_lock(index);
 
         let guard = self.inner.mmap.read().unwrap_or_else(|e| e.into_inner());
         let mmap = match guard.as_ref() {
@@ -1076,6 +1248,7 @@ where
         unsafe { core::ptr::write(ptr, val.clone()) };
         drop(guard);
         drop(_slot_guard);
+        drop(slot_locks_guard);
 
         let epoch = self.inner.completion.increment_current_epoch();
 
@@ -2231,5 +2404,159 @@ mod tests {
         // delete should still successfully clean up the backing file on disk
         assert!(mmap.delete().is_ok());
         assert!(!path.exists());
+    }
+
+    mod memmap_grow {
+        use super::*;
+
+        #[test]
+        fn ok_grow_updates_length() {
+            let (_dir, cfg) = tmp_cfg();
+            let mmap = MemMap::<u64>::new(cfg).unwrap();
+            let initial_len = INIT_T * core::mem::size_of::<u64>();
+            assert_eq!(mmap.length(), initial_len);
+
+            mmap.grow(4).unwrap();
+            assert_eq!(mmap.length(), initial_len + 4 * core::mem::size_of::<u64>());
+        }
+
+        #[test]
+        fn ok_grow_zero_count() {
+            let (_dir, cfg) = tmp_cfg();
+            let mmap = MemMap::<u64>::new(cfg).unwrap();
+            let initial_len = mmap.length();
+
+            mmap.grow(0).unwrap();
+            assert_eq!(mmap.length(), initial_len);
+        }
+
+        #[test]
+        fn ok_grow_extends_with_zero() {
+            let (_dir, cfg) = tmp_cfg();
+            let mmap = MemMap::<u64>::new(cfg).unwrap();
+            mmap.grow(3).unwrap();
+
+            // Newly extended slots should read as 0
+            for idx in INIT_T..(INIT_T + 3) {
+                assert_eq!(mmap.read(idx).unwrap(), 0u64);
+            }
+        }
+
+        #[test]
+        fn ok_grow_preserves_existing_data() {
+            let (_dir, cfg) = tmp_cfg();
+            let mmap = MemMap::<u64>::new(cfg).unwrap();
+
+            for i in 0..INIT_T {
+                mmap.write(&(0xCAFE_0000 + i as u64), i).unwrap();
+            }
+
+            mmap.grow(4).unwrap();
+
+            // Old slots preserved
+            for i in 0..INIT_T {
+                assert_eq!(mmap.read(i).unwrap(), 0xCAFE_0000 + i as u64);
+            }
+
+            // New slots can be written and read
+            for i in INIT_T..(INIT_T + 4) {
+                mmap.write(&(0xBEEF_0000 + i as u64), i).unwrap();
+                assert_eq!(mmap.read(i).unwrap(), 0xBEEF_0000 + i as u64);
+            }
+        }
+
+        #[test]
+        fn ok_grow_syncs_dirty_pages_when_curr_epoch_gt_durable() {
+            let (_dir, mut cfg) = tmp_cfg();
+            cfg.sync_interval = None; // Manual sync mode
+
+            let mmap = MemMap::<u64>::new(cfg).unwrap();
+            let ticket = mmap.write(&0x1234_5678u64, 1).unwrap();
+
+            assert!(!ticket.is_durable());
+            assert!(mmap.current_epoch() > mmap.durable_epoch());
+
+            // grow should trigger durability sync before re-mapping
+            mmap.grow(2).unwrap();
+
+            assert!(ticket.is_durable());
+            assert!(mmap.durable_epoch() >= ticket.epoch());
+        }
+
+        #[test]
+        fn ok_grow_when_already_durable() {
+            let (_dir, mut cfg) = tmp_cfg();
+            cfg.sync_interval = None;
+
+            let mmap = MemMap::<u64>::new(cfg).unwrap();
+            let ticket = mmap.write(&0x9999u64, 0).unwrap();
+            mmap.sync().unwrap();
+            assert!(ticket.is_durable());
+            assert_eq!(mmap.current_epoch(), mmap.durable_epoch());
+
+            mmap.grow(2).unwrap();
+            assert_eq!(mmap.read(0).unwrap(), 0x9999u64);
+        }
+
+        #[test]
+        fn err_grow_overflow_usize() {
+            let (_dir, cfg) = tmp_cfg();
+            let mmap = MemMap::<u64>::new(cfg).unwrap();
+
+            let err = mmap.grow(usize::MAX).unwrap_err();
+            assert_eq!(err.reason, err::GRW.reason);
+        }
+
+        #[test]
+        fn ok_grow_multiple_times() {
+            let (_dir, cfg) = tmp_cfg();
+            let mmap = MemMap::<u64>::new(cfg).unwrap();
+
+            mmap.write(&10u64, 0).unwrap();
+            mmap.grow(2).unwrap();
+            mmap.write(&20u64, INIT_T).unwrap();
+            mmap.grow(3).unwrap();
+            mmap.write(&30u64, INIT_T + 2).unwrap();
+
+            assert_eq!(mmap.read(0).unwrap(), 10u64);
+            assert_eq!(mmap.read(INIT_T).unwrap(), 20u64);
+            assert_eq!(mmap.read(INIT_T + 2).unwrap(), 30u64);
+            assert_eq!(mmap.length(), (INIT_T + 5) * core::mem::size_of::<u64>());
+        }
+
+        #[test]
+        fn ok_concurrent_grow_and_reads_writes() {
+            let (_dir, mut cfg) = tmp_cfg();
+            cfg.sync_interval = Some(Duration::from_millis(10));
+            let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
+
+            let num_writers = 4;
+            let mut handles = Vec::new();
+
+            for w in 0..num_writers {
+                let m = Arc::clone(&mmap);
+                handles.push(std::thread::spawn(move || {
+                    for i in 0..50 {
+                        let _ = m.write(&((w * 1000 + i) as u64), w % INIT_T);
+                        let _ = m.read(w % INIT_T);
+                    }
+                }));
+            }
+
+            let m_grower = Arc::clone(&mmap);
+            let grower_handle = std::thread::spawn(move || {
+                for _ in 0..3 {
+                    std::thread::sleep(Duration::from_millis(5));
+                    m_grower.grow(2).unwrap();
+                }
+            });
+
+            for h in handles {
+                h.join().unwrap();
+            }
+            grower_handle.join().unwrap();
+
+            assert_eq!(mmap.length(), (INIT_T + 6) * core::mem::size_of::<u64>());
+        }
     }
 }
