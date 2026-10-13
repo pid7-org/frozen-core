@@ -1732,7 +1732,7 @@ mod tests {
             let (_dir, path) = tmp_path();
             let file = POSIXFile::new(&path).unwrap();
 
-            let err = file.grow(usize::MAX - 10, 20).unwrap_err();
+            let err = file.grow(usize::MAX - 0x0A, 0x14).unwrap_err();
             assert_eq!(err.reason, err::GRW.reason);
 
             file.close().unwrap();
@@ -1816,7 +1816,7 @@ mod tests {
             // session 2
             {
                 let file = POSIXFile::new(&path).unwrap();
-                let mut buf = vec![0u8; 10];
+                let mut buf = vec![0u8; 0x0A];
                 file.pread(&mut buf, 0).unwrap();
                 assert_eq!(&buf[..], b"persist_me");
                 file.close().unwrap();
@@ -1890,7 +1890,7 @@ mod tests {
         fn err_pread_past_eof() {
             let (_dir, path) = tmp_path();
             let file = POSIXFile::new(&path).unwrap();
-            let mut buf = [0u8; 16];
+            let mut buf = [0u8; 0x10];
             let err = file.pread(&mut buf, 0).unwrap_err();
             assert_eq!(err.reason, err::HCF.reason);
             file.close().unwrap();
@@ -2127,7 +2127,7 @@ mod tests {
         fn err_ftruncate_overflow() {
             let (_dir, path) = tmp_path();
             let file = POSIXFile::new(&path).unwrap();
-            let err = ftruncate_raw(file.fd(), usize::MAX - 10, 20).unwrap_err();
+            let err = ftruncate_raw(file.fd(), usize::MAX - 0x0A, 0x14).unwrap_err();
             assert_eq!(err.reason, err::GRW.reason);
             file.close().unwrap();
         }

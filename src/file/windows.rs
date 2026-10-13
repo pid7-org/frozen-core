@@ -1359,7 +1359,7 @@ mod tests {
                 let running = running.clone();
                 std::thread::spawn(move || {
                     let mut attempts = 0;
-                    while running.load(atomic::Ordering::Relaxed) || attempts < 50 {
+                    while running.load(atomic::Ordering::Relaxed) || attempts < 0x32 {
                         attempts += 1;
                         let res = WINFile::open(&path);
                         // Once unlinked, open must fail with INV (file not found) or PRM (delete-pending)
@@ -1426,7 +1426,7 @@ mod tests {
                 })
             };
 
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(0x0A));
             unlinked.store(true, atomic::Ordering::Release);
             file.unlink(&path).unwrap();
 

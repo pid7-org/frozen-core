@@ -1262,7 +1262,7 @@ mod tests {
             let (_dir, mut cfg) = tmp_path();
             // On 64-bit systems, setting buffer_size such that buffer_size * initial_buffers exceeds
             // off_t::MAX / i64::MAX triggers grow failure after successful creation
-            cfg.buffer_size = 1 << 63;
+            cfg.buffer_size = 1 << 0x3F;
             cfg.initial_available_buffers = 1;
 
             let err = File::new(cfg.clone()).unwrap_err();
@@ -1590,7 +1590,7 @@ mod tests {
                 let running = running.clone();
                 std::thread::spawn(move || {
                     let mut attempts = 0;
-                    while running.load(atomic::Ordering::Relaxed) || attempts < 50 {
+                    while running.load(atomic::Ordering::Relaxed) || attempts < 0x32 {
                         attempts += 1;
                         let res = File::open(cfg.clone());
                         // While the file is open, open fails with LCK
@@ -1663,7 +1663,7 @@ mod tests {
                 })
             };
 
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(0x0A));
             deleted.store(true, atomic::Ordering::Release);
             file.delete().unwrap();
 
@@ -1823,14 +1823,14 @@ mod tests {
         #[test]
         fn ok_concurrent_non_overlapping_writes() {
             let (_dir, mut cfg) = tmp_path();
-            cfg.initial_available_buffers = 16;
+            cfg.initial_available_buffers = 0x10;
             let file = Arc::new(File::new(cfg).unwrap());
 
             let mut handles = vec![];
             for i in 0..4 {
                 let f = file.clone();
                 handles.push(std::thread::spawn(move || {
-                    let data = [i as u8 + 10; BUFFER_SIZE * 2];
+                    let data = [i as u8 + 0x0A; BUFFER_SIZE * 2];
                     f.write(&data, i * 2).unwrap();
                 }));
             }
@@ -1844,7 +1844,7 @@ mod tests {
             for i in 0..4 {
                 let mut buf = [0u8; BUFFER_SIZE * 2];
                 file.read(&mut buf, i * 2).unwrap();
-                assert_eq!(buf, [i as u8 + 10; BUFFER_SIZE * 2]);
+                assert_eq!(buf, [i as u8 + 0x0A; BUFFER_SIZE * 2]);
             }
         }
 
@@ -2052,8 +2052,8 @@ mod tests {
                 r.join().unwrap();
             }
 
-            assert_eq!(file.length(), BUFFER_SIZE * (INIT_BUFFERS + 10));
-            assert_eq!(file.total_buffers().unwrap(), INIT_BUFFERS + 10);
+            assert_eq!(file.length(), BUFFER_SIZE * (INIT_BUFFERS + 0x0A));
+            assert_eq!(file.total_buffers().unwrap(), INIT_BUFFERS + 0x0A);
         }
 
         #[test]
@@ -2324,7 +2324,7 @@ mod tests {
         #[test]
         fn ok_background_sync_advances_epoch() {
             let (_dir, mut cfg) = tmp_path();
-            cfg.sync_interval = Some(Duration::from_millis(25));
+            cfg.sync_interval = Some(Duration::from_millis(0x19));
 
             let file = File::new(cfg).unwrap();
             let data = [0x33u8; BUFFER_SIZE];
@@ -2340,7 +2340,7 @@ mod tests {
         fn ok_ticket_force_with_background_thread() {
             let (_dir, mut cfg) = tmp_path();
             // Long interval to verify force wakes up immediately
-            cfg.sync_interval = Some(Duration::from_secs(10));
+            cfg.sync_interval = Some(Duration::from_secs(0x0A));
 
             let file = File::new(cfg).unwrap();
             let data = [0x44u8; BUFFER_SIZE];
@@ -2360,7 +2360,7 @@ mod tests {
         #[test]
         fn ok_drop_with_background_thread_persists_data() {
             let (_dir, mut cfg) = tmp_path();
-            cfg.sync_interval = Some(Duration::from_secs(30));
+            cfg.sync_interval = Some(Duration::from_secs(0x1E));
             let data = [0x88u8; BUFFER_SIZE];
 
             {
@@ -2381,7 +2381,7 @@ mod tests {
         #[test]
         fn ok_delete_with_background_thread() {
             let (_dir, mut cfg) = tmp_path();
-            cfg.sync_interval = Some(Duration::from_millis(20));
+            cfg.sync_interval = Some(Duration::from_millis(0x14));
 
             let file = File::new(cfg.clone()).unwrap();
             let data = [0x99u8; BUFFER_SIZE];
@@ -2454,10 +2454,10 @@ mod tests {
         #[test]
         fn ok_concurrent_ticket_force_storm() {
             let (_dir, mut cfg) = tmp_path();
-            cfg.initial_available_buffers = 32;
-            cfg.sync_interval = Some(Duration::from_millis(10));
+            cfg.initial_available_buffers = 0x20;
+            cfg.sync_interval = Some(Duration::from_millis(0x0A));
             let file = Arc::new(File::new(cfg).unwrap());
-            let num_threads = 16;
+            let num_threads = 0x10;
             let barrier = Arc::new(Barrier::new(num_threads));
             let mut handles = Vec::new();
 
@@ -2512,7 +2512,7 @@ mod tests {
             assert_eq!(err1.module, 0x11);
             assert_eq!(err1.reason, err::INV.reason);
 
-            let err1_oob = file1.read(&mut [0u8; BUFFER_SIZE], 999).unwrap_err();
+            let err1_oob = file1.read(&mut [0u8; BUFFER_SIZE], 0x3E7).unwrap_err();
             assert_eq!(err1_oob.module, 0x11);
             assert_eq!(err1_oob.reason, err::HCF.reason);
 
@@ -2521,7 +2521,7 @@ mod tests {
             assert_eq!(err2.module, 0x22);
             assert_eq!(err2.reason, err::INV.reason);
 
-            let err2_oob = file2.write(&[0u8; BUFFER_SIZE], 999).unwrap_err();
+            let err2_oob = file2.write(&[0u8; BUFFER_SIZE], 0x3E7).unwrap_err();
             assert_eq!(err2_oob.module, 0x22);
             assert_eq!(err2_oob.reason, err::HCF.reason);
 
