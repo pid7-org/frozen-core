@@ -109,6 +109,10 @@ pub(in crate::memmap) mod err {
     /// unable to grow memory-mapped file
     pub const GRW: ErrCode = ErrCode::new(0x22, "unable to grow memory-mapped file");
 
+    /// state conflict / compare and swap mismatch
+    pub const CAS: ErrCode =
+        ErrCode::new(0x24, "compare and swap conflict: slot state has changed");
+
     #[inline]
     pub(in crate::memmap) fn raw_error<R, E: std::fmt::Display>(
         code: ErrCode,
@@ -1339,6 +1343,423 @@ where
             (Ok(()), Err(del_err)) => Err(del_err),
             (Ok(()), Ok(())) => Ok(()),
         }
+    }
+}
+
+impl<T> MemMap<T>
+where
+    T: Sized + Clone + PartialEq,
+{
+    /// Conditionally writes `val` into slot `index` if and only if the current value matches `expected`
+    ///
+    /// ## Semantics
+    ///
+    /// Acquires the exclusive slot lock for `index` and verifies that the current slot value equals
+    /// `expected`. If equal, writes `val`, advances the epoch, and returns an [`AckTicket`].
+    /// If the current value differs from `expected`, the operation immediately aborts without
+    /// modifying the slot, returning [`err::CAS`] so the caller can re-read and retry.
+    ///
+    /// ## Constraints
+    ///
+    /// - `index * size_of::<T>()` must not overflow `usize`, otherwise returns [`err::INV`]
+    /// - Writing past the mapped memory region returns [`err::HCF`]
+    /// - Returns [`err::CAS`] if `expected != current`
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::memmap::{MemMap, MemMapCfg};
+    /// use std::time::Duration;
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = MemMapCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().join("cas_demo.bin"),
+    ///     version: 1,
+    ///     initial_t: 4,
+    ///     sync_interval: Some(Duration::from_millis(100)),
+    /// };
+    ///
+    /// let mmap = MemMap::<u64>::new(cfg).unwrap();
+    /// mmap.write(&100u64, 0).unwrap();
+    ///
+    /// // Successful CAS: 100 -> 200
+    /// let ticket = mmap.compare_and_write(&100u64, &200u64, 0).unwrap();
+    /// assert_eq!(mmap.read(0).unwrap(), 200u64);
+    ///
+    /// // Failed CAS: expected 100, but slot is 200
+    /// assert!(mmap.compare_and_write(&100u64, &300u64, 0).is_err());
+    /// assert_eq!(mmap.read(0).unwrap(), 200u64);
+    /// ```
+    pub fn compare_and_write(
+        &self,
+        expected: &T,
+        val: &T,
+        index: usize,
+    ) -> FrozenResult<AckTicket> {
+        let mid = self.cfg.module_id;
+        let size = core::mem::size_of::<T>();
+
+        let offset = match index.checked_mul(size) {
+            Some(off) => off,
+            None => return err::default_error(err::INV).with_module(mid),
+        };
+
+        let slot_locks_guard = self.inner.slot_locks.read().unwrap_or_else(|e| e.into_inner());
+
+        if hints::unlikely(offset.checked_add(size).is_none_or(|end| end > self.length())) {
+            return err::default_error(err::HCF).with_module(mid);
+        }
+
+        let _slot_guard = slot_locks_guard.write_lock(index);
+
+        let guard = self.inner.mmap.read().unwrap_or_else(|e| e.into_inner());
+        let mmap = match guard.as_ref() {
+            Some(m) => m,
+            None => return err::default_error(err::INV).with_module(mid),
+        };
+
+        let ptr = unsafe { mmap.as_mut_ptr::<T>(offset) };
+        let current = unsafe { ptr.read() };
+        if current != *expected {
+            drop(guard);
+            drop(_slot_guard);
+            drop(slot_locks_guard);
+            return err::raw_error(
+                err::CAS,
+                format!("state conflict at index {}: slot data has changed", index),
+            )
+            .with_module(mid);
+        }
+
+        unsafe { core::ptr::write(ptr, val.clone()) };
+        drop(guard);
+        drop(_slot_guard);
+        drop(slot_locks_guard);
+
+        let epoch = self.inner.completion.increment_current_epoch();
+
+        if self.inner.is_parked.load(atomic::Ordering::Acquire) {
+            let _guard = self.inner.sync_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            if self.inner.is_parked.swap(false, atomic::Ordering::AcqRel) {
+                self.inner.sync_condvar.notify_one();
+            }
+        }
+
+        Ok(AckTicket::new(epoch, self.inner.completion.clone()))
+    }
+
+    /// Creates a new [`MemMapTransaction`] context for grouping multiple conditional writes into a single atomic epoch
+    ///
+    /// ## Overview
+    ///
+    /// `MemMapTransaction` allows grouping multiple slot mutations into a single atomic operation:
+    ///
+    /// - **Atomicity**: All writes succeed or fail together.
+    /// - **Optimistic Concurrency Control (CAS)**: Each write asserts that its target slot currently
+    ///   matches `expected`. If any slot differs at commit time, all changes abort and no slots are modified.
+    /// - **Single Epoch**: All committed writes share a single durability epoch and durable window.
+    /// - **Deadlock Freedom**: Slot locks are acquired in strictly ascending index order.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::memmap::{MemMap, MemMapCfg};
+    /// use std::time::Duration;
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = MemMapCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().join("tx_demo.bin"),
+    ///     version: 1,
+    ///     initial_t: 4,
+    ///     sync_interval: Some(Duration::from_millis(100)),
+    /// };
+    ///
+    /// let mmap = MemMap::<u64>::new(cfg).unwrap();
+    ///
+    /// let mut tx = mmap.new_tx();
+    /// tx.write(&0u64, &10u64, 0).unwrap();
+    /// tx.write(&0u64, &20u64, 1).unwrap();
+    ///
+    /// let ticket = tx.commit().unwrap();
+    /// assert_eq!(mmap.read(0).unwrap(), 10u64);
+    /// assert_eq!(mmap.read(1).unwrap(), 20u64);
+    /// ```
+    #[inline]
+    pub fn new_tx(&self) -> MemMapTransaction<'_, T> {
+        MemMapTransaction { memmap: self, ops: Vec::new() }
+    }
+}
+
+/// Context for grouping multiple conditional writes into a single atomic operation
+///
+/// Multi-slot mutations are staged in `MemMapTransaction` with optimistic concurrency preconditions.
+/// At [`commit`](Self::commit) time, all target slot locks are acquired in strictly ascending order,
+/// each slot is verified against its `expected` value, and if all match, all updates are applied
+/// under a single epoch.
+///
+/// If any slot fails verification, the transaction aborts with zero mutations, returning [`err::CAS`]
+/// with the index of the first conflicting slot so the caller can retry.
+///
+/// ## Example
+///
+/// ```
+/// use frozen_core::memmap::{MemMap, MemMapCfg};
+/// use std::time::Duration;
+///
+/// let dir = tempfile::tempdir().unwrap();
+/// let cfg = MemMapCfg {
+///     module_id: 1,
+///     path: dir.path().join("tx_struct_demo.bin"),
+///     version: 1,
+///     initial_t: 4,
+///     sync_interval: Some(Duration::from_millis(100)),
+/// };
+///
+/// let mmap = MemMap::<u64>::new(cfg).unwrap();
+/// let mut tx = mmap.new_tx();
+/// tx.write(&0u64, &42u64, 0).unwrap();
+/// tx.write(&0u64, &84u64, 2).unwrap();
+///
+/// let ticket = tx.commit().unwrap();
+/// assert_eq!(mmap.read(0).unwrap(), 42u64);
+/// assert_eq!(mmap.read(2).unwrap(), 84u64);
+/// ```
+#[derive(Debug)]
+pub struct MemMapTransaction<'a, T: Sized + Clone + PartialEq> {
+    memmap: &'a MemMap<T>,
+    ops: Vec<(usize, T, T)>,
+}
+
+impl<'a, T> MemMapTransaction<'a, T>
+where
+    T: Sized + Clone + PartialEq,
+{
+    /// Stages a conditional write of `new` at `index` requiring `expected` as the current slot value
+    ///
+    /// ## Requirements
+    ///
+    /// - Writes must be staged in strictly increasing index order (`index > previous_index`)
+    /// - Duplicate indices in the same transaction return an error
+    /// - `index` must not exceed mapping bounds
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::memmap::{MemMap, MemMapCfg};
+    /// use std::time::Duration;
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = MemMapCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().join("tx_write_demo.bin"),
+    ///     version: 1,
+    ///     initial_t: 4,
+    ///     sync_interval: Some(Duration::from_millis(100)),
+    /// };
+    ///
+    /// let mmap = MemMap::<u64>::new(cfg).unwrap();
+    /// let mut tx = mmap.new_tx();
+    /// tx.write(&0u64, &111u64, 0).unwrap();
+    /// tx.write(&0u64, &222u64, 1).unwrap();
+    ///
+    /// // Staging an out-of-order or duplicate index fails
+    /// assert!(tx.write(&0u64, &333u64, 1).is_err());
+    /// assert!(tx.write(&0u64, &333u64, 0).is_err());
+    /// ```
+    #[inline(always)]
+    pub fn write(&mut self, expected: &T, new: &T, index: usize) -> FrozenResult<&mut Self> {
+        let mid = self.memmap.cfg.module_id;
+        if let Some(err) = self.memmap.inner.completion.get_err() {
+            return Err(err);
+        }
+
+        if let Some((last_idx, _, _)) = self.ops.last() {
+            if index <= *last_idx {
+                return err::raw_error(
+                    err::HCF,
+                    "tx writes must be strictly ordered, with no more then single ops on given index",
+                )
+                .with_module(mid);
+            }
+        }
+
+        let size = core::mem::size_of::<T>();
+        let offset = match index.checked_mul(size) {
+            Some(off) => off,
+            None => return err::default_error(err::INV).with_module(mid),
+        };
+
+        if hints::unlikely(offset.checked_add(size).is_none_or(|end| end > self.memmap.length())) {
+            return err::default_error(err::HCF).with_module(mid);
+        }
+
+        self.ops.push((index, expected.clone(), new.clone()));
+        Ok(self)
+    }
+
+    /// Commits all staged writes atomically under a single durability epoch
+    ///
+    /// Acquires exclusive locks for all affected slots in order. If all slots match their
+    /// expected values, updates are applied, the durable epoch advances once, and an
+    /// [`AckTicket`] is returned.
+    ///
+    /// If any slot differs from `expected`, all locks are released without modifying any data,
+    /// and [`err::CAS`] is returned with context identifying the conflicting slot index.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::memmap::{MemMap, MemMapCfg};
+    /// use std::time::Duration;
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = MemMapCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().join("tx_commit_demo.bin"),
+    ///     version: 1,
+    ///     initial_t: 4,
+    ///     sync_interval: Some(Duration::from_millis(100)),
+    /// };
+    ///
+    /// let mmap = MemMap::<u64>::new(cfg).unwrap();
+    /// let mut tx = mmap.new_tx();
+    /// tx.write(&0u64, &100u64, 0).unwrap();
+    /// tx.write(&0u64, &200u64, 1).unwrap();
+    ///
+    /// let ticket = tx.commit().unwrap();
+    /// assert_eq!(mmap.read(0).unwrap(), 100u64);
+    /// assert_eq!(mmap.read(1).unwrap(), 200u64);
+    /// ```
+    pub fn commit(self) -> FrozenResult<AckTicket> {
+        let mid = self.memmap.cfg.module_id;
+        if self.ops.is_empty() {
+            return err::raw_error(err::INV, "empty transaction").with_module(mid);
+        }
+
+        if let Some(err) = self.memmap.inner.completion.get_err() {
+            return Err(err);
+        }
+
+        let size = core::mem::size_of::<T>();
+        let slot_locks_guard =
+            self.memmap.inner.slot_locks.read().unwrap_or_else(|e| e.into_inner());
+        let current_length = self.memmap.length();
+
+        // Verify bounds under slot_locks read guard
+        for (index, _, _) in &self.ops {
+            let offset = match index.checked_mul(size) {
+                Some(off) => off,
+                None => return err::default_error(err::INV).with_module(mid),
+            };
+            if hints::unlikely(offset.checked_add(size).is_none_or(|end| end > current_length)) {
+                return err::default_error(err::HCF).with_module(mid);
+            }
+        }
+
+        // Acquire all slot write locks in strictly ascending index order
+        let mut slot_guards = Vec::with_capacity(self.ops.len());
+        for (index, _, _) in &self.ops {
+            slot_guards.push(slot_locks_guard.write_lock(*index));
+        }
+
+        let guard = self.memmap.inner.mmap.read().unwrap_or_else(|e| e.into_inner());
+        let mmap = match guard.as_ref() {
+            Some(m) => m,
+            None => return err::default_error(err::INV).with_module(mid),
+        };
+
+        // Phase 1: State Precondition Verification (CAS)
+        for (index, expected, _) in &self.ops {
+            let offset = *index * size;
+            let ptr = unsafe { mmap.as_ptr::<T>(offset) };
+            let current = unsafe { ptr.read() };
+            if current != *expected {
+                drop(guard);
+                drop(slot_guards);
+                drop(slot_locks_guard);
+                return err::raw_error(
+                    err::CAS,
+                    format!("state conflict at index {}: slot data has changed", index),
+                )
+                .with_module(mid);
+            }
+        }
+
+        // Phase 2: Apply mutations
+        for (index, _, new) in self.ops {
+            let offset = index * size;
+            let ptr = unsafe { mmap.as_mut_ptr::<T>(offset) };
+            unsafe { core::ptr::write(ptr, new) };
+        }
+
+        drop(guard);
+        drop(slot_guards);
+        drop(slot_locks_guard);
+
+        let epoch = self.memmap.inner.completion.increment_current_epoch();
+
+        if self.memmap.inner.is_parked.load(atomic::Ordering::Acquire) {
+            let _guard = self.memmap.inner.sync_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            if self.memmap.inner.is_parked.swap(false, atomic::Ordering::AcqRel) {
+                self.memmap.inner.sync_condvar.notify_one();
+            }
+        }
+
+        Ok(AckTicket::new(epoch, self.memmap.inner.completion.clone()))
+    }
+
+    /// Returns the number of staged operations in this transaction
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::memmap::{MemMap, MemMapCfg};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = MemMapCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().join("tx_len_demo.bin"),
+    ///     version: 1,
+    ///     initial_t: 4,
+    ///     sync_interval: None,
+    /// };
+    ///
+    /// let mmap = MemMap::<u64>::new(cfg).unwrap();
+    /// let mut tx = mmap.new_tx();
+    /// assert_eq!(tx.len(), 0);
+    /// tx.write(&0u64, &10u64, 0).unwrap();
+    /// assert_eq!(tx.len(), 1);
+    /// ```
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.ops.len()
+    }
+
+    /// Returns `true` if no operations have been staged in this transaction
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::memmap::{MemMap, MemMapCfg};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = MemMapCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().join("tx_empty_demo.bin"),
+    ///     version: 1,
+    ///     initial_t: 4,
+    ///     sync_interval: None,
+    /// };
+    ///
+    /// let mmap = MemMap::<u64>::new(cfg).unwrap();
+    /// let tx = mmap.new_tx();
+    /// assert!(tx.is_empty());
+    /// ```
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
     }
 }
 
@@ -2635,6 +3056,266 @@ mod tests {
             mmap.sync().unwrap();
             assert!(ticket.is_durable());
             assert_eq!(mmap.read(0).unwrap(), 42u64);
+        }
+    }
+
+    mod memmap_transactions {
+        use super::*;
+
+        #[test]
+        fn ok_single_slot_cas_success_and_conflict() {
+            let (_dir, cfg) = tmp_cfg();
+            let mmap = MemMap::<u64>::new(cfg).unwrap();
+
+            // Default initialized value in slot 0 is 0
+            assert_eq!(mmap.read(0).unwrap(), 0);
+
+            // Successful CAS: 0 -> 100
+            let t1 = mmap.compare_and_write(&0, &100, 0).unwrap();
+            assert_eq!(mmap.read(0).unwrap(), 100);
+            assert_eq!(mmap.current_epoch(), 1);
+
+            // Failed CAS: expected 0, but current is 100
+            let err = mmap.compare_and_write(&0, &200, 0).unwrap_err();
+            assert_eq!(err.reason, err::CAS.reason);
+            assert!(err.context.contains("slot data has changed"));
+            assert_eq!(mmap.read(0).unwrap(), 100);
+            assert_eq!(mmap.current_epoch(), 1); // Epoch does not advance on failure
+
+            // Successful CAS: 100 -> 200
+            let t2 = mmap.compare_and_write(&100, &200, 0).unwrap();
+            assert_eq!(mmap.read(0).unwrap(), 200);
+            assert_eq!(mmap.current_epoch(), 2);
+            assert!(t2.epoch() > t1.epoch());
+        }
+
+        #[test]
+        fn ok_tx_multiple_writes_single_epoch() {
+            let (_dir, cfg) = tmp_cfg();
+            let mmap = MemMap::<u64>::new(cfg).unwrap();
+
+            let epoch_before = mmap.current_epoch();
+
+            let mut tx = mmap.new_tx();
+            assert!(tx.is_empty());
+            tx.write(&0, &111, 0).unwrap();
+            tx.write(&0, &222, 1).unwrap();
+            tx.write(&0, &333, 2).unwrap();
+            assert_eq!(tx.len(), 3);
+
+            let ticket = tx.commit().unwrap();
+            let epoch_after = mmap.current_epoch();
+
+            // Single epoch increment for all 3 writes
+            assert_eq!(epoch_after, epoch_before + 1);
+            assert_eq!(ticket.epoch(), epoch_after);
+
+            assert_eq!(mmap.read(0).unwrap(), 111);
+            assert_eq!(mmap.read(1).unwrap(), 222);
+            assert_eq!(mmap.read(2).unwrap(), 333);
+
+            ticket.wait().unwrap();
+            assert!(ticket.is_durable());
+        }
+
+        #[test]
+        fn err_tx_cas_conflict_aborts_all_with_zero_side_effects() {
+            let (_dir, cfg) = tmp_cfg();
+            let mmap = MemMap::<u64>::new(cfg).unwrap();
+
+            // Prepare slot 1 with a different value
+            mmap.write(&999, 1).unwrap();
+            let epoch_before = mmap.current_epoch();
+
+            let mut tx = mmap.new_tx();
+            tx.write(&0, &10, 0).unwrap(); // Expected 0, currently 0 (would succeed)
+            tx.write(&0, &20, 1).unwrap(); // Expected 0, currently 999 (will fail!)
+            tx.write(&0, &30, 2).unwrap(); // Expected 0, currently 0
+
+            let err = tx.commit().unwrap_err();
+            assert_eq!(err.reason, err::CAS.reason);
+            assert!(err.context.contains("state conflict at index 1"));
+
+            // Verify NONE of the slots were modified (all-or-nothing rollback)
+            assert_eq!(mmap.read(0).unwrap(), 0);
+            assert_eq!(mmap.read(1).unwrap(), 999);
+            assert_eq!(mmap.read(2).unwrap(), 0);
+
+            // Epoch must NOT have advanced
+            assert_eq!(mmap.current_epoch(), epoch_before);
+        }
+
+        #[test]
+        fn ok_tx_retry_after_conflict() {
+            let (_dir, cfg) = tmp_cfg();
+            let mmap = MemMap::<u64>::new(cfg).unwrap();
+
+            // Simulate concurrent write modifying slot 1
+            mmap.write(&42, 1).unwrap();
+
+            // First attempt assuming slot 1 is 0 fails
+            let mut tx1 = mmap.new_tx();
+            tx1.write(&0, &100, 0).unwrap();
+            tx1.write(&0, &200, 1).unwrap();
+            assert_eq!(tx1.commit().unwrap_err().reason, err::CAS.reason);
+
+            // Caller observes current slot 1 value is 42, retries transaction with updated precondition
+            let curr_val = mmap.read(1).unwrap();
+            assert_eq!(curr_val, 42);
+
+            let mut tx2 = mmap.new_tx();
+            tx2.write(&0, &100, 0).unwrap();
+            tx2.write(&42, &200, 1).unwrap();
+            let ticket = tx2.commit().unwrap();
+
+            assert_eq!(mmap.read(0).unwrap(), 100);
+            assert_eq!(mmap.read(1).unwrap(), 200);
+            ticket.wait().unwrap();
+            assert!(ticket.is_durable());
+        }
+
+        #[test]
+        fn err_tx_out_of_order() {
+            let (_dir, cfg) = tmp_cfg();
+            let mmap = MemMap::<u64>::new(cfg).unwrap();
+
+            let mut tx = mmap.new_tx();
+            tx.write(&0, &10, 2).unwrap();
+            let err = tx.write(&0, &20, 1).unwrap_err();
+            assert_eq!(err.reason, err::HCF.reason);
+            assert!(err.context.contains("strictly ordered"));
+        }
+
+        #[test]
+        fn err_tx_duplicate_index() {
+            let (_dir, cfg) = tmp_cfg();
+            let mmap = MemMap::<u64>::new(cfg).unwrap();
+
+            let mut tx = mmap.new_tx();
+            tx.write(&0, &10, 1).unwrap();
+            let err = tx.write(&0, &20, 1).unwrap_err();
+            assert_eq!(err.reason, err::HCF.reason);
+            assert!(err.context.contains("strictly ordered"));
+        }
+
+        #[test]
+        fn err_tx_out_of_bounds() {
+            let (_dir, cfg) = tmp_cfg();
+            let mmap = MemMap::<u64>::new(cfg).unwrap();
+
+            let mut tx = mmap.new_tx();
+            let err = tx.write(&0, &10, INIT_T).unwrap_err();
+            assert_eq!(err.reason, err::HCF.reason);
+        }
+
+        #[test]
+        fn err_tx_empty_commit() {
+            let (_dir, cfg) = tmp_cfg();
+            let mmap = MemMap::<u64>::new(cfg).unwrap();
+
+            let tx = mmap.new_tx();
+            let err = tx.commit().unwrap_err();
+            assert_eq!(err.reason, err::INV.reason);
+            assert!(err.context.contains("empty transaction"));
+        }
+
+        #[test]
+        fn ok_tx_discard_on_drop() {
+            let (_dir, cfg) = tmp_cfg();
+            let mmap = MemMap::<u64>::new(cfg).unwrap();
+
+            let epoch_before = mmap.current_epoch();
+            {
+                let mut tx = mmap.new_tx();
+                tx.write(&0, &777, 0).unwrap();
+                tx.write(&0, &888, 1).unwrap();
+                // tx dropped without calling commit()
+            }
+
+            assert_eq!(mmap.read(0).unwrap(), 0);
+            assert_eq!(mmap.read(1).unwrap(), 0);
+            assert_eq!(mmap.current_epoch(), epoch_before);
+        }
+
+        #[test]
+        fn ok_tx_concurrent_non_overlapping() {
+            let (_dir, mut cfg) = tmp_cfg();
+            cfg.initial_t = 16;
+            let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
+
+            let mut handles = Vec::new();
+            for thread_id in 0..4u64 {
+                let m = mmap.clone();
+                handles.push(std::thread::spawn(move || {
+                    let base = (thread_id as usize) * 4;
+                    let mut tx = m.new_tx();
+                    tx.write(&0, &(thread_id * 10 + 1), base).unwrap();
+                    tx.write(&0, &(thread_id * 10 + 2), base + 1).unwrap();
+                    tx.write(&0, &(thread_id * 10 + 3), base + 2).unwrap();
+                    tx.write(&0, &(thread_id * 10 + 4), base + 3).unwrap();
+                    let ticket = tx.commit().unwrap();
+                    ticket.wait().unwrap();
+                }));
+            }
+
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            for thread_id in 0..4u64 {
+                let base = (thread_id as usize) * 4;
+                assert_eq!(mmap.read(base).unwrap(), thread_id * 10 + 1);
+                assert_eq!(mmap.read(base + 1).unwrap(), thread_id * 10 + 2);
+                assert_eq!(mmap.read(base + 2).unwrap(), thread_id * 10 + 3);
+                assert_eq!(mmap.read(base + 3).unwrap(), thread_id * 10 + 4);
+            }
+        }
+
+        #[test]
+        fn ok_tx_durability_across_reopen() {
+            let (_dir, cfg) = tmp_cfg();
+
+            {
+                let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
+                let mut tx = mmap.new_tx();
+                tx.write(&0, &0xAAAA_BBBB, 0).unwrap();
+                tx.write(&0, &0xCCCC_DDDD, 1).unwrap();
+                let ticket = tx.commit().unwrap();
+                ticket.wait().unwrap();
+                assert!(ticket.is_durable());
+            }
+
+            {
+                let reopened = MemMap::<u64>::open(cfg).unwrap();
+                assert_eq!(reopened.read(0).unwrap(), 0xAAAA_BBBB);
+                assert_eq!(reopened.read(1).unwrap(), 0xCCCC_DDDD);
+            }
+        }
+
+        #[test]
+        fn ok_tx_unparks_idle_bg_worker() {
+            let (_dir, cfg) = tmp_cfg();
+            let mmap = MemMap::<u64>::new(cfg).unwrap();
+
+            // Wait for worker to park
+            let mut parked = false;
+            for _ in 0..100 {
+                if mmap.is_parked() {
+                    parked = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(parked);
+
+            let mut tx = mmap.new_tx();
+            tx.write(&0, &555, 0).unwrap();
+            let ticket = tx.commit().unwrap();
+
+            // Background worker was unparked and should make ticket durable
+            ticket.wait().unwrap();
+            assert!(ticket.is_durable());
+            assert_eq!(mmap.read(0).unwrap(), 555);
         }
     }
 }
