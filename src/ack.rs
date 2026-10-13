@@ -131,7 +131,8 @@ impl Completion {
         lock.clone()
     }
 
-    /// Update (i.e. replace) current acknowledgement error w/ a new [`FrozenError`]
+    /// Update
+    /// (i.e. replace) current acknowledgement error w/ a new [`FrozenError`]
     ///
     /// ## Example
     ///
@@ -208,8 +209,8 @@ impl Completion {
 
     /// Wake all listeners currently waiting for durability progress
     ///
-    /// Waking listeners does not modify any durable state and is typically called after advancing the durable
-    /// epoch or setting an error
+    /// Waking listeners does not modify any durable state and is typically called after advancing
+    /// the durable epoch or setting an error
     ///
     /// ## Example
     ///
@@ -249,7 +250,8 @@ impl Completion {
         }
     }
 
-    /// Blocks the current thread until the specified `epoch` becomes durable or an error is reported
+    /// Blocks the current thread until the specified `epoch` becomes durable or an error is
+    /// reported
     pub fn wait_for_epoch(&self, epoch: TEpoch) -> FrozenResult<TEpoch> {
         if self.read_durable_epoch() >= epoch {
             return Ok(epoch);
@@ -282,10 +284,11 @@ impl Completion {
 ///
 /// ## Durability Guarantee
 ///
-/// The ticket can be queried via [`is_durable`](Self::is_durable), waited on via [`wait`](Self::wait), or forced
-/// via [`force`](Self::force)
+/// The ticket can be queried via [`is_durable`](Self::is_durable), waited on via
+/// [`wait`](Self::wait), or forced via [`force`](Self::force)
 ///
-/// Once an epoch is confirmed durable, all writes assigned to earlier epochs are also guaranteed to be durable
+/// Once an epoch is confirmed durable, all writes assigned to earlier epochs are also guaranteed to
+/// be durable
 ///
 /// Callers that only require fire-and-forget semantics may simply discard the returned ticket
 #[derive(Debug, Clone)]
@@ -355,8 +358,8 @@ impl AckTicket {
     ///
     /// ## Error Propagation
     ///
-    /// If a durability error is reported before the epoch becomes durable, the corresponding [`FrozenError`] is
-    /// returned instead
+    /// If a durability error is reported before the epoch becomes durable, the corresponding
+    /// [`FrozenError`] is returned instead
     ///
     /// ## Example
     ///
@@ -386,8 +389,8 @@ impl AckTicket {
 
     /// Forces synchronization for this ticket and blocks until it becomes durable
     ///
-    /// If a background sync thread is running, signals the worker to sync immediately; otherwise executes the
-    /// sync synchronously under the lock
+    /// If a background sync thread is running, signals the worker to sync immediately; otherwise
+    /// executes the sync synchronously under the lock
     ///
     /// ## Example
     ///

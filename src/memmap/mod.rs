@@ -90,7 +90,8 @@ pub(in crate::memmap) mod err {
     /// `size_of::<T>()` is not multiple of 8
     pub const SZE: ErrCode = ErrCode::new(0x16, "`size_of::<T>()` must be multiple of 8 bytes");
 
-    /// type `T` is invalid (e.g. `size_of::<T>()` exceeds page size)
+    /// type `T` is invalid
+    /// (e.g. `size_of::<T>()` exceeds page size)
     pub const INV: ErrCode =
         ErrCode::new(0x18, "`size_of::<T>()` must not exceed system page size");
 
@@ -109,9 +110,8 @@ pub(in crate::memmap) mod err {
     /// unable to grow memory-mapped file
     pub const GRW: ErrCode = ErrCode::new(0x22, "unable to grow memory-mapped file");
 
-    /// state conflict / compare and swap mismatch
-    pub const CAS: ErrCode =
-        ErrCode::new(0x24, "compare and swap conflict: slot state has changed");
+    /// state conflict
+    pub const CAS: ErrCode = ErrCode::new(0x24, "compare and swap check failed");
 
     #[inline]
     pub(in crate::memmap) fn raw_error<R, E: std::fmt::Display>(
@@ -166,21 +166,20 @@ pub struct MemMapCfg {
     ///
     /// ## Notes
     ///
-    /// - The caller must make sure that the path represents a file and all the
-    ///   parent directories included in the path do exist
-    /// - The actual file created on disk is derived by appending the
-    ///   [`version`](Self::version) to the base file name (e.g. `data.bin`
-    ///   with version `1` becomes `data_1.bin`)
+    /// - The caller must make sure that the path represents a file and all the parent directories
+    ///   included in the path do exist
+    /// - The actual file created on disk is derived by appending the [`version`](Self::version) to
+    ///   the base file name (e.g. `data.bin` with version `1` becomes `data_1.bin`)
     pub path: std::path::PathBuf,
 
     /// Schema or layout version of the underlying memory-mapped file
     ///
-    /// Because the binary layout on disk is constructed according to the initial type `T` and structural parameters,
-    /// [`MemMap`] strictly requires type invariants across a file's lifetime
+    /// Because the binary layout on disk is constructed according to the initial type `T` and
+    /// structural parameters, [`MemMap`] strictly requires type invariants across a file's lifetime
     ///
-    /// When an application evolves its data structures or migrates `T`,
-    /// incrementing `version` ensures a new versioned backing file (`<name>_<ver>`) is
-    /// created on disk without corrupting or clashing with previously persisted data
+    /// When an application evolves its data structures or migrates `T`, incrementing `version`
+    /// ensures a new versioned backing file (`<name>_<ver>`) is created on disk without corrupting
+    /// or clashing with previously persisted data
     pub version: u32,
 
     /// Number of `T` elements to pre-allocate on fs when [`MemMap`] is initialized
@@ -190,8 +189,9 @@ pub struct MemMapCfg {
 
     /// Optional interval for the background sync thread
     ///
-    /// If `Some(duration)`, a background worker thread is spawned which flushes dirty mapped pages at this interval; and
-    /// if `None`, background sync is disabled and durability advances via manual sync or forced tickets
+    /// If `Some(duration)`, a background worker thread is spawned which flushes dirty mapped pages
+    /// at this interval; and if `None`, background sync is disabled and durability advances via
+    /// manual sync or forced tickets
     pub sync_interval: Option<std::time::Duration>,
 }
 
@@ -199,26 +199,8 @@ impl MemMapCfg {
     /// Computes the versioned file path by appending `_{version}` to the base file stem
     ///
     /// Preserves file extension if present (e.g., `data.bin` with version `1` becomes `data_1.bin`)
-    ///
-    /// ## Example
-    ///
-    /// ```
-    /// use frozen_core::memmap::MemMapCfg;
-    /// use std::path::PathBuf;
-    /// use std::time::Duration;
-    ///
-    /// let cfg = MemMapCfg {
-    ///     module_id: 1,
-    ///     path: PathBuf::from("store.db"),
-    ///     version: 3,
-    ///     initial_t: 10,
-    ///     sync_interval: Some(Duration::from_millis(100)),
-    /// };
-    ///
-    /// assert_eq!(cfg.versioned_path(), PathBuf::from("store_3.db"));
-    /// ```
     #[inline]
-    pub fn versioned_path(&self) -> std::path::PathBuf {
+    fn versioned_path(&self) -> std::path::PathBuf {
         let parent = self.path.parent();
         let stem = self.path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
         let extension = self.path.extension().and_then(|e| e.to_str());
@@ -235,10 +217,7 @@ impl MemMapCfg {
     }
 }
 
-/// Bitmask for exclusive writer flag in [`SlotLocks`]
 const WRITER_BIT: u32 = 0x8000_0000;
-
-/// Contention spin thresholds for slot locking backoff
 const L1_CONTENTION: usize = 0x10;
 const L2_CONTENTION: usize = 0x20;
 
@@ -433,17 +412,17 @@ impl MemMapInner {
 
 /// Custom memory-mapped typed array storage with slot-level locking and epoch durability
 ///
-/// `MemMap<T>` maps an on-disk [`File`] into process virtual address space as a contiguous array
-/// of fixed-size slots of type `T`
+/// `MemMap<T>` maps an on-disk [`File`] into process virtual address space as a contiguous array of
+/// fixed-size slots of type `T`
 ///
 /// It provides,
 ///
 /// - **Slot Synchronization**: Per-slot reader-writer spinlocks (`SlotLocks`) protecting each index
-///   against concurrent write-write and read-write hazards with backoff spin/yield/sleep stages.
-/// - **Epoch Durability**: Monotonically advancing write epoch counter incremented on each mutation,
-///   tracked via [`AckTicket`] and synchronized in the background by a dedicated worker.
+///   against concurrent write-write and read-write hazards with backoff spin/yield/sleep stages
+/// - **Epoch Durability**: Monotonically advancing write epoch counter incremented on each
+///   mutation, tracked via [`AckTicket`] and synchronized in the background by a dedicated worker
 /// - **Process Isolation**: Advisory kernel-level locking (`flock`/`LockFileEx`) ensuring exclusive
-///   file ownership by a single running instance.
+///   file ownership by a single running instance
 ///
 /// ## Constraints
 ///
@@ -451,7 +430,8 @@ impl MemMapInner {
 /// - `T` must be 8-byte aligned (`core::mem::align_of::<T>() == 8`)
 /// - `size_of::<T>()` must be non-zero, a multiple of 8, and must not exceed the host page size
 /// - `T` must not implement `Drop` (`!core::mem::needs_drop::<T>()`)
-/// - Type layout is immutable across file lifetime; schema changes require bumping [`MemMapCfg::version`]
+/// - Type layout is immutable across file lifetime; schema changes require bumping
+///   [`MemMapCfg::version`]
 ///
 /// ## Example
 ///
@@ -682,17 +662,19 @@ where
 
     /// Creates and memory-maps a new [`File`] at `cfg.versioned_path()`
     ///
-    /// Allocates an underlying file with capacity for `initial_t * size_of::<T>()` bytes,
-    /// acquires an exclusive advisory lock on the descriptor, establishes the memory mapping,
-    /// and spawns the background worker for periodic durability flushing
+    /// Allocates an underlying file with capacity for `initial_t * size_of::<T>()` bytes, acquires
+    /// an exclusive advisory lock on the descriptor, establishes the memory mapping, and spawns the
+    /// background worker for periodic durability flushing
     ///
     /// ## Constraints
     ///
     /// - Returns [`err::EXS`] if the versioned file already exists on the filesystem; Use
     ///   [`MemMap::open`] or [`MemMap::open_or_create`] instead
     /// - Returns [`err::PTH`] or [`err::DIR`] if the base path or its parent directory is invalid
-    /// - Enforces all structural type invariants for `T` (`align == 8`, `size % 8 == 0`, `size <= page_size`, no `Drop`)
-    /// - An exclusive advisory lock is acquired on creation; concurrent callers on the same file path fail
+    /// - Enforces all structural type invariants for `T` (`align == 8`, `size % 8 == 0`, `size <=
+    ///   page_size`, no `Drop`)
+    /// - An exclusive advisory lock is acquired on creation; concurrent callers on the same file
+    ///   path fail
     ///
     /// ## Example
     ///
@@ -750,8 +732,8 @@ where
     /// Opens an existing memory-mapped [`File`] at `cfg.versioned_path()`
     ///
     /// Opens the underlying versioned file, verifies its length matches the requested layout,
-    /// acquires an exclusive advisory lock on the descriptor, maps its memory region, and
-    /// spawns the background flush worker
+    /// acquires an exclusive advisory lock on the descriptor, maps its memory region, and spawns
+    /// the background flush worker
     ///
     /// ## Constraints
     ///
@@ -806,7 +788,8 @@ where
     /// Opens an existing memory-mapped [`File`] or creates a new one if it does not yet exist
     ///
     /// Idempotent entrypoint that transparently delegates to either open or creation semantics
-    /// based on filesystem presence, maintaining consistent advisory locking and background flushing
+    /// based on filesystem presence, maintaining consistent advisory locking and background
+    /// flushing
     ///
     /// ## Constraints
     ///
@@ -902,21 +885,24 @@ where
     ///
     /// ## Semantics
     ///
-    /// - Halts all concurrent read and write operations across all slots for the duration of the growth
+    /// - Halts all concurrent read and write operations across all slots for the duration of the
+    ///   growth
     /// - Halts background durability flushing and manual sync operations
-    /// - If uncommitted dirty writes exist (`current_epoch > durable_epoch`), performs a durability sync
-    ///   before modifying file boundaries
+    /// - If uncommitted dirty writes exist (`current_epoch > durable_epoch`), performs a durability
+    ///   sync before modifying file boundaries
     /// - Explicitly unmaps the current virtual memory mapping
-    /// - Zero-extends the backing file on disk safely via [`File::grow`] and synchronizes file metadata
+    /// - Zero-extends the backing file on disk safely via [`File::grow`] and synchronizes file
+    ///   metadata
     /// - Establishes a new memory mapping over the enlarged file range
     /// - Dynamically expands per-slot spinlocks to accommodate new slots
     /// - Updates tracked mapping length and advances durability epoch
     ///
     /// ## Crash Durability & Safety
     ///
-    /// - Existing payload data is flushed to persistent storage before file extension, ensuring no data loss
-    /// - Disk block pre-allocation (`fallocate` / `f_preallocate`) precedes logical size expansion; out-of-space
-    ///   failures leave existing data untouched
+    /// - Existing payload data is flushed to persistent storage before file extension, ensuring no
+    ///   data loss
+    /// - Disk block pre-allocation (`fallocate` / `f_preallocate`) precedes logical size expansion;
+    ///   out-of-space failures leave existing data untouched
     /// - If file growth fails, the original memory mapping is automatically restored
     ///
     /// ## Example
@@ -986,7 +972,6 @@ where
         // Pre-growth sync: only if needed (curr_epoch > durable_epoch)
         self.inner.sync_mmap_if_needed(mmap, curr_len)?;
 
-        // Unmap current mapping
         let old_mmap = match mmap_guard.take() {
             Some(m) => m,
             None => return err::default_error(err::INV).with_module(mid),
@@ -999,7 +984,6 @@ where
             return Err(e);
         }
 
-        // Zero extend the file
         if let Err(e) = file.grow(count).with_module(mid) {
             if let Ok(restored) = PlatformMemMap::new(file.fd(), curr_len).with_module(mid) {
                 *mmap_guard = Some(restored);
@@ -1017,7 +1001,6 @@ where
             return Err(e);
         }
 
-        // Re-mmap grown file
         let new_mmap = match PlatformMemMap::new(file.fd(), new_length).with_module(mid) {
             Ok(m) => m,
             Err(e) => {
@@ -1065,7 +1048,7 @@ where
 
     /// Fetch the latest assigned durability epoch
     ///
-    /// The current epoch monotonically increments on each [`MemMap::write`] call.
+    /// The current epoch monotonically increments on each [`MemMap::write`] call
     ///
     /// ## Example
     ///
@@ -1126,7 +1109,7 @@ where
     /// - Flushes modified virtual memory pages to host cache via [`PlatformMemMap::sync`]
     /// - Advances the durable epoch to the current write epoch and awakens all pending listeners
     ///
-    /// Returns `Ok(())` immediately if no writes have occurred since the last sync.
+    /// Returns `Ok(())` immediately if no writes have occurred since the last sync
     ///
     /// ## Example
     ///
@@ -1366,14 +1349,16 @@ impl<T> MemMap<T>
 where
     T: Sized + Clone + PartialEq,
 {
-    /// Conditionally writes `val` into slot `index` if and only if the current value matches `expected`
+    /// Conditionally writes `val` into slot `index` if and only if the current value matches
+    /// `expected`
     ///
     /// ## Semantics
     ///
     /// Acquires the exclusive slot lock for `index` and verifies that the current slot value equals
-    /// `expected`. If equal, writes `val`, advances the epoch, and returns an [`AckTicket`].
-    /// If the current value differs from `expected`, the operation immediately aborts without
-    /// modifying the slot, returning [`err::CAS`] so the caller can re-read and retry.
+    /// `expected`; if equal, writes `val`, advances the epoch, and returns an
+    /// [`AckTicket`]. If the current value differs from `expected`, the operation immediately
+    /// aborts without modifying the slot, returning [`err::CAS`] so the caller can re-read and
+    /// retry
     ///
     /// ## Constraints
     ///
@@ -1465,17 +1450,19 @@ where
         Ok(AckTicket::new(epoch, self.inner.completion.clone()))
     }
 
-    /// Creates a new [`MemMapTransaction`] context for grouping multiple conditional writes into a single atomic epoch
+    /// Creates a new [`MemMapTransaction`] context for grouping multiple conditional writes into a
+    /// single atomic epoch
     ///
     /// ## Overview
     ///
     /// `MemMapTransaction` allows grouping multiple slot mutations into a single atomic operation:
     ///
-    /// - **Atomicity**: All writes succeed or fail together.
-    /// - **Optimistic Concurrency Control (CAS)**: Each write asserts that its target slot currently
-    ///   matches `expected`. If any slot differs at commit time, all changes abort and no slots are modified.
-    /// - **Single Epoch**: All committed writes share a single durability epoch and durable window.
-    /// - **Deadlock Freedom**: Slot locks are acquired in strictly ascending index order.
+    /// - **Atomicity**: All writes succeed or fail together
+    /// - **Optimistic Concurrency Control (CAS)**: Each write asserts that its target slot
+    ///   currently matches `expected`; if any slot differs at commit time, all changes abort and no
+    ///   slots are modified
+    /// - **Single Epoch**: All committed writes share a single durability epoch and durable window
+    /// - **Deadlock Freedom**: Slot locks are acquired in strictly ascending index order
     ///
     /// ## Example
     ///
@@ -1510,13 +1497,13 @@ where
 
 /// Context for grouping multiple conditional writes into a single atomic operation
 ///
-/// Multi-slot mutations are staged in `MemMapTransaction` with optimistic concurrency preconditions.
-/// At [`commit`](Self::commit) time, all target slot locks are acquired in strictly ascending order,
-/// each slot is verified against its `expected` value, and if all match, all updates are applied
-/// under a single epoch.
+/// Multi-slot mutations are staged in `MemMapTransaction` with optimistic concurrency
+/// preconditions. At [`commit`](Self::commit) time, all target slot locks are acquired in strictly
+/// ascending order, each slot is verified against its `expected` value, and if all match, all
+/// updates are applied under a single epoch
 ///
-/// If any slot fails verification, the transaction aborts with zero mutations, returning [`err::CAS`]
-/// with the index of the first conflicting slot so the caller can retry.
+/// If any slot fails verification, the transaction aborts with zero mutations, returning
+/// [`err::CAS`] with the index of the first conflicting slot so the caller can retry
 ///
 /// ## Example
 ///
@@ -1552,7 +1539,8 @@ impl<'a, T> MemMapTransaction<'a, T>
 where
     T: Sized + Clone + PartialEq,
 {
-    /// Stages a conditional write of `new` at `index` requiring `expected` as the current slot value
+    /// Stages a conditional write of `new` at `index` requiring `expected` as the current slot
+    /// value
     ///
     /// ## Requirements
     ///
@@ -1617,12 +1605,12 @@ where
 
     /// Commits all staged writes atomically under a single durability epoch
     ///
-    /// Acquires exclusive locks for all affected slots in order. If all slots match their
-    /// expected values, updates are applied, the durable epoch advances once, and an
-    /// [`AckTicket`] is returned.
+    /// Acquires exclusive locks for all affected slots in order; if all slots match their expected
+    /// values, updates are applied, the durable epoch advances once, and an [`AckTicket`] is
+    /// returned
     ///
-    /// If any slot differs from `expected`, all locks are released without modifying any data,
-    /// and [`err::CAS`] is returned with context identifying the conflicting slot index.
+    /// If any slot differs from `expected`, all locks are released without modifying any data, and
+    /// [`err::CAS`] is returned with context identifying the conflicting slot index
     ///
     /// ## Example
     ///
@@ -2048,7 +2036,6 @@ mod tests {
 
     #[test]
     fn ok_versioned_path_resolution() {
-        // Simple file with extension
         let cfg = MemMapCfg {
             module_id: MID,
             path: std::path::PathBuf::from("data.bin"),
@@ -2058,7 +2045,6 @@ mod tests {
         };
         assert_eq!(cfg.versioned_path(), std::path::PathBuf::from("data_1.bin"));
 
-        // File without extension
         let cfg = MemMapCfg {
             module_id: MID,
             path: std::path::PathBuf::from("datastore"),
@@ -2068,7 +2054,6 @@ mod tests {
         };
         assert_eq!(cfg.versioned_path(), std::path::PathBuf::from("datastore_2"));
 
-        // Multi-part extension
         let cfg = MemMapCfg {
             module_id: MID,
             path: std::path::PathBuf::from("archive.tar.gz"),
@@ -2078,7 +2063,6 @@ mod tests {
         };
         assert_eq!(cfg.versioned_path(), std::path::PathBuf::from("archive.tar_3.gz"));
 
-        // Absolute path with directories
         let cfg = MemMapCfg {
             module_id: MID,
             path: std::path::PathBuf::from("/var/data/store.db"),
@@ -2088,7 +2072,6 @@ mod tests {
         };
         assert_eq!(cfg.versioned_path(), std::path::PathBuf::from("/var/data/store_10.db"));
 
-        // Relative path with directories
         let cfg = MemMapCfg {
             module_id: MID,
             path: std::path::PathBuf::from("dir/sub/file.dat"),
@@ -2098,7 +2081,6 @@ mod tests {
         };
         assert_eq!(cfg.versioned_path(), std::path::PathBuf::from("dir/sub/file_0.dat"));
 
-        // Dotfile without extension
         let cfg = MemMapCfg {
             module_id: MID,
             path: std::path::PathBuf::from(".env"),
@@ -2108,7 +2090,6 @@ mod tests {
         };
         assert_eq!(cfg.versioned_path(), std::path::PathBuf::from(".env_5"));
 
-        // Dotfile with extension
         let cfg = MemMapCfg {
             module_id: MID,
             path: std::path::PathBuf::from(".config.json"),
@@ -2211,7 +2192,6 @@ mod tests {
         let (_dir, cfg) = tmp_cfg();
         let mmap = MemMap::<u64>::new(cfg).unwrap();
 
-        // INIT_T is 4, valid indices are 0..=3
         let err_r = mmap.read(INIT_T).unwrap_err();
         assert_eq!(err_r.reason, err::HCF.reason);
 
@@ -2612,11 +2592,9 @@ mod tests {
         let (_dir, cfg) = tmp_cfg();
         let mmap = MemMap::<u64>::new(cfg).unwrap();
 
-        // Valid boundary: INIT_T - 1
         assert!(mmap.write(&0xF00D, INIT_T - 1).is_ok());
         assert_eq!(mmap.read(INIT_T - 1).unwrap(), 0xF00D);
 
-        // Invalid boundary: INIT_T
         assert_eq!(mmap.write(&0xBAD, INIT_T).unwrap_err().reason, err::HCF.reason);
         assert_eq!(mmap.read(INIT_T).unwrap_err().reason, err::HCF.reason);
     }
@@ -2630,7 +2608,6 @@ mod tests {
         let mmap = MemMap::<u64>::new(cfg).unwrap();
         assert_eq!(mmap.length(), LARGE_COUNT * core::mem::size_of::<u64>());
 
-        // First, middle, last
         assert!(mmap.write(&1, 0).is_ok());
         assert!(mmap.write(&0x1388, 0x1388).is_ok());
         assert!(mmap.write(&0x270F, LARGE_COUNT - 1).is_ok());
@@ -2744,7 +2721,6 @@ mod tests {
         let t3 = mmap.write(&0x3333, 2).unwrap();
         assert!(!mmap.is_parked());
 
-        // All tickets become durable
         t1.wait().unwrap();
         t2.wait().unwrap();
         t3.wait().unwrap();
@@ -2816,8 +2792,8 @@ mod tests {
         mmap.inner.sync_condvar.notify_one();
         std::thread::sleep(Duration::from_millis(0x0A));
 
-        // Because no writes occurred, worker should detect spurious wakeup and re-park immediately
-        // rather than sleeping for the 10-second interval
+        // Because no writes occurred, worker should detect spurious wakeup and re-park immediately rather than sleeping
+        // for the 10-second interval
         let start = std::time::Instant::now();
         while !mmap.is_parked() && start.elapsed() < Duration::from_millis(0x1F4) {
             std::thread::sleep(Duration::from_millis(5));
@@ -2873,7 +2849,6 @@ mod tests {
             let mmap = MemMap::<u64>::new(cfg).unwrap();
             mmap.grow(3).unwrap();
 
-            // Newly extended slots should read as 0
             for idx in INIT_T..(INIT_T + 3) {
                 assert_eq!(mmap.read(idx).unwrap(), 0u64);
             }
@@ -2890,12 +2865,10 @@ mod tests {
 
             mmap.grow(4).unwrap();
 
-            // Old slots preserved
             for i in 0..INIT_T {
                 assert_eq!(mmap.read(i).unwrap(), 0xCAFE_0000 + i as u64);
             }
 
-            // New slots can be written and read
             for i in INIT_T..(INIT_T + 4) {
                 mmap.write(&(0xBEEF_0000 + i as u64), i).unwrap();
                 assert_eq!(mmap.read(i).unwrap(), 0xBEEF_0000 + i as u64);
@@ -3006,7 +2979,6 @@ mod tests {
             // Pre-create file to force EXS error
             std::fs::write(cfg.versioned_path(), b"preexisting").unwrap();
 
-            // Calling new fails with EXS
             let res = MemMap::<u64>::new(cfg);
             assert!(res.is_err());
             // No MemMap instance was created, and no background sync thread was spawned
@@ -3017,7 +2989,6 @@ mod tests {
             let (_dir, mut cfg) = tmp_cfg();
             cfg.path = std::path::PathBuf::from("/non/existent/path/memmap.bin");
 
-            // Calling open on non-existent path fails with NEX/PTH
             let res = MemMap::<u64>::open(cfg);
             assert!(res.is_err());
             // No MemMap instance was created, and no background sync thread was spawned
@@ -3038,7 +3009,6 @@ mod tests {
                 panic!("intentional test panic to trigger Drop unwinding");
             });
 
-            // Join the panicked thread
             assert!(handle.join().is_err());
             assert!(thread_inner.load(atomic::Ordering::Acquire));
             // Stack unwinding drops MemMap, setting shutdown = true and joining the background worker
@@ -3064,7 +3034,6 @@ mod tests {
             let (_dir, cfg) = tmp_cfg();
             let mmap = MemMap::<u64>::new(cfg).unwrap();
 
-            // Trigger grow failure with overflow
             assert!(mmap.grow(usize::MAX).is_err());
 
             // The instance and background sync worker remain healthy
@@ -3083,22 +3052,18 @@ mod tests {
             let (_dir, cfg) = tmp_cfg();
             let mmap = MemMap::<u64>::new(cfg).unwrap();
 
-            // Default initialized value in slot 0 is 0
             assert_eq!(mmap.read(0).unwrap(), 0);
 
-            // Successful CAS: 0 -> 100
             let t1 = mmap.compare_and_write(&0, &0x64, 0).unwrap();
             assert_eq!(mmap.read(0).unwrap(), 0x64);
             assert_eq!(mmap.current_epoch(), 1);
 
-            // Failed CAS: expected 0, but current is 100
             let err = mmap.compare_and_write(&0, &0xC8, 0).unwrap_err();
             assert_eq!(err.reason, err::CAS.reason);
             assert!(err.context.contains("slot data has changed"));
             assert_eq!(mmap.read(0).unwrap(), 0x64);
             assert_eq!(mmap.current_epoch(), 1); // Epoch does not advance on failure
 
-            // Successful CAS: 100 -> 200
             let t2 = mmap.compare_and_write(&0x64, &0xC8, 0).unwrap();
             assert_eq!(mmap.read(0).unwrap(), 0xC8);
             assert_eq!(mmap.current_epoch(), 2);

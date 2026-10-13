@@ -47,8 +47,8 @@ pub fn detect_best_isa_extension() -> ISAExtension {
     //
     // NEON is part of the mandatory AArch64 baseline ISA
     //
-    // The Armv8-A architecture reference manual and AAPCS64 ABI specify Advanced SIMD (NEON) as a
-    // required baseline feature, so every conforming AArch64 CPU is guaranteed to implement it
+    // The Armv8-A architecture reference manual and AAPCS64 ABI specify Advanced SIMD (NEON) as a required baseline
+    // feature, so every conforming AArch64 CPU is guaranteed to implement it
     //
     // Therefore, we can safely use NEON as the default backend without runtime feature detection
     //
@@ -112,8 +112,8 @@ pub fn detect_best_isa_extension() -> ISAExtension {
     //
     // SSE2 is part of the mandatory x86_64 baseline ISA
     //
-    // The x86_64 System V ABI specifies SSE2 as a required baseline feature, so every conforming
-    // x86_64 CPU is guaranteed to implement it
+    // The x86_64 System V ABI specifies SSE2 as a required baseline feature, so every conforming x86_64 CPU is
+    // guaranteed to implement it
     //
     // Therefore, we can safely use SSE2 as the default backend without runtime feature detection
     //

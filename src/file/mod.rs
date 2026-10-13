@@ -1,5 +1,5 @@
-//! Custom implementation of `std::fs::File` with fixed-size buffer addressing, background synchronization,
-//! and epoch-based durability tracking
+//! Custom implementation of `std::fs::File` with fixed-size buffer addressing, background
+//! synchronization, and epoch-based durability tracking
 //!
 //! ## Example
 //!
@@ -37,9 +37,11 @@
 //! assert!(!path.exists());
 //! ```
 
-// TODO: Tackle durability verification for uncommitted/non-durable reads internally in the future
-// TODO: Tackle coarse-grained RwLock write lock in sync_internal which blocks concurrent pread and pwrite ops during disk flushes
-// CRITICAL: On EIO during sync(), kernel clears dirty bits and consumes writeback errors (f_wb_err). Subsequent sync() calls return Ok(()), causing del_err() to falsely report lost data as durable (ref: PostgreSQL Bug #15096 / fsyncgate). Sync failures must poison the state or panic rather than retrying blindly.
+// TODO: Tackle durability verification for uncommitted/non-durable reads internally in the future TODO: Tackle
+// coarse-grained RwLock write lock in sync_internal which blocks concurrent pread and pwrite ops during disk flushes
+// CRITICAL: On EIO during sync(), kernel clears dirty bits and consumes writeback errors (f_wb_err); subsequent sync()
+// calls return Ok(()), causing del_err() to falsely report lost data as durable (ref: PostgreSQL Bug #15096 /
+// fsyncgate); sync failures must poison the state or panic rather than retrying blindly
 
 mod interface;
 
@@ -147,8 +149,8 @@ pub type FileId = libc::c_int;
 ///
 /// ## NOTE
 ///
-/// On Windows, kernel HANDLE's are pointer sized but are stored as `isize` for atomic access; while the
-/// `INVALID_HANDLE_VALUE` maps to `-1isize`, which is [`windows::CLOSED_HANDLE`]
+/// On Windows, kernel HANDLE's are pointer sized but are stored as `isize` for atomic access; while
+/// the `INVALID_HANDLE_VALUE` maps to `-1isize`, which is [`windows::CLOSED_HANDLE`]
 #[cfg(target_os = "windows")]
 pub type FileId = isize;
 
@@ -179,13 +181,14 @@ pub struct FileCfg {
 
     /// Absolute path for/of the file
     ///
-    /// *NOTE:* The caller must make sure that the path represents a file and all the parent directories included
-    /// in the path do exists
+    /// *NOTE:* The caller must make sure that the path represents a file and all the parent
+    /// directories included in the path do exists
     pub path: std::path::PathBuf,
 
     /// Size (in bytes) of a single chunk in file
     ///
-    /// A chunk is a small fixed size allocation and addressing unit used by [`File`] for all the write/read ops
+    /// A chunk is a small fixed size allocation and addressing unit used by [`File`] for all the
+    /// write/read ops
     ///
     /// These ops are operated by index of the chunk and not the offset of the byte
     ///
@@ -199,8 +202,9 @@ pub struct FileCfg {
 
     /// Optional interval for the background sync thread
     ///
-    /// If `Some(duration)`, a background worker thread is spawned which flushes dirty pages at this interval; and
-    /// if `None`, background sync is disabled and durability advances via manual sync or forced tickets
+    /// If `Some(duration)`, a background worker thread is spawned which flushes dirty pages at this
+    /// interval; and if `None`, background sync is disabled and durability advances via manual sync
+    /// or forced tickets
     pub sync_interval: Option<std::time::Duration>,
 }
 
@@ -365,11 +369,13 @@ impl File {
     ///
     /// ## TOCTAU Safe
     ///
-    /// If the file already exists, an error w/ `err::EXS` is returned to guard against TOCTOU overwrites
+    /// If the file already exists, an error w/ `err::EXS` is returned to guard against TOCTOU
+    /// overwrites
     ///
     /// ## Exclusive Lock
     ///
-    /// Acquires an exclusive advisory lock via `flock(LOCK_EX | LOCK_NB)` immediately after descriptor creation
+    /// Acquires an exclusive advisory lock via `flock(LOCK_EX | LOCK_NB)` immediately after
+    /// descriptor creation
     ///
     /// ## Example
     ///
@@ -512,10 +518,11 @@ impl File {
     ///
     /// ## Semantics
     ///
-    /// Uses idempotent open-or-create (`OPEN_ALWAYS` on Windows, `O_CREAT` without `O_EXCL` on POSIX)
+    /// Uses idempotent open-or-create (`OPEN_ALWAYS` on Windows, `O_CREAT` without `O_EXCL` on
+    /// POSIX)
     ///
-    /// If the file is newly created, it is grown to `buffer_size * initial_available_buffers` and synced; and if
-    /// the file already exists, it is opened and its layout invariants are validated
+    /// If the file is newly created, it is grown to `buffer_size * initial_available_buffers` and
+    /// synced; and if the file already exists, it is opened and its layout invariants are validated
     ///
     /// In both cases, an exclusive advisory lock is acquired on the file
     ///
@@ -611,8 +618,9 @@ impl File {
     ///
     /// ## Durability Guarantee & Caller Responsibility
     ///
-    /// It is 100% the caller's responsibility to ensure that they do not read newly written data unless the
-    /// older data has been confirmed durable (e.g. by checking or waiting on the write's [`AckTicket`])
+    /// It is 100% the caller's responsibility to ensure that they do not read newly written data
+    /// unless the older data has been confirmed durable
+    /// (e.g. by checking or waiting on the write's [`AckTicket`])
     ///
     /// ## Multiple Buffers
     ///
@@ -745,7 +753,8 @@ impl File {
 
     /// Grow file size of [`File`] by given `count` of buffers
     ///
-    /// After successful execution, updated file length will be `current_length + (count * buffer_size)`
+    /// After successful execution, updated file length will be `current_length + (count *
+    /// buffer_size)`
     ///
     /// ## Example
     ///
@@ -1065,13 +1074,13 @@ impl File {
     ///
     /// Consumes `self` by value to prevent any concurrent or post-deletion operations
     ///
-    /// Unlinks the file at `path`, closes the underlying descriptor, and syncs the parent directory to
-    /// guarantee crash-safe durability
+    /// Unlinks the file at `path`, closes the underlying descriptor, and syncs the parent directory
+    /// to guarantee crash-safe durability
     ///
     /// ## Caller Responsibilities
     ///
-    /// The caller must ensure that when calling `delete`, no write operations are pending for durability
-    /// and no write operations are invoked during or after `delete` is called
+    /// The caller must ensure that when calling `delete`, no write operations are pending for
+    /// durability and no write operations are invoked during or after `delete` is called
     ///
     /// ## Example
     ///
@@ -1260,8 +1269,8 @@ mod tests {
         #[test]
         fn err_new_cleans_up_on_grow_failure() {
             let (_dir, mut cfg) = tmp_path();
-            // On 64-bit systems, setting buffer_size such that buffer_size * initial_buffers exceeds
-            // off_t::MAX / i64::MAX triggers grow failure after successful creation
+            // On 64-bit systems, setting buffer_size such that buffer_size * initial_buffers exceeds off_t::MAX /
+            // i64::MAX triggers grow failure after successful creation
             cfg.buffer_size = 1 << 0x3F;
             cfg.initial_available_buffers = 1;
 
@@ -1493,8 +1502,8 @@ mod tests {
 
             let _file = r_new.expect("File::new should succeed");
 
-            // File::open either ran before creation (INV), while lock was held (LCK),
-            // or in the brief window between creation and grow/sync (CPT)
+            // File::open either ran before creation (INV), while lock was held (LCK), or in the brief window between
+            // creation and grow/sync (CPT)
             if let Err(e) = r_open {
                 assert!(
                     e.reason == err::INV.reason
@@ -1593,12 +1602,11 @@ mod tests {
                     while running.load(atomic::Ordering::Relaxed) || attempts < 0x32 {
                         attempts += 1;
                         let res = File::open(cfg.clone());
-                        // While the file is open, open fails with LCK
-                        // On Windows, opening a delete-pending file yields PRM
-                        // Once the file is deleted, open fails with INV
+                        // While the file is open, open fails with LCK On Windows, opening a delete-pending file yields
+                        // PRM Once the file is deleted, open fails with INV
                         //
-                        // On POSIX, a descriptor opened right before unlink may momentarily succeed after
-                        // deletion releases the writer's lock; if so, dropping it is completely safe
+                        // On POSIX, a descriptor opened right before unlink may momentarily succeed after deletion
+                        // releases the writer's lock; if so, dropping it is completely safe
                         if let Err(err) = res {
                             assert!(
                                 err.reason == err::LCK.reason

@@ -1,11 +1,11 @@
 //! Utilities for error propagation used across `[frozen_core]`
 //!
-//! This module provides,
+//! ## Components
 //!
 //! - [`FrozenError`] which is a structured error w/ 24-bit identifier
 //! - [`FrozenResult`] which is a result alias using [`FrozenError`]
 //!
-//! ## Id
+//! ## ID
 //!
 //! Each [`FrozenError`] uses a 24-bit identifier encoded in the following format,
 //!
@@ -116,7 +116,6 @@ impl FrozenError {
     }
 
     /// Builder-style helper to attach a suppressed error
-    #[must_use]
     pub fn with_suppressed(mut self, err: FrozenError) -> Self {
         self.add_suppressed(err);
         self
@@ -169,16 +168,15 @@ impl FrozenError {
         Self::new_raw(Self::UNBOUND_MODULE, domain, code, err)
     }
 
-    /// Recursively stamps or overrides the 8-bit `module_id` onto this error
-    /// and all attached suppressed errors
+    /// Recursively stamps or overrides the 8-bit `module_id` onto this error and all attached
+    /// suppressed errors
     ///
     /// ## Example
     ///
     /// ```
     /// use frozen_core::error::{FrozenError, ErrCode};
     ///
-    /// let err = FrozenError::unbound(0x08, ErrCode::new(0x10, "inv"), "path error")
-    ///     .with_module(0x05);
+    /// let err = FrozenError::unbound(0x08, ErrCode::new(0x10, "inv"), "path error").with_module(0x05);
     /// assert_eq!(err.module, 0x05);
     /// assert_eq!(err.domain, 0x08);
     /// assert_eq!(err.reason, 0x10);
@@ -191,6 +189,7 @@ impl FrozenError {
                 *sub = sub.clone().with_module(module);
             }
         }
+
         self
     }
 }
@@ -264,20 +263,23 @@ impl std::fmt::Display for FrozenError {
                 self.module, self.domain, self.reason, self.context
             )
         } else {
-            // Write tree format, stripping the trailing newline so Display behaves well in format!("{err}")
             let mut formatted = String::new();
-            // Using a helper struct or formatting directly to a String buffer
+
             struct TreeHelper<'a>(&'a FrozenError);
+
             impl std::fmt::Display for TreeHelper<'_> {
                 fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                     self.0.fmt_tree(f, "", true, true)
                 }
             }
+
             use std::fmt::Write as _;
             let _ = write!(formatted, "{}", TreeHelper(self));
+
             if formatted.ends_with('\n') {
                 formatted.pop();
             }
+
             write!(f, "{formatted}")
         }
     }
@@ -317,7 +319,8 @@ pub struct ErrCode {
 impl ErrCode {
     /// Create a new [`ErrCode`]
     ///
-    /// *NOTE:* This function is `const`, allowing error codes to be defined as compile-time constants
+    /// *NOTE:* This function is `const`, allowing error codes to be defined as compile-time
+    /// constants
     ///
     /// ## Example
     ///
@@ -444,8 +447,8 @@ mod tests {
     fn ok_is_std_error() {
         // NOTE:
         //
-        // `FrozenError` must satisfy `std::error::Error` so it can be used with `?` into `Box<dyn Error>`
-        // and ecosystem tooling
+        // `FrozenError` must satisfy `std::error::Error` so it can be used with `?` into `Box<dyn Error>` and ecosystem
+        // tooling
         fn assert_is_error<E: std::error::Error>(_: &E) {}
         let err = FrozenError::new(1, 2, ErrCode::new(3, "io"), "fail");
         assert_is_error(&err);

@@ -25,7 +25,8 @@ pub(in crate::memmap) trait MemMapInterface: Sized + Send + Sync {
     /// Returns the system memory page size in bytes queried from kernel settings
     fn page_size() -> FrozenResult<usize>;
 
-    /// Returns the indices of memory-mapped pages that are currently resident in physical memory (RAM)
+    /// Returns the indices of memory-mapped pages that are currently resident in physical memory
+    /// (RAM)
     ///
     /// ## Residency semantics
     ///
@@ -39,8 +40,8 @@ pub(in crate::memmap) trait MemMapInterface: Sized + Send + Sync {
     ///
     /// ## Eviction semantics
     ///
-    /// Advises or requests the kernel to release process page table / working set entries and free physical
-    /// memory associated with the specified page indices
+    /// Advises or requests the kernel to release process page table / working set entries and free
+    /// physical memory associated with the specified page indices
     ///
     /// Contiguous page indices are automatically coalesced to minimize system call overhead
     ///
@@ -61,10 +62,11 @@ pub(in crate::memmap) trait MemMapInterface: Sized + Send + Sync {
     ///
     /// # Safety
     ///
-    /// - The caller must ensure that `offset + std::mem::size_of::<T>() <= length` where `length` is the mapped region
-    ///   size
+    /// - The caller must ensure that `offset + std::mem::size_of::<T>() <= length` where `length`
+    ///   is the mapped region size
     /// - The pointer `base + offset` must be properly aligned for `T`
-    /// - The caller must uphold Rust's aliasing rules (no concurrent unsynchronized reads or writes to overlapping bytes)
+    /// - The caller must uphold Rust's aliasing rules (no concurrent unsynchronized reads or writes
+    ///   to overlapping bytes)
     /// - The memory mapping must not have been unmapped via [`unmap`](MemMapInterface::unmap)
     unsafe fn as_mut_ptr<T>(&self, offset: usize) -> *mut T
     where
@@ -76,8 +78,8 @@ pub(in crate::memmap) trait MemMapInterface: Sized + Send + Sync {
     ///
     /// # Safety
     ///
-    /// - The caller must ensure that `offset + std::mem::size_of::<T>() <= length` where `length` is the mapped region
-    ///   size
+    /// - The caller must ensure that `offset + std::mem::size_of::<T>() <= length` where `length`
+    ///   is the mapped region size
     /// - The pointer `base + offset` must be properly aligned for `T`
     /// - The caller must uphold Rust's aliasing rules (no concurrent unsynchronized writes)
     /// - The memory mapping must not have been unmapped via [`unmap`](MemMapInterface::unmap)

@@ -25,7 +25,8 @@ const MAX_RETRIES: usize = 0x0A;
 ///
 /// Wraps an allocated virtual memory mapping, managing its lifetime via RAII
 ///
-/// Automatic cleanup is provided via [`Drop`] unless explicitly consumed with [`POSIXMemMap::unmap`]
+/// Automatic cleanup is provided via [`Drop`] unless explicitly consumed with
+/// [`POSIXMemMap::unmap`]
 #[derive(Debug)]
 pub(super) struct POSIXMemMap {
     ptr: TPtr,
@@ -36,7 +37,8 @@ unsafe impl Send for POSIXMemMap {}
 unsafe impl Sync for POSIXMemMap {}
 
 impl Drop for POSIXMemMap {
-    /// Automatically releases mapped memory via `munmap(2)` when going out of scope if not explicitly unmapped
+    /// Automatically releases mapped memory via `munmap(2)` when going out of scope if not
+    /// explicitly unmapped
     fn drop(&mut self) {
         if !self.ptr.is_null() && self.length > 0 {
             let _ = munmap_raw(self.ptr, self.length);
@@ -107,22 +109,23 @@ impl MemMapInterface for POSIXMemMap {
         Ok(page_size)
     }
 
-    /// Returns the indices of memory-mapped pages that are currently resident in physical memory (RAM)
+    /// Returns the indices of memory-mapped pages that are currently resident in physical memory
+    /// (RAM)
     ///
     /// ## Residency semantics
     ///
-    /// Under POSIX systems (Linux and macOS), this queries `mincore(2)` to inspect the resident set status of
-    /// each page in the mapped range
+    /// Under POSIX systems (Linux and macOS), this queries `mincore(2)` to inspect the resident set
+    /// status of each page in the mapped range
     ///
     /// A page index `i` is included if the corresponding page is present in physical memory
     ///
-    /// The returned list of indices can also be used by callers to compute the total active resident page count
-    /// via `indices.len()`
+    /// The returned list of indices can also be used by callers to compute the total active
+    /// resident page count via `indices.len()`
     ///
     /// ## Why do we retry?
     ///
-    /// POSIX syscalls are interruptible by signals and may fail w/ `EINTR`, `EBUSY`, or `EAGAIN`. In such cases,
-    /// no progress is guaranteed, so the syscall must be retried
+    /// POSIX syscalls are interruptible by signals and may fail w/ `EINTR`, `EBUSY`, or `EAGAIN`;
+    /// in such cases, no progress is guaranteed, so the syscall must be retried
     fn active_page_indices(&self) -> FrozenResult<Vec<usize>> {
         if hints::unlikely(self.ptr.is_null() || self.length == 0) {
             return Ok(Vec::new());
@@ -169,11 +172,12 @@ impl MemMapInterface for POSIXMemMap {
     ///
     /// ## Eviction semantics
     ///
-    /// Under POSIX systems (Linux and macOS), this advises the kernel with `MADV_DONTNEED` for the specified page
-    /// indices, releasing process page table entries and freeing physical memory associated with the mapping
+    /// Under POSIX systems (Linux and macOS), this advises the kernel with `MADV_DONTNEED` for the
+    /// specified page indices, releasing process page table entries and freeing physical memory
+    /// associated with the mapping
     ///
-    /// Contiguous page indices are automatically coalesced into single `madvise(2)` calls to minimize system call
-    /// overhead
+    /// Contiguous page indices are automatically coalesced into single `madvise(2)` calls to
+    /// minimize system call overhead
     ///
     /// Duplicate page indices are deduplicated
     ///
@@ -181,8 +185,8 @@ impl MemMapInterface for POSIXMemMap {
     ///
     /// ## Durability notice
     ///
-    /// If pages contain modified (`MAP_SHARED`) data that has not been synced, call [`POSIXMemMap::sync`] before
-    /// evicting to avoid discarding unwritten changes
+    /// If pages contain modified (`MAP_SHARED`) data that has not been synced, call
+    /// [`POSIXMemMap::sync`] before evicting to avoid discarding unwritten changes
     fn evict_pages(&self, indices: &[usize]) -> FrozenResult<()> {
         if hints::unlikely(indices.is_empty()) {
             return Ok(());
@@ -234,11 +238,12 @@ impl MemMapInterface for POSIXMemMap {
     ///
     /// ## Durability
     ///
-    /// In POSIX systems `msync(MS_SYNC)` does not provide crash-safe durability; this syscall is used as a best-effort
-    /// operation to explicitly push dirty mmapped pages into filesystem writeback
+    /// In POSIX systems `msync(MS_SYNC)` does not provide crash-safe durability; this syscall is
+    /// used as a best-effort operation to explicitly push dirty mmapped pages into filesystem
+    /// writeback
     ///
-    /// For strong durability, use of [`File::sync`](crate::file::File::sync) is required right after calling
-    /// [`POSIXMemMap::sync`]
+    /// For strong durability, use of [`File::sync`](crate::file::File::sync) is required right
+    /// after calling [`POSIXMemMap::sync`]
     ///
     /// ## Why do we retry?
     ///
@@ -255,10 +260,11 @@ impl MemMapInterface for POSIXMemMap {
     ///
     /// # Safety
     ///
-    /// - The caller must ensure that `offset + std::mem::size_of::<T>() <= length` where `length` is the mapped region
-    ///   size
+    /// - The caller must ensure that `offset + std::mem::size_of::<T>() <= length` where `length`
+    ///   is the mapped region size
     /// - The pointer `base + offset` must be properly aligned for `T`
-    /// - The caller must uphold Rust's aliasing rules (no concurrent unsynchronized reads or writes to overlapping bytes)
+    /// - The caller must uphold Rust's aliasing rules (no concurrent unsynchronized reads or writes
+    ///   to overlapping bytes)
     /// - The memory mapping must not have been unmapped via [`POSIXMemMap::unmap`]
     #[inline]
     #[allow(unsafe_op_in_unsafe_fn)]
@@ -275,8 +281,8 @@ impl MemMapInterface for POSIXMemMap {
     ///
     /// # Safety
     ///
-    /// - The caller must ensure that `offset + std::mem::size_of::<T>() <= length` where `length` is the mapped region
-    ///   size
+    /// - The caller must ensure that `offset + std::mem::size_of::<T>() <= length` where `length`
+    ///   is the mapped region size
     /// - The pointer `base + offset` must be properly aligned for `T`
     /// - The caller must uphold Rust's aliasing rules (no concurrent unsynchronized writes)
     /// - The memory mapping must not have been unmapped via [`POSIXMemMap::unmap`]
@@ -297,7 +303,8 @@ impl MemMapInterface for POSIXMemMap {
 /// In POSIX systems, when calling `mmap(2)`, the provided offset must be a multiple of page size,
 /// i.e. `sysconf(_SC_PAGESIZE)`, otherwise an `EINVAL` error is returned
 ///
-/// For our use case, we always map the entire file from offset 0, hence this is never an issue for us
+/// For our use case, we always map the entire file from offset 0, hence this is never an issue for
+/// us
 fn mmap_raw(fd: i32, length: size_t) -> FrozenResult<TPtr> {
     let mut retries = 0; // only for transient errors (EINTR, EBUSY, EAGAIN)
     loop {
@@ -320,13 +327,11 @@ fn mmap_raw(fd: i32, length: size_t) -> FrozenResult<TPtr> {
                     return raw_error(err::UNK, err_msg);
                 }
 
-                // invalid fd, invalid fd type, invalid length, etc.
+                // invalid fd, invalid fd type, invalid length, etc
                 EINVAL | EBADF | EOVERFLOW => return raw_error(err::HCF, err_msg),
 
-                // no more memory available
                 ENOMEM => return raw_error(err::NMM, err_msg),
 
-                // permission denied or read-only file
                 EACCES | EPERM | ENODEV | ETXTBSY => return raw_error(err::PRM, err_msg),
 
                 _ => return raw_error(err::UNK, err_msg),
@@ -347,7 +352,6 @@ fn munmap_raw(ptr: TPtr, length: size_t) -> FrozenResult<()> {
     let err_msg = err_msg(errno);
 
     match errno {
-        // invalid/unaligned ptr or address range is not mapped
         EINVAL | ENOMEM => raw_error(err::HCF, err_msg),
 
         _ => raw_error(err::UNK, err_msg),
@@ -358,9 +362,9 @@ fn munmap_raw(ptr: TPtr, length: size_t) -> FrozenResult<()> {
 ///
 /// ## Caveats of `msync(2)` on POSIX
 ///
-/// This syscall by itself does not provide any durability guarantee; it is used as a best-effort operation to explicitly
-/// push dirty mmapped pages into filesystem writeback, to aid hard sync calls like `fdatasync` on Linux and
-/// `fcntl(F_FULLFSYNC)` on macOS
+/// This syscall by itself does not provide any durability guarantee; it is used as a best-effort
+/// operation to explicitly push dirty mmapped pages into filesystem writeback, to aid hard sync
+/// calls like `fdatasync` on Linux and `fcntl(F_FULLFSYNC)` on macOS
 fn msync_raw(ptr: TPtr, length: size_t) -> FrozenResult<()> {
     if hints::unlikely(length == 0) {
         return Ok(());
@@ -377,25 +381,21 @@ fn msync_raw(ptr: TPtr, length: size_t) -> FrozenResult<()> {
         let err_msg = err_msg(errno);
 
         match errno {
-            // IO interrupt, locked file or transient error
             EINTR | EBUSY | EAGAIN => {
                 if retries < MAX_RETRIES {
                     retries += 1;
                     continue;
                 }
 
-                // NOTE: sync error indicates that retries exhausted and durability is broken
-                // in the current/last window/batch
+                // NOTE: sync error indicates that retries exhausted and durability is broken in the current/last
+                // window/batch
                 return raw_error(err::SYN, err_msg);
             }
 
-            // fatal error, i.e. no sync for writes in recent window/batch
             EIO => return raw_error(err::SYN, err_msg),
 
-            // invalid address range, unaligned pointer, or invalid flags
             EINVAL => return raw_error(err::HCF, err_msg),
 
-            // no-more memory available
             ENOMEM => return raw_error(err::NMM, err_msg),
 
             _ => return raw_error(err::UNK, err_msg),
@@ -426,7 +426,6 @@ fn madvise_raw(ptr: *mut c_void, length: size_t) -> FrozenResult<()> {
         let err_msg = err_msg(errno);
 
         match errno {
-            // Transient busy or interrupted errors
             EINTR | EBUSY | EAGAIN => {
                 if retries < MAX_RETRIES {
                     retries += 1;
@@ -436,10 +435,8 @@ fn madvise_raw(ptr: *mut c_void, length: size_t) -> FrozenResult<()> {
                 return raw_error(err::UNK, err_msg);
             }
 
-            // Invalid address range, unaligned pointer, or invalid flags
             EINVAL => return raw_error(err::HCF, err_msg),
 
-            // Address range is not mapped
             ENOMEM => return raw_error(err::NMM, err_msg),
 
             _ => return raw_error(err::UNK, err_msg),
@@ -586,7 +583,6 @@ mod tests {
             unsafe {
                 let mmap = POSIXMemMap::new(file.fd(), total_len).unwrap();
 
-                // Touch page 0 and page 2
                 let p0 = mmap.as_mut_ptr::<u8>(0);
                 *p0 = 0xAA;
                 let p2 = mmap.as_mut_ptr::<u8>(page_size * 2);
@@ -711,9 +707,7 @@ mod tests {
                 }
                 mmap.sync(total_len).unwrap();
 
-                // Evict contiguous run [0, 1]
                 assert!(mmap.evict_pages(&[0, 1]).is_ok());
-                // Evict remaining contiguous run [2, 3]
                 assert!(mmap.evict_pages(&[2, 3]).is_ok());
 
                 mmap.unmap().unwrap();
@@ -733,7 +727,6 @@ mod tests {
                 }
                 mmap.sync(total_len).unwrap();
 
-                // Duplicates and unsorted order
                 assert!(mmap.evict_pages(&[2, 0, 2, 1, 0]).is_ok());
                 mmap.unmap().unwrap();
             }
@@ -787,8 +780,7 @@ mod tests {
                 let err_unaligned = madvise_raw(unaligned, BUFFER_SIZE).unwrap_err();
                 assert_eq!(err_unaligned.reason, err::HCF.reason);
 
-                // Target-specific raw syscall assertion:
-                // Linux kernel rejects unaligned address with -1 (EINVAL)
+                // Target-specific raw syscall assertion: Linux kernel rejects unaligned address with -1 (EINVAL)
                 #[cfg(target_os = "linux")]
                 {
                     let raw = madvise(unaligned, BUFFER_SIZE, MADV_DONTNEED);
@@ -978,11 +970,9 @@ mod tests {
             unsafe {
                 let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
 
-                // write
                 let wptr = mmap.as_mut_ptr::<u64>(0);
                 *wptr = VAL;
 
-                // read
                 let rptr = mmap.as_ptr::<u64>(0);
                 assert_eq!(*rptr, VAL);
 
@@ -998,11 +988,9 @@ mod tests {
             unsafe {
                 let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
 
-                // write
                 let wptr = mmap.as_mut_ptr::<u64>(8);
                 *wptr = VAL;
 
-                // read
                 let rptr = mmap.as_ptr::<u64>(8);
                 assert_eq!(*rptr, VAL);
 
@@ -1037,14 +1025,11 @@ mod tests {
             unsafe {
                 let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
 
-                // write
                 let wptr = mmap.as_mut_ptr::<[u32; 0x0A]>(0);
                 *wptr = VAL;
 
-                // sync
                 mmap.sync(LENGTH).unwrap();
 
-                // read
                 let rptr = mmap.as_ptr::<[u32; 0x0A]>(0);
                 assert_eq!(*rptr, VAL);
 
@@ -1102,7 +1087,6 @@ mod tests {
             const VAL: u64 = 0xCAFEBABEDEADC0DE;
             let (_dir, file) = new_tmp();
 
-            // create + map + write + sync
             unsafe {
                 let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
 
@@ -1113,7 +1097,6 @@ mod tests {
                 mmap.unmap().unwrap();
             }
 
-            // open + map + read
             unsafe {
                 let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
 
@@ -1129,7 +1112,6 @@ mod tests {
             const VAL: u64 = 0xDEADC0DEDEADC0DE;
             let (dir, file) = new_tmp();
 
-            // create + map + write + sync + unmap
             unsafe {
                 let mmap = POSIXMemMap::new(file.fd(), LENGTH).unwrap();
 
@@ -1141,7 +1123,6 @@ mod tests {
                 drop(file);
             }
 
-            // open + map + read
             unsafe {
                 let path = dir.path().join("tmp_map");
                 let cfg = FileCfg {

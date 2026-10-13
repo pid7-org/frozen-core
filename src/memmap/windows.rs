@@ -41,7 +41,8 @@ const ERROR_FILE_INVALID: u32 = 0x3EE;
 /// Max allowed retries for transient lock or sharing violations
 const MAX_RETRIES: usize = 0x80;
 
-/// Custom implementation of memory-mapped memory via Win32 File Mapping APIs for Windows 64-bit systems
+/// Custom implementation of memory-mapped memory via Win32 File Mapping APIs for Windows 64-bit
+/// systems
 ///
 /// Wraps an allocated virtual memory mapping, managing its lifetime via RAII
 ///
@@ -56,7 +57,8 @@ unsafe impl Send for WINMemMap {}
 unsafe impl Sync for WINMemMap {}
 
 impl Drop for WINMemMap {
-    /// Automatically releases mapped memory via `UnmapViewOfFile` when going out of scope if not explicitly unmapped
+    /// Automatically releases mapped memory via `UnmapViewOfFile` when going out of scope if not
+    /// explicitly unmapped
     fn drop(&mut self) {
         if !self.ptr.is_null() && self.length > 0 {
             let _ = munmap_raw(self.ptr, self.length);
@@ -119,17 +121,19 @@ impl MemMapInterface for WINMemMap {
         Ok(page_size)
     }
 
-    /// Returns the indices of memory-mapped pages that are currently resident in physical memory (RAM)
+    /// Returns the indices of memory-mapped pages that are currently resident in physical memory
+    /// (RAM)
     ///
     /// ## Residency semantics
     ///
-    /// Under Windows systems, this queries `K32QueryWorkingSetEx` to inspect the resident working set status of
-    /// each page in the mapped range
+    /// Under Windows systems, this queries `K32QueryWorkingSetEx` to inspect the resident working
+    /// set status of each page in the mapped range
     ///
-    /// A page index `i` is included if the corresponding page is present in physical memory (`Valid` bit set)
+    /// A page index `i` is included if the corresponding page is present in physical memory
+    /// (`Valid` bit set)
     ///
-    /// The returned list of indices can also be used by callers to compute the total active resident page count
-    /// via `indices.len()`
+    /// The returned list of indices can also be used by callers to compute the total active
+    /// resident page count via `indices.len()`
     fn active_page_indices(&self) -> FrozenResult<Vec<usize>> {
         if hints::unlikely(self.ptr.is_null() || self.length == 0) {
             return Ok(Vec::new());
@@ -206,8 +210,8 @@ impl MemMapInterface for WINMemMap {
     /// Under Windows systems, this calls `VirtualUnlock` for the specified page indices, releasing
     /// working set entries and evicting physical memory associated with the mapping
     ///
-    /// Contiguous page indices are automatically coalesced into single `VirtualUnlock` calls to minimize
-    /// system call overhead
+    /// Contiguous page indices are automatically coalesced into single `VirtualUnlock` calls to
+    /// minimize system call overhead
     ///
     /// Duplicate page indices are deduplicated
     ///
@@ -215,8 +219,8 @@ impl MemMapInterface for WINMemMap {
     ///
     /// ## Durability notice
     ///
-    /// If pages contain modified data that has not been synced, call [`WINMemMap::sync`] before evicting
-    /// to avoid discarding unwritten changes
+    /// If pages contain modified data that has not been synced, call [`WINMemMap::sync`] before
+    /// evicting to avoid discarding unwritten changes
     fn evict_pages(&self, indices: &[usize]) -> FrozenResult<()> {
         if hints::unlikely(indices.is_empty()) {
             return Ok(());
@@ -270,8 +274,8 @@ impl MemMapInterface for WINMemMap {
     ///
     /// In Windows systems `FlushViewOfFile` pushes dirty pages to the filesystem cache
     ///
-    /// For strong durability, use of [`File::sync`](crate::file::File::sync) (`FlushFileBuffers`) is required
-    /// right after calling [`WINMemMap::sync`]
+    /// For strong durability, use of [`File::sync`](crate::file::File::sync) (`FlushFileBuffers`)
+    /// is required right after calling [`WINMemMap::sync`]
     fn sync(&self, length: usize) -> FrozenResult<()> {
         msync_raw(self.ptr, length)
     }
@@ -282,9 +286,11 @@ impl MemMapInterface for WINMemMap {
     ///
     /// # Safety
     ///
-    /// - The caller must ensure that `offset + std::mem::size_of::<T>() <= length` where `length` is the mapped region size
+    /// - The caller must ensure that `offset + std::mem::size_of::<T>() <= length` where `length`
+    ///   is the mapped region size
     /// - The pointer `base + offset` must be properly aligned for `T`
-    /// - The caller must uphold Rust's aliasing rules (no concurrent unsynchronized reads or writes to overlapping bytes)
+    /// - The caller must uphold Rust's aliasing rules (no concurrent unsynchronized reads or writes
+    ///   to overlapping bytes)
     /// - The memory mapping must not have been unmapped via [`WINMemMap::unmap`]
     #[inline]
     #[allow(unsafe_op_in_unsafe_fn)]
@@ -301,7 +307,8 @@ impl MemMapInterface for WINMemMap {
     ///
     /// # Safety
     ///
-    /// - The caller must ensure that `offset + std::mem::size_of::<T>() <= length` where `length` is the mapped region size
+    /// - The caller must ensure that `offset + std::mem::size_of::<T>() <= length` where `length`
+    ///   is the mapped region size
     /// - The pointer `base + offset` must be properly aligned for `T`
     /// - The caller must uphold Rust's aliasing rules (no concurrent unsynchronized writes)
     /// - The memory mapping must not have been unmapped via [`WINMemMap::unmap`]
@@ -315,7 +322,8 @@ impl MemMapInterface for WINMemMap {
     }
 }
 
-/// Create a new memory mapping w/ `CreateFileMappingW` + `MapViewOfFile` on given `handle` and `length`
+/// Create a new memory mapping w/ `CreateFileMappingW` + `MapViewOfFile` on given `handle` and
+/// `length`
 fn mmap_raw(handle: isize, length: usize) -> FrozenResult<TPtr> {
     if hints::unlikely(
         handle == CLOSED_HANDLE
@@ -491,9 +499,8 @@ fn discard_raw(ptr: *mut core::ffi::c_void, length: usize) -> FrozenResult<()> {
 
     let mut retries = 0;
     loop {
-        // Calling VirtualUnlock on an unlocked range removes those pages from the process working set,
-        // returning FALSE with last error ERROR_NOT_LOCKED. If the pages were locked, it unlocks them
-        // and returns nonzero.
+        // Calling VirtualUnlock on an unlocked range removes those pages from the process working set, returning FALSE
+        // with last error ERROR_NOT_LOCKED; if the pages were locked, it unlocks them and returns nonzero
         let ok = unsafe { VirtualUnlock(ptr, aligned_len) };
         if hints::likely(ok != 0) {
             return Ok(());
@@ -654,7 +661,6 @@ mod tests {
             unsafe {
                 let mmap = WINMemMap::new(file.fd(), total_len).unwrap();
 
-                // Touch page 0 and page 2
                 let p0 = mmap.as_mut_ptr::<u8>(0);
                 *p0 = 0xAA;
                 let p2 = mmap.as_mut_ptr::<u8>(page_size * 2);
@@ -777,9 +783,7 @@ mod tests {
                 }
                 mmap.sync(total_len).unwrap();
 
-                // Evict contiguous run [0, 1]
                 assert!(mmap.evict_pages(&[0, 1]).is_ok());
-                // Evict remaining contiguous run [2, 3]
                 assert!(mmap.evict_pages(&[2, 3]).is_ok());
 
                 mmap.unmap().unwrap();
@@ -799,7 +803,6 @@ mod tests {
                 }
                 mmap.sync(total_len).unwrap();
 
-                // Duplicates and unsorted order
                 assert!(mmap.evict_pages(&[2, 0, 2, 1, 0]).is_ok());
                 mmap.unmap().unwrap();
             }
@@ -1049,11 +1052,9 @@ mod tests {
             unsafe {
                 let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
 
-                // write
                 let wptr = mmap.as_mut_ptr::<u64>(0);
                 *wptr = VAL;
 
-                // read
                 let rptr = mmap.as_ptr::<u64>(0);
                 assert_eq!(*rptr, VAL);
 
@@ -1069,11 +1070,9 @@ mod tests {
             unsafe {
                 let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
 
-                // write
                 let wptr = mmap.as_mut_ptr::<u64>(8);
                 *wptr = VAL;
 
-                // read
                 let rptr = mmap.as_ptr::<u64>(8);
                 assert_eq!(*rptr, VAL);
 
@@ -1108,14 +1107,11 @@ mod tests {
             unsafe {
                 let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
 
-                // write
                 let wptr = mmap.as_mut_ptr::<[u32; 0x0A]>(0);
                 *wptr = VAL;
 
-                // sync
                 mmap.sync(LENGTH).unwrap();
 
-                // read
                 let rptr = mmap.as_ptr::<[u32; 0x0A]>(0);
                 assert_eq!(*rptr, VAL);
 
@@ -1173,7 +1169,6 @@ mod tests {
             const VAL: u64 = 0xCAFEBABEDEADC0DE;
             let (_dir, file) = new_tmp();
 
-            // create + map + write + sync
             unsafe {
                 let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
 
@@ -1184,7 +1179,6 @@ mod tests {
                 mmap.unmap().unwrap();
             }
 
-            // open + map + read
             unsafe {
                 let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
 
@@ -1200,7 +1194,6 @@ mod tests {
             const VAL: u64 = 0xDEADC0DEDEADC0DE;
             let (dir, file) = new_tmp();
 
-            // create + map + write + sync + unmap
             unsafe {
                 let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
 
@@ -1212,7 +1205,6 @@ mod tests {
                 drop(file);
             }
 
-            // open + map + read
             unsafe {
                 let path = dir.path().join("tmp_map");
                 let cfg = FileCfg {

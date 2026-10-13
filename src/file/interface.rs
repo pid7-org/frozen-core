@@ -15,8 +15,9 @@ pub(in crate::file) trait FileInterface: Sized + Send + Sync {
     ///
     /// ## Concurrency
     ///
-    /// Implementations should load the handle atomically using [`Acquire`](std::sync::atomic::Ordering::Acquire)
-    /// ordering to ensure thread-safe descriptor inspection
+    /// Implementations should load the handle atomically using
+    /// [`Acquire`](std::sync::atomic::Ordering::Acquire) ordering to ensure thread-safe descriptor
+    /// inspection
     fn fd(&self) -> Self::Id;
 
     /// Returns `true` if the underlying descriptor or handle is currently closed
@@ -30,8 +31,8 @@ pub(in crate::file) trait FileInterface: Sized + Send + Sync {
 
     /// Verifies the physical existence of a file at `path` on the storage device
     ///
-    /// Returns `Ok(true)` if the file exists, `Ok(false)` if it does not, or an error if permission or
-    /// path resolution fails
+    /// Returns `Ok(true)` if the file exists, `Ok(false)` if it does not, or an error if permission
+    /// or path resolution fails
     fn exists(path: &Path) -> FrozenResult<bool>;
 
     /// Atomically creates and opens a new file at `path`
@@ -40,7 +41,8 @@ pub(in crate::file) trait FileInterface: Sized + Send + Sync {
     ///
     /// The creation must be atomic at the operating system / filesystem level
     ///
-    /// If a file already exists at `path`, the operation must fail immediately and return [`super::err::EXS`]
+    /// If a file already exists at `path`, the operation must fail immediately and return
+    /// [`super::err::EXS`]
     fn create(path: &Path) -> FrozenResult<Self>;
 
     /// Opens an existing file at `path` for read and write operations without creating it
@@ -52,28 +54,31 @@ pub(in crate::file) trait FileInterface: Sized + Send + Sync {
     ///
     /// ## Semantics
     ///
-    /// If the file does not exist, it is created. If it already exists, it is opened
+    /// If the file does not exist, it is created; if it already exists, it is opened
     fn new(path: &Path) -> FrozenResult<Self>;
 
     /// Acquires an exclusive, non-blocking advisory lock on the entire file
     ///
     /// ## Lock Semantics
     ///
-    /// If another process or handle holds a conflicting lock, the call fails immediately and returns
-    /// [`super::err::LCK`]
+    /// If another process or handle holds a conflicting lock, the call fails immediately and
+    /// returns [`super::err::LCK`]
     ///
-    /// The lock is automatically released when the underlying handle is closed (i.e. RAII Safe)
+    /// The lock is automatically released when the underlying handle is closed
+    /// (i.e. RAII Safe)
     fn flock(&self) -> FrozenResult<()>;
 
     /// Closes the underlying operating system descriptor or handle and releases allocated resources
     ///
-    /// Consumes `self` by value to prevent concurrent use-after-close or double-close bugs (i.e. TOCTOU errors)
+    /// Consumes `self` by value to prevent concurrent use-after-close or double-close bugs
+    /// (i.e. TOCTOU errors)
     fn close(self) -> FrozenResult<()>;
 
     /// Deletes and removes the file at `path` from the filesystem namespace
     ///
     /// Consumes `self` by value to guarantee that no subsequent operations can be executed on the
-    /// deleted file instance (i.e. TOCTOU errors)
+    /// deleted file instance
+    /// (i.e. TOCTOU errors)
     ///
     /// ## Crash-Safe Durability
     ///
@@ -100,6 +105,6 @@ pub(in crate::file) trait FileInterface: Sized + Send + Sync {
     /// Reads bytes starting from `offset` into `buf` without mutating the underlying file pointer
     fn pread(&self, buf: &mut [u8], offset: usize) -> FrozenResult<()>;
 
-    /// Writes bytes from `buf` starting at `offset` without mutating the underlying file pointer.
+    /// Writes bytes from `buf` starting at `offset` without mutating the underlying file pointer
     fn pwrite(&self, buf: &[u8], offset: usize) -> FrozenResult<()>;
 }
