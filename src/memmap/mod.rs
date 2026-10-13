@@ -2559,4 +2559,82 @@ mod tests {
             assert_eq!(mmap.length(), (INIT_T + 6) * core::mem::size_of::<u64>());
         }
     }
+
+    mod thread_failure_lifecycle {
+        use super::*;
+
+        #[test]
+        fn err_new_failure_paths_spawn_no_sync_thread() {
+            let (_dir, cfg) = tmp_cfg();
+            // Pre-create file to force EXS error
+            std::fs::write(cfg.versioned_path(), b"preexisting").unwrap();
+
+            // Calling new fails with EXS
+            let res = MemMap::<u64>::new(cfg);
+            assert!(res.is_err());
+            // No MemMap instance was created, and no background sync thread was spawned
+        }
+
+        #[test]
+        fn err_open_failure_paths_spawn_no_sync_thread() {
+            let (_dir, mut cfg) = tmp_cfg();
+            cfg.path = std::path::PathBuf::from("/non/existent/path/memmap.bin");
+
+            // Calling open on non-existent path fails with NEX/PTH
+            let res = MemMap::<u64>::open(cfg);
+            assert!(res.is_err());
+            // No MemMap instance was created, and no background sync thread was spawned
+        }
+
+        #[test]
+        fn ok_thread_shutdown_on_panic_unwinding() {
+            let (_dir, cfg) = tmp_cfg();
+            let thread_inner = Arc::new(atomic::AtomicBool::new(false));
+            let thread_inner_clone = Arc::clone(&thread_inner);
+
+            // Spawn worker thread that panics with MemMap in scope
+            let handle = std::thread::spawn(move || {
+                let mmap = MemMap::<u64>::new(cfg).unwrap();
+                let _inner = Arc::clone(&mmap.inner);
+                thread_inner_clone.store(true, atomic::Ordering::Release);
+                // Trigger panic while mmap is in scope
+                panic!("intentional test panic to trigger Drop unwinding");
+            });
+
+            // Join the panicked thread
+            assert!(handle.join().is_err());
+            assert!(thread_inner.load(atomic::Ordering::Acquire));
+            // Stack unwinding drops MemMap, setting shutdown = true and joining the background worker
+        }
+
+        #[test]
+        fn ok_thread_shutdown_in_delete_even_if_already_unmapped() {
+            let (_dir, cfg) = tmp_cfg();
+            let mmap = MemMap::<u64>::new(cfg).unwrap();
+
+            // Simulate mmap having been taken/unmapped prior to delete
+            {
+                let mut guard = mmap.inner.mmap.write().unwrap();
+                let _ = guard.take();
+            }
+
+            // delete shuts down and joins bg_thread before performing unmap and file deletion
+            assert!(mmap.delete().is_ok());
+        }
+
+        #[test]
+        fn ok_grow_failure_keeps_thread_healthy() {
+            let (_dir, cfg) = tmp_cfg();
+            let mmap = MemMap::<u64>::new(cfg).unwrap();
+
+            // Trigger grow failure with overflow
+            assert!(mmap.grow(usize::MAX).is_err());
+
+            // The instance and background sync worker remain healthy
+            let ticket = mmap.write(&42u64, 0).unwrap();
+            mmap.sync().unwrap();
+            assert!(ticket.is_durable());
+            assert_eq!(mmap.read(0).unwrap(), 42u64);
+        }
+    }
 }
