@@ -1195,6 +1195,123 @@ where
         Ok(val)
     }
 
+    /// Atomically locks `N` consecutive slots and invokes `f` with a reference to `Target`
+    ///
+    /// Requires `size_of::<Target>() == N * size_of::<T>()` and compatible alignment
+    ///
+    /// ## Constraints
+    ///
+    /// - `size_of::<Target>()` must not be zero ([`err::ZRO`])
+    /// - `size_of::<Target>()` must be an exact multiple of `size_of::<T>()` ([`err::SZE`])
+    /// - `align_of::<Target>()` must not exceed `align_of::<T>()` ([`err::ALN`])
+    /// - Slot index and byte offset calculations must not overflow `usize` ([`err::INV`])
+    /// - Target slot range `start..start + N` must not exceed mapping bounds ([`err::HCF`])
+    ///
+    /// ## Deadlock Freedom
+    ///
+    /// Read spinlocks for slots `start..start + N` are acquired in strictly ascending order
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::memmap::{MemMap, MemMapCfg};
+    /// use std::time::Duration;
+    ///
+    /// #[derive(Clone, Copy)]
+    /// #[repr(C)]
+    /// struct Page {
+    ///     header: u64,
+    ///     payload: [u64; 3],
+    /// }
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = MemMapCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().join("read_exact_demo.bin"),
+    ///     version: 1,
+    ///     initial_t: 8,
+    ///     sync_interval: Some(Duration::from_millis(100)),
+    /// };
+    ///
+    /// let mmap = MemMap::<u64>::new(cfg).unwrap();
+    /// mmap.write(&0xAA, 0).unwrap();
+    /// mmap.write(&0xBB, 1).unwrap();
+    /// mmap.write(&0xCC, 2).unwrap();
+    /// mmap.write(&0xDD, 3).unwrap();
+    ///
+    /// let header = mmap.read_exact(0, |page: &Page| page.header).unwrap();
+    /// assert_eq!(header, 0xAA);
+    /// ```
+    #[inline(always)]
+    pub fn read_exact<Target, R, F>(&self, start: usize, f: F) -> FrozenResult<R>
+    where
+        F: FnOnce(&Target) -> R,
+    {
+        let mid = self.cfg.module_id;
+        let slot_size = core::mem::size_of::<T>();
+        let target_size = core::mem::size_of::<Target>();
+
+        if hints::unlikely(target_size == 0) {
+            return err::default_error(err::ZRO).with_module(mid);
+        }
+
+        if hints::unlikely(target_size % slot_size != 0) {
+            return err::default_error(err::SZE).with_module(mid);
+        }
+
+        if hints::unlikely(core::mem::align_of::<Target>() > core::mem::align_of::<T>()) {
+            return err::default_error(err::ALN).with_module(mid);
+        }
+
+        let n = target_size / slot_size;
+
+        let end_slot = match start.checked_add(n) {
+            Some(end) => end,
+            None => return err::default_error(err::INV).with_module(mid),
+        };
+
+        let offset = match start.checked_mul(slot_size) {
+            Some(off) => off,
+            None => return err::default_error(err::INV).with_module(mid),
+        };
+
+        let end_offset = match end_slot.checked_mul(slot_size) {
+            Some(end) => end,
+            None => return err::default_error(err::INV).with_module(mid),
+        };
+
+        let slot_locks_guard = self.inner.slot_locks.read().unwrap_or_else(|e| e.into_inner());
+
+        if hints::unlikely(end_offset > self.length()) {
+            return err::default_error(err::HCF).with_module(mid);
+        }
+
+        let mut slot_guards = Vec::with_capacity(n);
+        for slot in start..end_slot {
+            slot_guards.push(slot_locks_guard.read_lock(slot));
+        }
+
+        let guard = self.inner.mmap.read().unwrap_or_else(|e| e.into_inner());
+        let mmap = match guard.as_ref() {
+            Some(m) => m,
+            None => return err::default_error(err::INV).with_module(mid),
+        };
+
+        let ptr = unsafe { mmap.as_ptr::<Target>(offset) };
+        if hints::unlikely((ptr as usize) % core::mem::align_of::<Target>() != 0) {
+            return err::default_error(err::ALN).with_module(mid);
+        }
+
+        let target_ref = unsafe { &*ptr };
+        let res = f(target_ref);
+
+        drop(guard);
+        drop(slot_guards);
+        drop(slot_locks_guard);
+
+        Ok(res)
+    }
+
     /// Writes an element `val` of type `T` into the memory mapping at the specified `index`
     ///
     /// Returns an [`AckTicket`] representing the durability acknowledgement of this write operation
@@ -2215,6 +2332,179 @@ mod tests {
 
         let err_w = mmap.write(&0x3039, usize::MAX).unwrap_err();
         assert_eq!(err_w.reason, err::INV.reason);
+    }
+
+    mod read_exact {
+        use super::*;
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[repr(C)]
+        struct TestNode {
+            id: u64,
+            flags: u64,
+            keys: [u64; 2],
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[repr(C)]
+        struct TestBadSizeTarget([u8; 12]);
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[repr(C, align(16))]
+        struct TestOveralignedTarget {
+            _a: u64,
+            _b: u64,
+        }
+
+        #[test]
+        fn ok_read_exact_single_and_multi_slot() {
+            let (_dir, cfg) = tmp_cfg();
+            let mmap = MemMap::<u64>::new(cfg).unwrap();
+
+            mmap.write(&0x1111, 0).unwrap();
+            mmap.write(&0x2222, 1).unwrap();
+            mmap.write(&0x3333, 2).unwrap();
+            mmap.write(&0x4444, 3).unwrap();
+
+            let single = mmap.read_exact(0, |val: &u64| *val).unwrap();
+            assert_eq!(single, 0x1111);
+
+            let node = mmap.read_exact(0, |n: &TestNode| *n).unwrap();
+            assert_eq!(node, TestNode { id: 0x1111, flags: 0x2222, keys: [0x3333, 0x4444] });
+
+            let keys = mmap.read_exact(2, |k: &[u64; 2]| *k).unwrap();
+            assert_eq!(keys, [0x3333, 0x4444]);
+
+            let flag_is_set = mmap.read_exact(0, |n: &TestNode| n.flags == 0x2222).unwrap();
+            assert!(flag_is_set);
+        }
+
+        #[test]
+        fn err_read_exact_invariants() {
+            let (_dir, cfg) = tmp_cfg();
+            let mmap = MemMap::<u64>::new(cfg).unwrap();
+
+            let err_zro = mmap.read_exact::<(), _, _>(0, |_| ()).unwrap_err();
+            assert_eq!(err_zro.reason, err::ZRO.reason);
+
+            let err_sze = mmap.read_exact::<TestBadSizeTarget, _, _>(0, |_| ()).unwrap_err();
+            assert_eq!(err_sze.reason, err::SZE.reason);
+
+            let err_aln = mmap.read_exact::<TestOveralignedTarget, _, _>(0, |_| ()).unwrap_err();
+            assert_eq!(err_aln.reason, err::ALN.reason);
+
+            let err_inv = mmap.read_exact::<u64, _, _>(usize::MAX, |_| ()).unwrap_err();
+            assert_eq!(err_inv.reason, err::INV.reason);
+
+            let err_inv_add =
+                mmap.read_exact::<TestNode, _, _>(usize::MAX - 1, |_| ()).unwrap_err();
+            assert_eq!(err_inv_add.reason, err::INV.reason);
+
+            let err_hcf_start = mmap.read_exact::<u64, _, _>(INIT_T, |_| ()).unwrap_err();
+            assert_eq!(err_hcf_start.reason, err::HCF.reason);
+
+            let err_hcf_end = mmap.read_exact::<TestNode, _, _>(INIT_T - 2, |_| ()).unwrap_err();
+            assert_eq!(err_hcf_end.reason, err::HCF.reason);
+        }
+
+        #[test]
+        fn ok_read_exact_concurrent_readers() {
+            let (_dir, mut cfg) = tmp_cfg();
+            cfg.initial_t = 8;
+            let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
+
+            mmap.write(&0xCAFE, 0).unwrap();
+            mmap.write(&0xBABE, 1).unwrap();
+            mmap.write(&0x1234, 2).unwrap();
+            mmap.write(&0x5678, 3).unwrap();
+
+            let barrier = Arc::new(std::sync::Barrier::new(4));
+            let mut handles = Vec::new();
+
+            for _ in 0..4 {
+                let mmap_clone = Arc::clone(&mmap);
+                let barrier_clone = Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    barrier_clone.wait();
+                    for _ in 0..0x1F4 {
+                        let id = mmap_clone.read_exact(0, |n: &TestNode| n.id).unwrap();
+                        assert_eq!(id, 0xCAFE);
+                        let k1 = mmap_clone.read_exact(0, |n: &TestNode| n.keys[1]).unwrap();
+                        assert_eq!(k1, 0x5678);
+                    }
+                }));
+            }
+
+            for h in handles {
+                h.join().unwrap();
+            }
+        }
+
+        #[test]
+        fn ok_read_exact_concurrent_writers_isolation() {
+            let (_dir, mut cfg) = tmp_cfg();
+            cfg.initial_t = 8;
+            let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
+
+            let barrier = Arc::new(std::sync::Barrier::new(5));
+            let mut handles = Vec::new();
+
+            {
+                let mmap_clone = Arc::clone(&mmap);
+                let barrier_clone = Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    barrier_clone.wait();
+                    for i in 0..0x1F4 {
+                        let v = i as u64;
+                        let _ = mmap_clone.write(&v, 0).unwrap();
+                        let _ = mmap_clone.write(&v, 1).unwrap();
+                    }
+                }));
+            }
+
+            for _ in 0..4 {
+                let mmap_clone = Arc::clone(&mmap);
+                let barrier_clone = Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    barrier_clone.wait();
+                    for _ in 0..0x1F4 {
+                        mmap_clone
+                            .read_exact(0, |pair: &[u64; 2]| {
+                                assert!(pair[0] <= 0x1F4 && pair[1] <= 0x1F4);
+                            })
+                            .unwrap();
+                    }
+                }));
+            }
+
+            for h in handles {
+                h.join().unwrap();
+            }
+        }
+
+        #[test]
+        fn ok_read_exact_unwind_releases_locks() {
+            let (_dir, cfg) = tmp_cfg();
+            let mmap = MemMap::<u64>::new(cfg).unwrap();
+
+            mmap.write(&0x1111, 0).unwrap();
+            mmap.write(&0x2222, 1).unwrap();
+
+            let panic_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = mmap.read_exact(0, |_pair: &[u64; 2]| {
+                    panic!("intentional panic inside read_exact callback");
+                });
+            }));
+            assert!(panic_res.is_err());
+
+            let ticket = mmap.write(&0x9999, 0).unwrap();
+            assert_eq!(mmap.read(0).unwrap(), 0x9999);
+            assert_eq!(ticket.epoch(), 3);
+
+            let ticket2 = mmap.write(&0x8888, 1).unwrap();
+            assert_eq!(mmap.read(1).unwrap(), 0x8888);
+            assert_eq!(ticket2.epoch(), 4);
+        }
     }
 
     #[test]
