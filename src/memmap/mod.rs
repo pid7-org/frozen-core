@@ -13,12 +13,13 @@
 //!     module_id: 1,
 //!     path,
 //!     version: 1,
-//!     initial_t: 8,
+//!     initial_t: 512,
 //!     sync_interval: Some(Duration::from_millis(50)),
+//!     page_size: None,
 //! };
 //!
 //! let memmap = MemMap::<u64>::new(cfg).unwrap();
-//! assert_eq!(memmap.length(), 8 * std::mem::size_of::<u64>());
+//! assert_eq!(memmap.length(), 512 * std::mem::size_of::<u64>());
 //!
 //! let (ticket, _) = memmap.write(0, |v| *v = 0xDEAD_BEEF_CAFE_BABE).unwrap();
 //! ticket.wait().unwrap();
@@ -152,13 +153,15 @@ pub(in crate::memmap) mod err {
 ///     module_id: 1,
 ///     path: std::path::PathBuf::from("test.db"),
 ///     version: 1,
-///     initial_t: 0x10,
+///     initial_t: 512,
 ///     sync_interval: Some(Duration::from_millis(0x64)),
+///     page_size: None,
 /// };
 ///
 /// assert_eq!(cfg.version, 1);
-/// assert_eq!(cfg.initial_t, 0x10);
+/// assert_eq!(cfg.initial_t, 512);
 /// assert_eq!(cfg.sync_interval, Some(Duration::from_millis(0x64)));
+/// assert_eq!(cfg.page_size, None);
 /// ```
 #[derive(Debug, Clone)]
 pub struct MemMapCfg {
@@ -196,6 +199,12 @@ pub struct MemMapCfg {
     /// at this interval; and if `None`, background sync is disabled and durability advances via
     /// manual sync or forced tickets
     pub sync_interval: Option<std::time::Duration>,
+
+    /// Configured page size unit for file allocation and growth
+    ///
+    /// Must be a power of 2 and at least 4096 bytes ([`PageSize::K4`]).
+    /// If `None`, defaults to the platform/host page size ([`PlatformMemMap::page_size()`]).
+    pub page_size: Option<PageSize>,
 }
 
 impl MemMapCfg {
@@ -346,6 +355,7 @@ impl Drop for SlotWriteGuard<'_> {
 #[derive(Debug)]
 struct MemMapInner {
     cfg: MemMapCfg,
+    page_size: PageSize,
     mmap: RwLock<Option<PlatformMemMap>>,
     slot_locks: RwLock<SlotLocks>,
     length: atomic::AtomicUsize,
@@ -447,12 +457,13 @@ impl MemMapInner {
 ///     module_id: 1,
 ///     path: dir.path().join("storage.bin"),
 ///     version: 1,
-///     initial_t: 4,
+///     initial_t: 512,
 ///     sync_interval: Some(Duration::from_millis(100)),
+///     page_size: None,
 /// };
 ///
 /// let memmap = MemMap::<u64>::new(cfg).unwrap();
-/// assert_eq!(memmap.length(), 4 * std::mem::size_of::<u64>());
+/// assert_eq!(memmap.length(), 512 * std::mem::size_of::<u64>());
 ///
 /// let (ticket, _) = memmap.write(0, |v| *v = 12345u64).unwrap();
 /// assert_eq!(memmap.read(0, |v| *v).unwrap(), 12345u64);
@@ -482,7 +493,8 @@ impl<T> MemMap<T>
 where
     T: Sized + Clone,
 {
-    fn validate_t(mid: u8) -> FrozenResult<()> {
+    fn validate_t(cfg: &MemMapCfg) -> FrozenResult<PageSize> {
+        let mid = cfg.module_id;
         if core::mem::needs_drop::<T>() {
             return err::default_error(err::DRP).with_module(mid);
         }
@@ -501,12 +513,46 @@ where
             return err::default_error(err::ALN).with_module(mid);
         }
 
-        let page_size = PlatformMemMap::page_size().with_module(mid)?;
+        let page_size = match cfg.page_size {
+            Some(ps) => ps.validate_platform().with_module(mid)?,
+            None => PlatformMemMap::page_size().with_module(mid)?,
+        };
+
         if size > page_size.as_usize() {
             return err::default_error(err::INV).with_module(mid);
         }
 
-        Ok(())
+        if page_size.as_usize() % size != 0 {
+            return err::raw_error(
+                err::INV,
+                format!("page size {page_size} must be divisible by size_of::<T>() ({size})"),
+            )
+            .with_module(mid);
+        }
+
+        if cfg.initial_t == 0 {
+            return err::default_error(err::INV).with_module(mid);
+        }
+
+        let initial_bytes = match cfg.initial_t.checked_mul(size) {
+            Some(b) => b,
+            None => {
+                return err::raw_error(err::INV, "initial_t calculation overflowed usize")
+                    .with_module(mid);
+            }
+        };
+
+        if initial_bytes % page_size.as_usize() != 0 {
+            return err::raw_error(
+                err::INV,
+                format!(
+                    "initial allocation (initial_t * size_of::<T>() = {initial_bytes} bytes) must be an exact multiple of page size ({page_size})"
+                ),
+            )
+            .with_module(mid);
+        }
+
+        Ok(page_size)
     }
 
     fn validate_path(cfg: &MemMapCfg) -> FrozenResult<()> {
@@ -544,7 +590,12 @@ where
         }
     }
 
-    fn from_components(cfg: MemMapCfg, mmap: PlatformMemMap, file: File) -> FrozenResult<Self> {
+    fn from_components(
+        cfg: MemMapCfg,
+        mmap: PlatformMemMap,
+        file: File,
+        page_size: PageSize,
+    ) -> FrozenResult<Self> {
         let length = mmap.length();
         let completion = Arc::new(Completion::default());
         let sync_interval = cfg.sync_interval;
@@ -553,6 +604,7 @@ where
 
         let inner = Arc::new(MemMapInner {
             cfg: cfg.clone(),
+            page_size,
             mmap: RwLock::new(Some(mmap)),
             slot_locks: RwLock::new(slot_locks),
             length: atomic::AtomicUsize::new(length),
@@ -690,18 +742,19 @@ where
     ///     module_id: 1,
     ///     path: dir.path().join("new_memmap.bin"),
     ///     version: 1,
-    ///     initial_t: 4,
+    ///     initial_t: 512,
     ///     sync_interval: Some(Duration::from_millis(100)),
+    ///     page_size: None,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
-    /// assert_eq!(mmap.length(), std::mem::size_of::<u64>() * 4);
+    /// assert_eq!(mmap.length(), std::mem::size_of::<u64>() * 512);
     ///
     /// // Creating another file at the same path fails
     /// assert!(MemMap::<u64>::new(cfg).is_err());
     /// ```
     pub fn new(cfg: MemMapCfg) -> FrozenResult<Self> {
-        Self::validate_t(cfg.module_id)?;
+        let page_size = Self::validate_t(&cfg)?;
         Self::validate_path(&cfg)?;
 
         let vpath = cfg.versioned_path();
@@ -729,7 +782,7 @@ where
             }
         };
 
-        Self::from_components(cfg, mmap, file)
+        Self::from_components(cfg, mmap, file, page_size)
     }
 
     /// Opens an existing memory-mapped [`File`] at `cfg.versioned_path()`
@@ -756,20 +809,21 @@ where
     ///     module_id: 1,
     ///     path: dir.path().join("open_memmap.bin"),
     ///     version: 1,
-    ///     initial_t: 4,
+    ///     initial_t: 512,
     ///     sync_interval: Some(Duration::from_millis(100)),
+    ///     page_size: None,
     /// };
     ///
     /// {
     ///     let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
-    ///     assert_eq!(mmap.length(), std::mem::size_of::<u64>() * 4);
+    ///     assert_eq!(mmap.length(), std::mem::size_of::<u64>() * 512);
     /// }
     ///
     /// let opened = MemMap::<u64>::open(cfg).unwrap();
-    /// assert_eq!(opened.length(), std::mem::size_of::<u64>() * 4);
+    /// assert_eq!(opened.length(), std::mem::size_of::<u64>() * 512);
     /// ```
     pub fn open(cfg: MemMapCfg) -> FrozenResult<Self> {
-        Self::validate_t(cfg.module_id)?;
+        let page_size = Self::validate_t(&cfg)?;
         Self::validate_path(&cfg)?;
 
         let vpath = cfg.versioned_path();
@@ -785,7 +839,7 @@ where
 
         let mmap = PlatformMemMap::new(file.fd(), file.length()).with_module(cfg.module_id)?;
 
-        Self::from_components(cfg, mmap, file)
+        Self::from_components(cfg, mmap, file, page_size)
     }
 
     /// Opens an existing memory-mapped [`File`] or creates a new one if it does not yet exist
@@ -812,20 +866,21 @@ where
     ///     module_id: 1,
     ///     path: dir.path().join("open_or_create_memmap.bin"),
     ///     version: 1,
-    ///     initial_t: 2,
+    ///     initial_t: 512,
     ///     sync_interval: Some(Duration::from_millis(100)),
+    ///     page_size: None,
     /// };
     ///
     /// {
     ///     let mmap = MemMap::<u64>::open_or_create(cfg.clone()).unwrap();
-    ///     assert_eq!(mmap.length(), std::mem::size_of::<u64>() * 2);
+    ///     assert_eq!(mmap.length(), std::mem::size_of::<u64>() * 512);
     /// }
     ///
     /// let reopened = MemMap::<u64>::open_or_create(cfg).unwrap();
-    /// assert_eq!(reopened.length(), std::mem::size_of::<u64>() * 2);
+    /// assert_eq!(reopened.length(), std::mem::size_of::<u64>() * 512);
     /// ```
     pub fn open_or_create(cfg: MemMapCfg) -> FrozenResult<Self> {
-        Self::validate_t(cfg.module_id)?;
+        let page_size = Self::validate_t(&cfg)?;
         Self::validate_path(&cfg)?;
 
         let vpath = cfg.versioned_path();
@@ -838,7 +893,7 @@ where
 
         let mmap = PlatformMemMap::new(file.fd(), file.length()).with_module(cfg.module_id)?;
 
-        Self::from_components(cfg, mmap, file)
+        Self::from_components(cfg, mmap, file, page_size)
     }
 
     /// Returns the system memory page size queried from kernel settings
@@ -872,19 +927,20 @@ where
     ///     module_id: 1,
     ///     path: dir.path().join("length_demo.bin"),
     ///     version: 1,
-    ///     initial_t: 8,
+    ///     initial_t: 512,
     ///     sync_interval: Some(Duration::from_millis(100)),
+    ///     page_size: None,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
-    /// assert_eq!(mmap.length(), 8 * std::mem::size_of::<u64>());
+    /// assert_eq!(mmap.length(), 512 * std::mem::size_of::<u64>());
     /// ```
     #[inline]
     pub fn length(&self) -> usize {
         self.inner.length.load(atomic::Ordering::Acquire)
     }
 
-    /// Dynamically grows the memory-mapped file by `count` additional elements of type `T`
+    /// Dynamically grows the memory-mapped file by `pages` additional virtual memory pages
     ///
     /// ## Semantics
     ///
@@ -895,7 +951,7 @@ where
     ///   sync before modifying file boundaries
     /// - Explicitly unmaps the current virtual memory mapping
     /// - Zero-extends the backing file on disk safely via [`File::grow`] and synchronizes file
-    ///   metadata
+    ///   metadata in units of the configured page size
     /// - Establishes a new memory mapping over the enlarged file range
     /// - Dynamically expands per-slot spinlocks to accommodate new slots
     /// - Updates tracked mapping length and advances durability epoch
@@ -919,33 +975,37 @@ where
     ///     module_id: 1,
     ///     path: dir.path().join("grow_demo.bin"),
     ///     version: 1,
-    ///     initial_t: 2,
+    ///     initial_t: 512,
     ///     sync_interval: None,
+    ///     page_size: None,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
-    /// assert_eq!(mmap.length(), 2 * std::mem::size_of::<u64>());
+    /// assert_eq!(mmap.length(), 512 * std::mem::size_of::<u64>());
     /// mmap.write(0, |v| *v = 111u64).unwrap();
     ///
-    /// mmap.grow(3).unwrap();
-    /// assert_eq!(mmap.length(), 5 * std::mem::size_of::<u64>());
+    /// mmap.grow(1).unwrap();
+    /// assert_eq!(mmap.length(), 1024 * std::mem::size_of::<u64>());
     /// assert_eq!(mmap.read(0, |v| *v).unwrap(), 111u64);
-    /// assert_eq!(mmap.read(4, |v| *v).unwrap(), 0u64);
+    /// assert_eq!(mmap.read(512, |v| *v).unwrap(), 0u64);
     /// ```
-    pub fn grow(&self, count: usize) -> FrozenResult<()> {
+    pub fn grow(&self, pages: usize) -> FrozenResult<()> {
         let mid = self.cfg.module_id;
-        if count == 0 {
+        if pages == 0 {
             return Ok(());
         }
 
-        let size = core::mem::size_of::<T>();
-        let len_to_add = match count.checked_mul(size) {
-            Some(len) => len,
+        let page_size = self.inner.page_size.as_usize();
+        let bytes_to_add = match pages.checked_mul(page_size) {
+            Some(bytes) => bytes,
             None => {
                 return err::raw_error(err::GRW, "file growth calculation overflowed usize")
                     .with_module(mid);
             }
         };
+
+        let size = core::mem::size_of::<T>();
+        let additional_slots = bytes_to_add / size;
 
         let file = match self.file.as_ref() {
             Some(f) => f,
@@ -964,7 +1024,7 @@ where
         };
 
         let curr_len = self.inner.length.load(atomic::Ordering::Acquire);
-        let new_length = match curr_len.checked_add(len_to_add) {
+        let new_length = match curr_len.checked_add(bytes_to_add) {
             Some(len) => len,
             None => {
                 return err::raw_error(err::GRW, "file growth calculation overflowed usize")
@@ -987,7 +1047,7 @@ where
             return Err(e);
         }
 
-        if let Err(e) = file.grow(count).with_module(mid) {
+        if let Err(e) = file.grow(additional_slots).with_module(mid) {
             if let Ok(restored) = PlatformMemMap::new(file.fd(), curr_len).with_module(mid) {
                 *mmap_guard = Some(restored);
             }
@@ -999,7 +1059,7 @@ where
             if let Ok(restored) = PlatformMemMap::new(file.fd(), new_length).with_module(mid) {
                 *mmap_guard = Some(restored);
                 self.inner.length.store(new_length, atomic::Ordering::Release);
-                slot_locks_guard.grow(count);
+                slot_locks_guard.grow(additional_slots);
             }
             return Err(e);
         }
@@ -1015,7 +1075,7 @@ where
         };
 
         *mmap_guard = Some(new_mmap);
-        slot_locks_guard.grow(count);
+        slot_locks_guard.grow(additional_slots);
         self.inner.length.store(new_length, atomic::Ordering::Release);
 
         self.inner.completion.increment_current_epoch();
@@ -1036,13 +1096,14 @@ where
     ///     module_id: 1,
     ///     path: dir.path().join("cfg_demo.bin"),
     ///     version: 2,
-    ///     initial_t: 4,
+    ///     initial_t: 512,
     ///     sync_interval: Some(Duration::from_millis(100)),
+    ///     page_size: None,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
     /// assert_eq!(mmap.cfg().version, 2);
-    /// assert_eq!(mmap.cfg().initial_t, 4);
+    /// assert_eq!(mmap.cfg().initial_t, 512);
     /// ```
     #[inline]
     pub fn cfg(&self) -> &MemMapCfg {
@@ -1064,8 +1125,9 @@ where
     ///     module_id: 1,
     ///     path: dir.path().join("epoch_demo.bin"),
     ///     version: 1,
-    ///     initial_t: 4,
+    ///     initial_t: 512,
     ///     sync_interval: Some(Duration::from_millis(100)),
+    ///     page_size: None,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1091,8 +1153,9 @@ where
     ///     module_id: 1,
     ///     path: dir.path().join("durable_demo.bin"),
     ///     version: 1,
-    ///     initial_t: 4,
+    ///     initial_t: 512,
     ///     sync_interval: Some(Duration::from_millis(100)),
+    ///     page_size: None,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1124,8 +1187,9 @@ where
     ///     module_id: 1,
     ///     path: dir.path().join("sync_demo.bin"),
     ///     version: 1,
-    ///     initial_t: 4,
+    ///     initial_t: 512,
     ///     sync_interval: None,
+    ///     page_size: None,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1165,8 +1229,9 @@ where
     ///     module_id: 1,
     ///     path: dir.path().join("read_test.bin"),
     ///     version: 1,
-    ///     initial_t: 4,
+    ///     initial_t: 512,
     ///     sync_interval: Some(Duration::from_millis(100)),
+    ///     page_size: None,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1245,8 +1310,9 @@ where
     ///     module_id: 1,
     ///     path: dir.path().join("read_exact_demo.bin"),
     ///     version: 1,
-    ///     initial_t: 8,
+    ///     initial_t: 512,
     ///     sync_interval: Some(Duration::from_millis(100)),
+    ///     page_size: None,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1355,8 +1421,9 @@ where
     ///     module_id: 1,
     ///     path: dir.path().join("write_test.bin"),
     ///     version: 1,
-    ///     initial_t: 4,
+    ///     initial_t: 512,
     ///     sync_interval: Some(Duration::from_millis(100)),
+    ///     page_size: None,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1445,8 +1512,9 @@ where
     ///     module_id: 1,
     ///     path: dir.path().join("write_exact_demo.bin"),
     ///     version: 1,
-    ///     initial_t: 8,
+    ///     initial_t: 512,
     ///     sync_interval: Some(Duration::from_millis(100)),
+    ///     page_size: None,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1571,8 +1639,9 @@ where
     ///     module_id: 1,
     ///     path,
     ///     version: 1,
-    ///     initial_t: 4,
+    ///     initial_t: 512,
     ///     sync_interval: Some(Duration::from_millis(100)),
+    ///     page_size: None,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1652,8 +1721,9 @@ where
     ///     module_id: 1,
     ///     path: dir.path().join("cas_demo.bin"),
     ///     version: 1,
-    ///     initial_t: 4,
+    ///     initial_t: 512,
     ///     sync_interval: Some(Duration::from_millis(100)),
+    ///     page_size: None,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1750,8 +1820,9 @@ where
     ///     module_id: 1,
     ///     path: dir.path().join("tx_demo.bin"),
     ///     version: 1,
-    ///     initial_t: 4,
+    ///     initial_t: 512,
     ///     sync_interval: Some(Duration::from_millis(100)),
+    ///     page_size: None,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1791,8 +1862,9 @@ where
 ///     module_id: 1,
 ///     path: dir.path().join("tx_struct_demo.bin"),
 ///     version: 1,
-///     initial_t: 4,
+///     initial_t: 512,
 ///     sync_interval: Some(Duration::from_millis(100)),
+///     page_size: None,
 /// };
 ///
 /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1834,8 +1906,9 @@ where
     ///     module_id: 1,
     ///     path: dir.path().join("tx_write_demo.bin"),
     ///     version: 1,
-    ///     initial_t: 4,
+    ///     initial_t: 512,
     ///     sync_interval: Some(Duration::from_millis(100)),
+    ///     page_size: None,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1898,8 +1971,9 @@ where
     ///     module_id: 1,
     ///     path: dir.path().join("tx_commit_demo.bin"),
     ///     version: 1,
-    ///     initial_t: 4,
+    ///     initial_t: 512,
     ///     sync_interval: Some(Duration::from_millis(100)),
+    ///     page_size: None,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -2001,8 +2075,9 @@ where
     ///     module_id: 1,
     ///     path: dir.path().join("tx_len_demo.bin"),
     ///     version: 1,
-    ///     initial_t: 4,
+    ///     initial_t: 512,
     ///     sync_interval: None,
+    ///     page_size: None,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -2028,8 +2103,9 @@ where
     ///     module_id: 1,
     ///     path: dir.path().join("tx_empty_demo.bin"),
     ///     version: 1,
-    ///     initial_t: 4,
+    ///     initial_t: 512,
     ///     sync_interval: None,
+    ///     page_size: None,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -2068,7 +2144,7 @@ mod tests {
     use std::time::Duration;
 
     const MID: u8 = 0;
-    const INIT_T: usize = 4;
+    const INIT_T: usize = 512;
 
     #[derive(Debug, Clone)]
     #[repr(C, align(8))]
@@ -2117,6 +2193,7 @@ mod tests {
             version: 1,
             initial_t: INIT_T,
             sync_interval: Some(Duration::from_millis(0x64)),
+            page_size: None,
         };
 
         (dir, cfg)
@@ -2124,17 +2201,29 @@ mod tests {
 
     #[test]
     fn ok_validate_t() {
-        assert!(MemMap::<u64>::validate_t(MID).is_ok());
-        assert!(MemMap::<ValidT>::validate_t(MID).is_ok());
+        let (_dir, cfg) = tmp_cfg();
+        assert!(MemMap::<u64>::validate_t(&cfg).is_ok());
+        let mut cfg_valid = cfg.clone();
+        cfg_valid.initial_t = 256;
+        assert!(MemMap::<ValidT>::validate_t(&cfg_valid).is_ok());
     }
 
     #[test]
     fn err_validate_t_invariants() {
-        assert_eq!(MemMap::<DropT>::validate_t(MID).unwrap_err().reason, err::DRP.reason);
-        assert_eq!(MemMap::<BadAlignT>::validate_t(MID).unwrap_err().reason, err::ALN.reason);
-        assert_eq!(MemMap::<ZstT>::validate_t(MID).unwrap_err().reason, err::ZRO.reason);
-        assert_eq!(MemMap::<BadSizeT>::validate_t(MID).unwrap_err().reason, err::SZE.reason);
-        assert_eq!(MemMap::<OversizedT>::validate_t(MID).unwrap_err().reason, err::INV.reason);
+        let (_dir, cfg) = tmp_cfg();
+        assert_eq!(MemMap::<DropT>::validate_t(&cfg).unwrap_err().reason, err::DRP.reason);
+        assert_eq!(MemMap::<BadAlignT>::validate_t(&cfg).unwrap_err().reason, err::ALN.reason);
+        assert_eq!(MemMap::<ZstT>::validate_t(&cfg).unwrap_err().reason, err::ZRO.reason);
+        assert_eq!(MemMap::<BadSizeT>::validate_t(&cfg).unwrap_err().reason, err::SZE.reason);
+        assert_eq!(MemMap::<OversizedT>::validate_t(&cfg).unwrap_err().reason, err::INV.reason);
+
+        let mut zero_cfg = cfg.clone();
+        zero_cfg.initial_t = 0;
+        assert_eq!(MemMap::<u64>::validate_t(&zero_cfg).unwrap_err().reason, err::INV.reason);
+
+        let mut unaligned_cfg = cfg.clone();
+        unaligned_cfg.initial_t = 511;
+        assert_eq!(MemMap::<u64>::validate_t(&unaligned_cfg).unwrap_err().reason, err::INV.reason);
     }
 
     #[test]
@@ -2202,6 +2291,7 @@ mod tests {
             version: 1,
             initial_t: INIT_T,
             sync_interval: Some(Duration::from_millis(0x64)),
+            page_size: None,
         };
 
         let err_new = MemMap::<u64>::new(cfg.clone()).unwrap_err();
@@ -2226,6 +2316,7 @@ mod tests {
             version: 1,
             initial_t: INIT_T,
             sync_interval: Some(Duration::from_millis(0x64)),
+            page_size: None,
         };
 
         let err_new = MemMap::<u64>::new(cfg.clone()).unwrap_err();
@@ -2246,6 +2337,7 @@ mod tests {
             version: 1,
             initial_t: INIT_T,
             sync_interval: Some(Duration::from_millis(0x64)),
+            page_size: None,
         };
 
         let err_new = MemMap::<u64>::new(cfg.clone()).unwrap_err();
@@ -2267,6 +2359,7 @@ mod tests {
             version: 1,
             initial_t: INIT_T,
             sync_interval: Some(Duration::from_millis(0x64)),
+            page_size: None,
         };
 
         let err_new = MemMap::<u64>::new(cfg.clone()).unwrap_err();
@@ -2287,6 +2380,7 @@ mod tests {
             version: 1,
             initial_t: INIT_T,
             sync_interval: Some(Duration::from_millis(0x64)),
+            page_size: None,
         };
 
         let err_new = MemMap::<u64>::new(cfg.clone()).unwrap_err();
@@ -2317,6 +2411,7 @@ mod tests {
             version: 1,
             initial_t: 2,
             sync_interval: Some(Duration::from_millis(0x64)),
+            page_size: None,
         };
         assert_eq!(cfg.versioned_path(), std::path::PathBuf::from("data_1.bin"));
 
@@ -2326,6 +2421,7 @@ mod tests {
             version: 2,
             initial_t: 2,
             sync_interval: Some(Duration::from_millis(0x64)),
+            page_size: None,
         };
         assert_eq!(cfg.versioned_path(), std::path::PathBuf::from("datastore_2"));
 
@@ -2335,6 +2431,7 @@ mod tests {
             version: 3,
             initial_t: 2,
             sync_interval: Some(Duration::from_millis(0x64)),
+            page_size: None,
         };
         assert_eq!(cfg.versioned_path(), std::path::PathBuf::from("archive.tar_3.gz"));
 
@@ -2344,6 +2441,7 @@ mod tests {
             version: 0x0A,
             initial_t: 2,
             sync_interval: Some(Duration::from_millis(0x64)),
+            page_size: None,
         };
         assert_eq!(cfg.versioned_path(), std::path::PathBuf::from("/var/data/store_10.db"));
 
@@ -2353,6 +2451,7 @@ mod tests {
             version: 0,
             initial_t: 2,
             sync_interval: Some(Duration::from_millis(0x64)),
+            page_size: None,
         };
         assert_eq!(cfg.versioned_path(), std::path::PathBuf::from("dir/sub/file_0.dat"));
 
@@ -2362,6 +2461,7 @@ mod tests {
             version: 5,
             initial_t: 2,
             sync_interval: Some(Duration::from_millis(0x64)),
+            page_size: None,
         };
         assert_eq!(cfg.versioned_path(), std::path::PathBuf::from(".env_5"));
 
@@ -2371,6 +2471,7 @@ mod tests {
             version: 1,
             initial_t: 2,
             sync_interval: Some(Duration::from_millis(0x64)),
+            page_size: None,
         };
         assert_eq!(cfg.versioned_path(), std::path::PathBuf::from(".config_1.json"));
     }
@@ -2384,8 +2485,9 @@ mod tests {
             module_id: MID,
             path: base_path.clone(),
             version: 1,
-            initial_t: 2,
+            initial_t: 512,
             sync_interval: Some(Duration::from_millis(0x64)),
+            page_size: None,
         };
         assert_eq!(cfg_v1.versioned_path(), dir.path().join("store_1.dat"));
 
@@ -2393,8 +2495,9 @@ mod tests {
             module_id: MID,
             path: base_path.clone(),
             version: 2,
-            initial_t: 4,
+            initial_t: 256,
             sync_interval: Some(Duration::from_millis(0x64)),
+            page_size: None,
         };
         assert_eq!(cfg_v2.versioned_path(), dir.path().join("store_2.dat"));
 
@@ -2404,8 +2507,8 @@ mod tests {
 
         assert!(cfg_v1.versioned_path().exists());
         assert!(cfg_v2.versioned_path().exists());
-        assert_eq!(mmap_v1.length(), core::mem::size_of::<u64>() * 2);
-        assert_eq!(mmap_v2.length(), core::mem::size_of::<ValidT>() * 4);
+        assert_eq!(mmap_v1.length(), core::mem::size_of::<u64>() * 512);
+        assert_eq!(mmap_v2.length(), core::mem::size_of::<ValidT>() * 256);
 
         assert!(mmap_v1.delete().is_ok());
         assert!(!cfg_v1.versioned_path().exists());
@@ -2432,12 +2535,12 @@ mod tests {
         let mmap = MemMap::<u64>::new(cfg).unwrap();
 
         for i in 0..INIT_T {
-            let val = (i as u64 + 1) * 0x1111_2222_3333_4444;
+            let val = (i as u64 + 1).wrapping_mul(0x1111_2222_3333_4444);
             mmap.write(i, |v| *v = val).unwrap();
         }
 
         for i in 0..INIT_T {
-            let expected = (i as u64 + 1) * 0x1111_2222_3333_4444;
+            let expected = (i as u64 + 1).wrapping_mul(0x1111_2222_3333_4444);
             assert_eq!(mmap.read(i, |v| *v).unwrap(), expected);
         }
     }
@@ -2557,7 +2660,7 @@ mod tests {
     #[test]
     fn ok_concurrent_writes_and_reads_single_slot() {
         let (_dir, mut cfg) = tmp_cfg();
-        cfg.initial_t = 4;
+        cfg.initial_t = 256;
         let mmap = Arc::new(MemMap::<ValidT>::new(cfg).unwrap());
 
         let barrier = Arc::new(std::sync::Barrier::new(4));
@@ -2612,10 +2715,10 @@ mod tests {
         let err_w = mmap.write(INIT_T, |_| ()).unwrap_err();
         assert_eq!(err_w.reason, err::HCF.reason);
 
-        let err_r_large = mmap.read(0x64, |_| ()).unwrap_err();
+        let err_r_large = mmap.read(INIT_T + 0x64, |_| ()).unwrap_err();
         assert_eq!(err_r_large.reason, err::HCF.reason);
 
-        let err_w_large = mmap.write(0x64, |_| ()).unwrap_err();
+        let err_w_large = mmap.write(INIT_T + 0x64, |_| ()).unwrap_err();
         assert_eq!(err_w_large.reason, err::HCF.reason);
     }
 
@@ -2706,8 +2809,7 @@ mod tests {
 
         #[test]
         fn ok_read_exact_concurrent_readers() {
-            let (_dir, mut cfg) = tmp_cfg();
-            cfg.initial_t = 8;
+            let (_dir, cfg) = tmp_cfg();
             let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
 
             mmap.write(0, |v| *v = 0xCAFE).unwrap();
@@ -2739,8 +2841,7 @@ mod tests {
 
         #[test]
         fn ok_read_exact_concurrent_writers_isolation() {
-            let (_dir, mut cfg) = tmp_cfg();
-            cfg.initial_t = 8;
+            let (_dir, cfg) = tmp_cfg();
             let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
 
             let barrier = Arc::new(std::sync::Barrier::new(5));
@@ -2895,8 +2996,7 @@ mod tests {
 
         #[test]
         fn ok_write_exact_concurrent_writers() {
-            let (_dir, mut cfg) = tmp_cfg();
-            cfg.initial_t = 8;
+            let (_dir, cfg) = tmp_cfg();
             let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
 
             let barrier = Arc::new(std::sync::Barrier::new(2));
@@ -2953,8 +3053,7 @@ mod tests {
 
         #[test]
         fn ok_write_exact_concurrent_readers_writers_isolation() {
-            let (_dir, mut cfg) = tmp_cfg();
-            cfg.initial_t = 8;
+            let (_dir, cfg) = tmp_cfg();
             let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
 
             let barrier = Arc::new(std::sync::Barrier::new(5));
@@ -3106,7 +3205,6 @@ mod tests {
     #[test]
     fn ok_concurrent_slot_locking() {
         let (_dir, mut cfg) = tmp_cfg();
-        cfg.initial_t = 8;
         cfg.sync_interval = Some(Duration::from_secs(0x3C));
 
         let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
@@ -3280,7 +3378,6 @@ mod tests {
     fn ok_concurrent_distinct_slots_no_contention() {
         let (_dir, mut cfg) = tmp_cfg();
         const THREADS: usize = 8;
-        cfg.initial_t = THREADS;
         cfg.sync_interval = Some(Duration::from_secs(0x3C));
 
         let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
@@ -3316,7 +3413,6 @@ mod tests {
         let (_dir, mut cfg) = tmp_cfg();
         const NUM_SLOTS: usize = 0x10;
         const NUM_THREADS: usize = 8;
-        cfg.initial_t = NUM_SLOTS;
         cfg.sync_interval = Some(Duration::from_millis(0x32));
 
         let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
@@ -3350,7 +3446,6 @@ mod tests {
     #[test]
     fn ok_concurrent_writers_with_background_sync() {
         let (_dir, mut cfg) = tmp_cfg();
-        cfg.initial_t = 8;
         cfg.sync_interval = Some(Duration::from_millis(5));
 
         let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
@@ -3385,7 +3480,6 @@ mod tests {
     #[test]
     fn ok_concurrent_ticket_force_stress() {
         let (_dir, mut cfg) = tmp_cfg();
-        cfg.initial_t = 8;
         cfg.sync_interval = Some(Duration::from_secs(0x1E));
 
         let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
@@ -3427,7 +3521,7 @@ mod tests {
     #[test]
     fn ok_large_slot_count_initialization() {
         let (_dir, mut cfg) = tmp_cfg();
-        const LARGE_COUNT: usize = 0x2710;
+        const LARGE_COUNT: usize = 0x2800;
         cfg.initial_t = LARGE_COUNT;
 
         let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -3435,11 +3529,11 @@ mod tests {
 
         assert!(mmap.write(0, |v| *v = 1).is_ok());
         assert!(mmap.write(0x1388, |v| *v = 0x1388).is_ok());
-        assert!(mmap.write(LARGE_COUNT - 1, |v| *v = 0x270F).is_ok());
+        assert!(mmap.write(LARGE_COUNT - 1, |v| *v = 0x27FF).is_ok());
 
         assert_eq!(mmap.read(0, |v| *v).unwrap(), 1);
         assert_eq!(mmap.read(0x1388, |v| *v).unwrap(), 0x1388);
-        assert_eq!(mmap.read(LARGE_COUNT - 1, |v| *v).unwrap(), 0x270F);
+        assert_eq!(mmap.read(LARGE_COUNT - 1, |v| *v).unwrap(), 0x27FF);
     }
 
     #[test]
@@ -3561,7 +3655,6 @@ mod tests {
     #[test]
     fn ok_concurrent_stress_park_unpark_no_lost_wakeups() {
         let (_dir, mut cfg) = tmp_cfg();
-        cfg.initial_t = 0x10;
         cfg.sync_interval = Some(Duration::from_millis(5));
 
         let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
@@ -3652,10 +3745,11 @@ mod tests {
             let (_dir, cfg) = tmp_cfg();
             let mmap = MemMap::<u64>::new(cfg).unwrap();
             let initial_len = INIT_T * core::mem::size_of::<u64>();
+            let page_size = mmap.inner.page_size.as_usize();
             assert_eq!(mmap.length(), initial_len);
 
             mmap.grow(4).unwrap();
-            assert_eq!(mmap.length(), initial_len + 4 * core::mem::size_of::<u64>());
+            assert_eq!(mmap.length(), initial_len + 4 * page_size);
         }
 
         #[test]
@@ -3672,9 +3766,10 @@ mod tests {
         fn ok_grow_extends_with_zero() {
             let (_dir, cfg) = tmp_cfg();
             let mmap = MemMap::<u64>::new(cfg).unwrap();
-            mmap.grow(3).unwrap();
+            let page_slots = mmap.inner.page_size.as_usize() / core::mem::size_of::<u64>();
+            mmap.grow(1).unwrap();
 
-            for idx in INIT_T..(INIT_T + 3) {
+            for idx in INIT_T..(INIT_T + page_slots) {
                 assert_eq!(mmap.read(idx, |v| *v).unwrap(), 0u64);
             }
         }
@@ -3683,18 +3778,19 @@ mod tests {
         fn ok_grow_preserves_existing_data() {
             let (_dir, cfg) = tmp_cfg();
             let mmap = MemMap::<u64>::new(cfg).unwrap();
+            let page_slots = mmap.inner.page_size.as_usize() / core::mem::size_of::<u64>();
 
             for i in 0..INIT_T {
                 mmap.write(i, |v| *v = 0xCAFE_0000 + i as u64).unwrap();
             }
 
-            mmap.grow(4).unwrap();
+            mmap.grow(1).unwrap();
 
             for i in 0..INIT_T {
                 assert_eq!(mmap.read(i, |v| *v).unwrap(), 0xCAFE_0000 + i as u64);
             }
 
-            for i in INIT_T..(INIT_T + 4) {
+            for i in INIT_T..(INIT_T + page_slots) {
                 mmap.write(i, |v| *v = 0xBEEF_0000 + i as u64).unwrap();
                 assert_eq!(mmap.read(i, |v| *v).unwrap(), 0xBEEF_0000 + i as u64);
             }
@@ -3746,6 +3842,7 @@ mod tests {
         fn ok_grow_multiple_times() {
             let (_dir, cfg) = tmp_cfg();
             let mmap = MemMap::<u64>::new(cfg).unwrap();
+            let page_size = mmap.inner.page_size.as_usize();
 
             mmap.write(0, |v| *v = 0x0Au64).unwrap();
             mmap.grow(2).unwrap();
@@ -3756,7 +3853,7 @@ mod tests {
             assert_eq!(mmap.read(0, |v| *v).unwrap(), 0x0Au64);
             assert_eq!(mmap.read(INIT_T, |v| *v).unwrap(), 0x14u64);
             assert_eq!(mmap.read(INIT_T + 2, |v| *v).unwrap(), 0x1Eu64);
-            assert_eq!(mmap.length(), (INIT_T + 5) * core::mem::size_of::<u64>());
+            assert_eq!(mmap.length(), (INIT_T * core::mem::size_of::<u64>()) + 5 * page_size);
         }
 
         #[test]
@@ -3764,6 +3861,7 @@ mod tests {
             let (_dir, mut cfg) = tmp_cfg();
             cfg.sync_interval = Some(Duration::from_millis(0x0A));
             let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
+            let page_size = mmap.inner.page_size.as_usize();
 
             let num_writers = 4;
             let mut handles = Vec::new();
@@ -3791,7 +3889,7 @@ mod tests {
             }
             grower_handle.join().unwrap();
 
-            assert_eq!(mmap.length(), (INIT_T + 6) * core::mem::size_of::<u64>());
+            assert_eq!(mmap.length(), (INIT_T * core::mem::size_of::<u64>()) + 6 * page_size);
         }
     }
 
@@ -4045,8 +4143,7 @@ mod tests {
 
         #[test]
         fn ok_tx_concurrent_non_overlapping() {
-            let (_dir, mut cfg) = tmp_cfg();
-            cfg.initial_t = 0x10;
+            let (_dir, cfg) = tmp_cfg();
             let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
 
             let mut handles = Vec::new();
@@ -4134,8 +4231,7 @@ mod tests {
 
         #[test]
         fn ok_concurrent_tx_read_exact_and_write_exact_same_slots() {
-            let (_dir, mut cfg) = tmp_cfg();
-            cfg.initial_t = 8;
+            let (_dir, cfg) = tmp_cfg();
             let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
 
             let barrier = Arc::new(std::sync::Barrier::new(6));
@@ -4207,8 +4303,7 @@ mod tests {
 
         #[test]
         fn ok_tx_retry_loop_against_concurrent_write_exact_and_read_exact() {
-            let (_dir, mut cfg) = tmp_cfg();
-            cfg.initial_t = 8;
+            let (_dir, cfg) = tmp_cfg();
             let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
 
             let barrier = Arc::new(std::sync::Barrier::new(4));
