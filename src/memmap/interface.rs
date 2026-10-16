@@ -1,5 +1,6 @@
 //! Interface contract for platform-specific memory map backends
 
+use super::PageSize;
 use crate::error::FrozenResult;
 
 /// Common interface contract implemented by platform-specific memory map backends
@@ -22,8 +23,8 @@ pub(in crate::memmap) trait MemMapInterface: Sized + Send + Sync {
     /// Returns the length of the memory mapping in bytes
     fn length(&self) -> usize;
 
-    /// Returns the system memory page size in bytes queried from kernel settings
-    fn page_size() -> FrozenResult<usize>;
+    /// Returns the system memory page size queried from kernel settings
+    fn page_size() -> FrozenResult<PageSize>;
 
     /// Returns the indices of memory-mapped pages that are currently resident in physical memory
     /// (RAM)

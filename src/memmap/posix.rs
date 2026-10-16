@@ -1,6 +1,7 @@
 //! Implementation of memory mapped files for POSIX (Linux and macOS) systems
 
 use super::{
+    PageSize,
     err::{self, raw_error},
     interface::MemMapInterface,
 };
@@ -81,10 +82,10 @@ impl MemMapInterface for POSIXMemMap {
         self.length
     }
 
-    /// Returns the system memory page size in bytes queried from kernel settings
+    /// Returns the system memory page size queried from kernel settings
     ///
     /// Under POSIX systems (Linux and macOS), this queries `sysconf(_SC_PAGESIZE)`
-    fn page_size() -> FrozenResult<usize> {
+    fn page_size() -> FrozenResult<PageSize> {
         let res = unsafe { sysconf(_SC_PAGESIZE) };
         if hints::unlikely(res <= 0) {
             let errno = last_errno();
@@ -96,17 +97,8 @@ impl MemMapInterface for POSIXMemMap {
             };
         }
 
-        let page_size = res as usize;
-        if hints::unlikely(!page_size.is_power_of_two() || page_size < 0x1000) {
-            return raw_error(
-                err::HCF,
-                format!(
-                    "kernel returned invalid page size: {page_size} (must be power of two >= 4096)"
-                ),
-            );
-        }
-
-        Ok(page_size)
+        let page_size = PageSize::try_from(res as usize)?;
+        page_size.validate_platform()
     }
 
     /// Returns the indices of memory-mapped pages that are currently resident in physical memory
@@ -131,7 +123,7 @@ impl MemMapInterface for POSIXMemMap {
             return Ok(Vec::new());
         }
 
-        let page_size = Self::page_size()?;
+        let page_size = Self::page_size()?.as_usize();
         let num_pages = self.length.div_ceil(page_size);
 
         let mut vec = vec![0u8; num_pages];
@@ -196,7 +188,7 @@ impl MemMapInterface for POSIXMemMap {
             return raw_error(err::HCF, "cannot evict pages on unmapped or zero-length mapping");
         }
 
-        let page_size = Self::page_size()?;
+        let page_size = Self::page_size()?.as_usize();
         let num_pages = self.length.div_ceil(page_size);
 
         let mut sorted_indices = indices.to_vec();
@@ -410,7 +402,7 @@ fn madvise_raw(ptr: *mut c_void, length: size_t) -> FrozenResult<()> {
         return raw_error(err::NMM, "cannot advise unmapped null pointer");
     }
 
-    let page_size = POSIXMemMap::page_size()?;
+    let page_size = POSIXMemMap::page_size()?.as_usize();
     if hints::unlikely(ptr as usize % page_size != 0) {
         return raw_error(err::HCF, "address is not page-aligned");
     }
@@ -516,7 +508,7 @@ mod tests {
             let size = POSIXMemMap::page_size().expect("page_size must succeed");
             assert!(size.is_power_of_two(), "page size must be a power of two, got {size}");
             assert!(
-                size >= 0x1000,
+                size.as_usize() >= 0x1000,
                 "page size must be at least 4096 bytes on supported 64-bit systems, got {size}"
             );
         }
@@ -525,7 +517,7 @@ mod tests {
         fn ok_page_size_matches_libc_sysconf() {
             let size = POSIXMemMap::page_size().expect("page_size must succeed");
             let sysconf_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
-            assert_eq!(size, sysconf_size);
+            assert_eq!(size.as_usize(), sysconf_size);
         }
 
         #[test]
@@ -558,7 +550,7 @@ mod tests {
         use super::*;
 
         fn new_paged_tmp(num_pages: usize) -> (tempfile::TempDir, File, usize) {
-            let page_size = POSIXMemMap::page_size().expect("page_size");
+            let page_size = POSIXMemMap::page_size().expect("page_size").as_usize();
             let total_len = page_size * num_pages;
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("tmp_paged_map");
@@ -578,7 +570,7 @@ mod tests {
         #[test]
         fn ok_active_pages_after_touch() {
             let (_dir, file, total_len) = new_paged_tmp(4);
-            let page_size = POSIXMemMap::page_size().unwrap();
+            let page_size = POSIXMemMap::page_size().unwrap().as_usize();
 
             unsafe {
                 let mmap = POSIXMemMap::new(file.fd(), total_len).unwrap();
@@ -602,7 +594,7 @@ mod tests {
         #[test]
         fn ok_active_pages_all_touched() {
             let (_dir, file, total_len) = new_paged_tmp(3);
-            let page_size = POSIXMemMap::page_size().unwrap();
+            let page_size = POSIXMemMap::page_size().unwrap().as_usize();
 
             unsafe {
                 let mmap = POSIXMemMap::new(file.fd(), total_len).unwrap();
@@ -622,7 +614,7 @@ mod tests {
         #[test]
         fn ok_active_pages_read_faults_page() {
             let (_dir, file, total_len) = new_paged_tmp(2);
-            let page_size = POSIXMemMap::page_size().unwrap();
+            let page_size = POSIXMemMap::page_size().unwrap().as_usize();
 
             unsafe {
                 let mmap = POSIXMemMap::new(file.fd(), total_len).unwrap();
@@ -654,7 +646,7 @@ mod tests {
         use super::*;
 
         fn new_paged_tmp(num_pages: usize) -> (tempfile::TempDir, File, usize) {
-            let page_size = POSIXMemMap::page_size().expect("page_size");
+            let page_size = POSIXMemMap::page_size().expect("page_size").as_usize();
             let total_len = page_size * num_pages;
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("tmp_evict_map");
@@ -697,7 +689,7 @@ mod tests {
         #[test]
         fn ok_evict_contiguous_runs() {
             let (_dir, file, total_len) = new_paged_tmp(4);
-            let page_size = POSIXMemMap::page_size().unwrap();
+            let page_size = POSIXMemMap::page_size().unwrap().as_usize();
 
             unsafe {
                 let mmap = POSIXMemMap::new(file.fd(), total_len).unwrap();
@@ -717,7 +709,7 @@ mod tests {
         #[test]
         fn ok_evict_unsorted_and_duplicate_indices() {
             let (_dir, file, total_len) = new_paged_tmp(3);
-            let page_size = POSIXMemMap::page_size().unwrap();
+            let page_size = POSIXMemMap::page_size().unwrap().as_usize();
 
             unsafe {
                 let mmap = POSIXMemMap::new(file.fd(), total_len).unwrap();
@@ -735,7 +727,7 @@ mod tests {
         #[test]
         fn ok_evict_all_using_active_page_indices() {
             let (_dir, file, total_len) = new_paged_tmp(3);
-            let page_size = POSIXMemMap::page_size().unwrap();
+            let page_size = POSIXMemMap::page_size().unwrap().as_usize();
 
             unsafe {
                 let mmap = POSIXMemMap::new(file.fd(), total_len).unwrap();

@@ -38,6 +38,9 @@ use core::marker::PhantomData;
 use std::sync::{Arc, Condvar, Mutex, RwLock, atomic};
 
 mod interface;
+mod page_size;
+
+pub use page_size::PageSize;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod posix;
@@ -499,7 +502,7 @@ where
         }
 
         let page_size = PlatformMemMap::page_size().with_module(mid)?;
-        if size > page_size {
+        if size > page_size.as_usize() {
             return err::default_error(err::INV).with_module(mid);
         }
 
@@ -838,19 +841,19 @@ where
         Self::from_components(cfg, mmap, file)
     }
 
-    /// Returns the system memory page size in bytes queried from kernel settings
+    /// Returns the system memory page size queried from kernel settings
     ///
     /// ## Example
     ///
     /// ```
-    /// use frozen_core::memmap::MemMap;
+    /// use frozen_core::memmap::{MemMap, PageSize};
     ///
     /// let page_size = MemMap::<u64>::page_size().unwrap();
-    /// assert!(page_size >= 4096);
+    /// assert!(page_size.as_usize() >= 4096);
     /// assert!(page_size.is_power_of_two());
     /// ```
     #[inline]
-    pub fn page_size() -> FrozenResult<usize> {
+    pub fn page_size() -> FrozenResult<PageSize> {
         PlatformMemMap::page_size()
     }
 
@@ -4278,8 +4281,16 @@ mod tests {
         #[test]
         fn ok_page_size_returns_valid_power_of_two() {
             let page_size = MemMap::<u64>::page_size().unwrap();
-            assert!(page_size >= 0x1000);
+            assert!(page_size.as_usize() >= 0x1000);
             assert!(page_size.is_power_of_two());
+            assert_eq!(page_size.as_usize(), page_size.as_u32() as usize);
+
+            let matched_bytes = match page_size {
+                PageSize::K4 => 4096,
+                PageSize::K16 => 16384,
+                PageSize::K64 => 65536,
+            };
+            assert_eq!(matched_bytes, page_size.as_usize());
         }
 
         #[test]

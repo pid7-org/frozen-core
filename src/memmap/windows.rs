@@ -1,4 +1,5 @@
 use super::{
+    PageSize,
     err::{self, raw_error},
     interface::MemMapInterface,
 };
@@ -101,24 +102,15 @@ impl MemMapInterface for WINMemMap {
         self.length
     }
 
-    /// Returns the system memory page size in bytes queried from kernel settings
+    /// Returns the system memory page size queried from kernel settings
     ///
     /// Under Windows systems, this queries `GetSystemInfo`
-    fn page_size() -> FrozenResult<usize> {
+    fn page_size() -> FrozenResult<PageSize> {
         let mut sys_info = unsafe { core::mem::zeroed::<SYSTEM_INFO>() };
         unsafe { GetSystemInfo(&mut sys_info) };
 
-        let page_size = sys_info.dwPageSize as usize;
-        if hints::unlikely(!page_size.is_power_of_two() || page_size < 0x1000) {
-            return raw_error(
-                err::HCF,
-                format!(
-                    "kernel returned invalid page size: {page_size} (must be power of two >= 4096)"
-                ),
-            );
-        }
-
-        Ok(page_size)
+        let page_size = PageSize::try_from(sys_info.dwPageSize as usize)?;
+        page_size.validate_platform()
     }
 
     /// Returns the indices of memory-mapped pages that are currently resident in physical memory
@@ -139,7 +131,7 @@ impl MemMapInterface for WINMemMap {
             return Ok(Vec::new());
         }
 
-        let page_size = Self::page_size()?;
+        let page_size = Self::page_size()?.as_usize();
         let num_pages = self.length.div_ceil(page_size);
 
         let mut ws_info: Vec<PSAPI_WORKING_SET_EX_INFORMATION> = (0..num_pages)
@@ -230,7 +222,7 @@ impl MemMapInterface for WINMemMap {
             return raw_error(err::HCF, "cannot evict pages on unmapped or zero-length mapping");
         }
 
-        let page_size = Self::page_size()?;
+        let page_size = Self::page_size()?.as_usize();
         let num_pages = self.length.div_ceil(page_size);
 
         let mut sorted_indices = indices.to_vec();
@@ -451,7 +443,7 @@ fn msync_raw(ptr: TPtr, length: usize) -> FrozenResult<()> {
         return raw_error(err::NMM, "cannot sync null pointer");
     }
 
-    let page_size = WINMemMap::page_size()?;
+    let page_size = WINMemMap::page_size()?.as_usize();
     if hints::unlikely(ptr as usize % page_size != 0) {
         return raw_error(err::HCF, "address is not page-aligned");
     }
@@ -490,7 +482,7 @@ fn discard_raw(ptr: *mut core::ffi::c_void, length: usize) -> FrozenResult<()> {
         return raw_error(err::NMM, "cannot advise unmapped null pointer");
     }
 
-    let page_size = WINMemMap::page_size()?;
+    let page_size = WINMemMap::page_size()?.as_usize();
     if hints::unlikely(ptr as usize % page_size != 0) {
         return raw_error(err::HCF, "address is not page-aligned");
     }
@@ -593,7 +585,7 @@ mod tests {
             let size = WINMemMap::page_size().expect("page_size must succeed");
             assert!(size.is_power_of_two(), "page size must be a power of two, got {size}");
             assert!(
-                size >= 0x1000,
+                size.as_usize() >= 0x1000,
                 "page size must be at least 4096 bytes on supported 64-bit systems, got {size}"
             );
         }
@@ -603,7 +595,7 @@ mod tests {
             let size = WINMemMap::page_size().expect("page_size must succeed");
             let mut sys_info = unsafe { core::mem::zeroed::<SYSTEM_INFO>() };
             unsafe { GetSystemInfo(&mut sys_info) };
-            assert_eq!(size, sys_info.dwPageSize as usize);
+            assert_eq!(size.as_usize(), sys_info.dwPageSize as usize);
         }
 
         #[test]
@@ -636,7 +628,7 @@ mod tests {
         use super::*;
 
         fn new_paged_tmp(num_pages: usize) -> (tempfile::TempDir, File, usize) {
-            let page_size = WINMemMap::page_size().expect("page_size");
+            let page_size = WINMemMap::page_size().expect("page_size").as_usize();
             let total_len = page_size * num_pages;
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("tmp_paged_map");
@@ -656,7 +648,7 @@ mod tests {
         #[test]
         fn ok_active_pages_after_touch() {
             let (_dir, file, total_len) = new_paged_tmp(4);
-            let page_size = WINMemMap::page_size().unwrap();
+            let page_size = WINMemMap::page_size().unwrap().as_usize();
 
             unsafe {
                 let mmap = WINMemMap::new(file.fd(), total_len).unwrap();
@@ -680,7 +672,7 @@ mod tests {
         #[test]
         fn ok_active_pages_all_touched() {
             let (_dir, file, total_len) = new_paged_tmp(3);
-            let page_size = WINMemMap::page_size().unwrap();
+            let page_size = WINMemMap::page_size().unwrap().as_usize();
 
             unsafe {
                 let mmap = WINMemMap::new(file.fd(), total_len).unwrap();
@@ -700,7 +692,7 @@ mod tests {
         #[test]
         fn ok_active_pages_read_faults_page() {
             let (_dir, file, total_len) = new_paged_tmp(2);
-            let page_size = WINMemMap::page_size().unwrap();
+            let page_size = WINMemMap::page_size().unwrap().as_usize();
 
             unsafe {
                 let mmap = WINMemMap::new(file.fd(), total_len).unwrap();
@@ -731,7 +723,7 @@ mod tests {
         use super::*;
 
         fn new_paged_tmp(num_pages: usize) -> (tempfile::TempDir, File, usize) {
-            let page_size = WINMemMap::page_size().expect("page_size");
+            let page_size = WINMemMap::page_size().expect("page_size").as_usize();
             let total_len = page_size * num_pages;
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("tmp_evict_map");
@@ -773,7 +765,7 @@ mod tests {
         #[test]
         fn ok_evict_contiguous_runs() {
             let (_dir, file, total_len) = new_paged_tmp(4);
-            let page_size = WINMemMap::page_size().unwrap();
+            let page_size = WINMemMap::page_size().unwrap().as_usize();
 
             unsafe {
                 let mmap = WINMemMap::new(file.fd(), total_len).unwrap();
@@ -793,7 +785,7 @@ mod tests {
         #[test]
         fn ok_evict_unsorted_and_duplicate_indices() {
             let (_dir, file, total_len) = new_paged_tmp(3);
-            let page_size = WINMemMap::page_size().unwrap();
+            let page_size = WINMemMap::page_size().unwrap().as_usize();
 
             unsafe {
                 let mmap = WINMemMap::new(file.fd(), total_len).unwrap();
@@ -811,7 +803,7 @@ mod tests {
         #[test]
         fn ok_evict_all_using_active_page_indices() {
             let (_dir, file, total_len) = new_paged_tmp(3);
-            let page_size = WINMemMap::page_size().unwrap();
+            let page_size = WINMemMap::page_size().unwrap().as_usize();
 
             unsafe {
                 let mmap = WINMemMap::new(file.fd(), total_len).unwrap();
