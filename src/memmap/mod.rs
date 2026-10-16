@@ -24,7 +24,7 @@
 //! ticket.wait().unwrap();
 //! assert!(ticket.is_durable());
 //!
-//! assert_eq!(memmap.read(0).unwrap(), 0xDEAD_BEEF_CAFE_BABE);
+//! assert_eq!(memmap.read(0, |v| *v).unwrap(), 0xDEAD_BEEF_CAFE_BABE);
 //! assert!(memmap.delete().is_ok());
 //! ```
 
@@ -452,7 +452,7 @@ impl MemMapInner {
 /// assert_eq!(memmap.length(), 4 * std::mem::size_of::<u64>());
 ///
 /// let ticket = memmap.write(&12345u64, 0).unwrap();
-/// assert_eq!(memmap.read(0).unwrap(), 12345u64);
+/// assert_eq!(memmap.read(0, |v| *v).unwrap(), 12345u64);
 /// assert!(memmap.delete().is_ok());
 /// ```
 pub struct MemMap<T: Sized + Clone> {
@@ -926,8 +926,8 @@ where
     ///
     /// mmap.grow(3).unwrap();
     /// assert_eq!(mmap.length(), 5 * std::mem::size_of::<u64>());
-    /// assert_eq!(mmap.read(0).unwrap(), 111u64);
-    /// assert_eq!(mmap.read(4).unwrap(), 0u64);
+    /// assert_eq!(mmap.read(0, |v| *v).unwrap(), 111u64);
+    /// assert_eq!(mmap.read(4, |v| *v).unwrap(), 0u64);
     /// ```
     pub fn grow(&self, count: usize) -> FrozenResult<()> {
         let mid = self.cfg.module_id;
@@ -1137,12 +1137,19 @@ where
         self.inner.sync_internal()
     }
 
-    /// Reads an element of type `T` from the memory mapping at the specified `index`
+    /// Locks slot `index` for reading and invokes `f` with a reference to `T`
     ///
     /// ## Constraints
     ///
     /// - `index * size_of::<T>()` must not overflow `usize`, otherwise returns [`err::INV`]
     /// - Reading past the mapped memory region returns [`err::HCF`]
+    ///
+    /// ## Zero-Copy & Safety
+    ///
+    /// Callback `f` is invoked with `&T` directly referencing mapped memory under lock
+    ///
+    /// The higher-ranked lifetime bound (`F: FnOnce(&T) -> R`) ensures references cannot
+    /// escape or outlive the locked callback scope
     ///
     /// ## Example
     ///
@@ -1161,10 +1168,13 @@ where
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
     /// mmap.write(&42u64, 0).unwrap();
-    /// assert_eq!(mmap.read(0).unwrap(), 42u64);
+    /// assert_eq!(mmap.read(0, |v| *v).unwrap(), 42u64);
     /// ```
     #[inline(always)]
-    pub fn read(&self, index: usize) -> FrozenResult<T> {
+    pub fn read<R, F>(&self, index: usize, f: F) -> FrozenResult<R>
+    where
+        F: FnOnce(&T) -> R,
+    {
         let mid = self.cfg.module_id;
         let size = core::mem::size_of::<T>();
 
@@ -1188,11 +1198,14 @@ where
         };
 
         let ptr = unsafe { mmap.as_ptr::<T>(offset) };
-        let val = unsafe { ptr.read() };
+        let target_ref = unsafe { &*ptr };
+        let res = f(target_ref);
+
         drop(guard);
         drop(_slot_guard);
         drop(slot_locks_guard);
-        Ok(val)
+
+        Ok(res)
     }
 
     /// Atomically locks `N` consecutive slots and invokes `f` with a reference to `Target`
@@ -1338,7 +1351,7 @@ where
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
     /// let ticket = mmap.write(&100u64, 2).unwrap();
-    /// assert_eq!(mmap.read(2).unwrap(), 100u64);
+    /// assert_eq!(mmap.read(2, |v| *v).unwrap(), 100u64);
     /// ```
     #[inline(always)]
     pub fn write(&self, val: &T, index: usize) -> FrozenResult<AckTicket> {
@@ -1431,8 +1444,8 @@ where
     ///     })
     ///     .unwrap();
     ///
-    /// assert_eq!(mmap.read(0).unwrap(), 0xAA);
-    /// assert_eq!(mmap.read(1).unwrap(), 0xBB);
+    /// assert_eq!(mmap.read(0, |v| *v).unwrap(), 0xAA);
+    /// assert_eq!(mmap.read(1, |v| *v).unwrap(), 0xBB);
     /// assert_eq!(ticket.epoch(), 1);
     /// ```
     #[inline(always)]
@@ -1635,11 +1648,11 @@ where
     ///
     /// // Successful CAS: 100 -> 200
     /// let ticket = mmap.compare_and_write(&100u64, &200u64, 0).unwrap();
-    /// assert_eq!(mmap.read(0).unwrap(), 200u64);
+    /// assert_eq!(mmap.read(0, |v| *v).unwrap(), 200u64);
     ///
     /// // Failed CAS: expected 100, but slot is 200
     /// assert!(mmap.compare_and_write(&100u64, &300u64, 0).is_err());
-    /// assert_eq!(mmap.read(0).unwrap(), 200u64);
+    /// assert_eq!(mmap.read(0, |v| *v).unwrap(), 200u64);
     /// ```
     pub fn compare_and_write(
         &self,
@@ -1735,8 +1748,8 @@ where
     /// tx.write(&0u64, &20u64, 1).unwrap();
     ///
     /// let ticket = tx.commit().unwrap();
-    /// assert_eq!(mmap.read(0).unwrap(), 10u64);
-    /// assert_eq!(mmap.read(1).unwrap(), 20u64);
+    /// assert_eq!(mmap.read(0, |v| *v).unwrap(), 10u64);
+    /// assert_eq!(mmap.read(1, |v| *v).unwrap(), 20u64);
     /// ```
     #[inline]
     pub fn new_tx(&self) -> MemMapTransaction<'_, T> {
@@ -1775,8 +1788,8 @@ where
 /// tx.write(&0u64, &84u64, 2).unwrap();
 ///
 /// let ticket = tx.commit().unwrap();
-/// assert_eq!(mmap.read(0).unwrap(), 42u64);
-/// assert_eq!(mmap.read(2).unwrap(), 84u64);
+/// assert_eq!(mmap.read(0, |v| *v).unwrap(), 42u64);
+/// assert_eq!(mmap.read(2, |v| *v).unwrap(), 84u64);
 /// ```
 #[derive(Debug)]
 pub struct MemMapTransaction<'a, T: Sized + Clone + PartialEq> {
@@ -1882,8 +1895,8 @@ where
     /// tx.write(&0u64, &200u64, 1).unwrap();
     ///
     /// let ticket = tx.commit().unwrap();
-    /// assert_eq!(mmap.read(0).unwrap(), 100u64);
-    /// assert_eq!(mmap.read(1).unwrap(), 200u64);
+    /// assert_eq!(mmap.read(0, |v| *v).unwrap(), 100u64);
+    /// assert_eq!(mmap.read(1, |v| *v).unwrap(), 200u64);
     /// ```
     pub fn commit(self) -> FrozenResult<AckTicket> {
         let mid = self.memmap.cfg.module_id;
@@ -2394,9 +2407,9 @@ mod tests {
         let (_dir, cfg) = tmp_cfg();
         let mmap = MemMap::<u64>::new(cfg).unwrap();
 
-        assert_eq!(mmap.read(0).unwrap(), 0);
+        assert_eq!(mmap.read(0, |v| *v).unwrap(), 0);
         let ticket = mmap.write(&0xDEAD_BEEF_CAFE_BABE, 0).unwrap();
-        assert_eq!(mmap.read(0).unwrap(), 0xDEAD_BEEF_CAFE_BABE);
+        assert_eq!(mmap.read(0, |v| *v).unwrap(), 0xDEAD_BEEF_CAFE_BABE);
         assert_eq!(ticket.epoch(), 1);
     }
 
@@ -2412,7 +2425,7 @@ mod tests {
 
         for i in 0..INIT_T {
             let expected = (i as u64 + 1) * 0x1111_2222_3333_4444;
-            assert_eq!(mmap.read(i).unwrap(), expected);
+            assert_eq!(mmap.read(i, |v| *v).unwrap(), expected);
         }
     }
 
@@ -2427,8 +2440,8 @@ mod tests {
         mmap.write(&val0, 0).unwrap();
         mmap.write(&val1, 1).unwrap();
 
-        let r0 = mmap.read(0).unwrap();
-        let r1 = mmap.read(1).unwrap();
+        let r0 = mmap.read(0, |v| v.clone()).unwrap();
+        let r1 = mmap.read(1, |v| v.clone()).unwrap();
 
         assert_eq!(r0.a, 0x0A);
         assert_eq!(r0.b, 0x14);
@@ -2437,17 +2450,51 @@ mod tests {
     }
 
     #[test]
+    fn ok_read_callback_zero_copy_projection() {
+        let (_dir, cfg) = tmp_cfg();
+        let mmap = MemMap::<ValidT>::new(cfg).unwrap();
+
+        let val = ValidT { a: 0x1234, b: 0x5678 };
+        mmap.write(&val, 0).unwrap();
+
+        let a_val = mmap.read(0, |v| v.a).unwrap();
+        assert_eq!(a_val, 0x1234);
+
+        let sum = mmap.read(0, |v| v.a + v.b).unwrap();
+        assert_eq!(sum, 0x1234 + 0x5678);
+
+        let is_match = mmap.read(0, |v| v.b == 0x5678).unwrap();
+        assert!(is_match);
+    }
+
+    #[test]
+    fn ok_read_callback_unwind_releases_lock() {
+        let (_dir, cfg) = tmp_cfg();
+        let mmap = MemMap::<u64>::new(cfg).unwrap();
+        mmap.write(&0x42, 0).unwrap();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = mmap.read(0, |_| panic!("simulated panic in read callback"));
+        }));
+        assert!(result.is_err());
+
+        assert_eq!(mmap.read(0, |v| *v).unwrap(), 0x42);
+        assert!(mmap.write(&0x99, 0).is_ok());
+        assert_eq!(mmap.read(0, |v| *v).unwrap(), 0x99);
+    }
+
+    #[test]
     fn err_write_read_out_of_bounds() {
         let (_dir, cfg) = tmp_cfg();
         let mmap = MemMap::<u64>::new(cfg).unwrap();
 
-        let err_r = mmap.read(INIT_T).unwrap_err();
+        let err_r = mmap.read(INIT_T, |_| ()).unwrap_err();
         assert_eq!(err_r.reason, err::HCF.reason);
 
         let err_w = mmap.write(&0x3039, INIT_T).unwrap_err();
         assert_eq!(err_w.reason, err::HCF.reason);
 
-        let err_r_large = mmap.read(0x64).unwrap_err();
+        let err_r_large = mmap.read(0x64, |_| ()).unwrap_err();
         assert_eq!(err_r_large.reason, err::HCF.reason);
 
         let err_w_large = mmap.write(&0x3039, 0x64).unwrap_err();
@@ -2459,7 +2506,7 @@ mod tests {
         let (_dir, cfg) = tmp_cfg();
         let mmap = MemMap::<u64>::new(cfg).unwrap();
 
-        let err_r = mmap.read(usize::MAX).unwrap_err();
+        let err_r = mmap.read(usize::MAX, |_| ()).unwrap_err();
         assert_eq!(err_r.reason, err::INV.reason);
 
         let err_w = mmap.write(&0x3039, usize::MAX).unwrap_err();
@@ -2630,11 +2677,11 @@ mod tests {
             assert!(panic_res.is_err());
 
             let ticket = mmap.write(&0x9999, 0).unwrap();
-            assert_eq!(mmap.read(0).unwrap(), 0x9999);
+            assert_eq!(mmap.read(0, |v| *v).unwrap(), 0x9999);
             assert_eq!(ticket.epoch(), 3);
 
             let ticket2 = mmap.write(&0x8888, 1).unwrap();
-            assert_eq!(mmap.read(1).unwrap(), 0x8888);
+            assert_eq!(mmap.read(1, |v| *v).unwrap(), 0x8888);
             assert_eq!(ticket2.epoch(), 4);
         }
     }
@@ -2674,7 +2721,7 @@ mod tests {
                 .unwrap();
             assert_eq!(res, 42);
             assert_eq!(ticket_single.epoch(), 1);
-            assert_eq!(mmap.read(0).unwrap(), 0xAAAA);
+            assert_eq!(mmap.read(0, |v| *v).unwrap(), 0xAAAA);
 
             let (ticket_multi, _) = mmap
                 .write_exact(0, |node: &mut TestNode| {
@@ -2696,8 +2743,8 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(ticket_partial.epoch(), 3);
-            assert_eq!(mmap.read(2).unwrap(), 0x5555);
-            assert_eq!(mmap.read(3).unwrap(), 0x6666);
+            assert_eq!(mmap.read(2, |v| *v).unwrap(), 0x5555);
+            assert_eq!(mmap.read(3, |v| *v).unwrap(), 0x6666);
         }
 
         #[test]
@@ -2845,11 +2892,11 @@ mod tests {
             assert!(panic_res.is_err());
 
             let ticket = mmap.write(&0x9999, 0).unwrap();
-            assert_eq!(mmap.read(0).unwrap(), 0x9999);
+            assert_eq!(mmap.read(0, |v| *v).unwrap(), 0x9999);
             assert_eq!(ticket.epoch(), 1);
 
             let ticket2 = mmap.write(&0x8888, 1).unwrap();
-            assert_eq!(mmap.read(1).unwrap(), 0x8888);
+            assert_eq!(mmap.read(1, |v| *v).unwrap(), 0x8888);
             assert_eq!(ticket2.epoch(), 2);
         }
 
@@ -2887,7 +2934,7 @@ mod tests {
         }
 
         let reopened = MemMap::<u64>::open(cfg).unwrap();
-        assert_eq!(reopened.read(1).unwrap(), 0xCAFE_BABE_1234_5678);
+        assert_eq!(reopened.read(1, |v| *v).unwrap(), 0xCAFE_BABE_1234_5678);
     }
 
     #[test]
@@ -2935,7 +2982,7 @@ mod tests {
         }
 
         let reopened = MemMap::<u64>::open(cfg).unwrap();
-        assert_eq!(reopened.read(0).unwrap(), 0xBEEF_CAFE);
+        assert_eq!(reopened.read(0, |v| *v).unwrap(), 0xBEEF_CAFE);
     }
 
     #[test]
@@ -2968,7 +3015,7 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 barrier_clone.wait();
                 for _ in 0..0x3E8 {
-                    let val = mmap_clone.read(0).unwrap();
+                    let val = mmap_clone.read(0, |v| *v).unwrap();
                     let thread_id = (val >> 0x20) as usize;
                     assert!(thread_id <= 4, "read value must be valid without torn reads");
                 }
@@ -2988,7 +3035,7 @@ mod tests {
             read_handles.push(std::thread::spawn(move || {
                 barrier_clone.wait();
                 for _ in 0..0x1F4 {
-                    let _ = mmap_clone.read(0).unwrap();
+                    mmap_clone.read(0, |_| ()).unwrap();
                 }
             }));
         }
@@ -3094,7 +3141,7 @@ mod tests {
         drop(m1);
 
         let m2 = MemMap::<u64>::open(cfg).unwrap();
-        assert_eq!(m2.read(0).unwrap(), 0x1122_3344);
+        assert_eq!(m2.read(0, |v| *v).unwrap(), 0x1122_3344);
         assert!(m2.delete().is_ok());
     }
 
@@ -3105,7 +3152,7 @@ mod tests {
             let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
             let val = (i as u64 + 1) * 0xAA55;
             mmap.write(&val, 0).unwrap();
-            assert_eq!(mmap.read(0).unwrap(), val);
+            assert_eq!(mmap.read(0, |v| *v).unwrap(), val);
             assert!(mmap.delete().is_ok());
             assert!(!cfg.versioned_path().exists());
         }
@@ -3130,7 +3177,7 @@ mod tests {
                 for i in 0..0x3E8 {
                     let val = (t as u64) << 0x20 | (i as u64);
                     let _ = mmap_clone.write(&val, t).unwrap();
-                    let read_val = mmap_clone.read(t).unwrap();
+                    let read_val = mmap_clone.read(t, |v| *v).unwrap();
                     assert_eq!(read_val >> 0x20, t as u64);
                 }
             }));
@@ -3141,7 +3188,7 @@ mod tests {
         }
 
         for t in 0..THREADS {
-            let val = mmap.read(t).unwrap();
+            let val = mmap.read(t, |v| *v).unwrap();
             assert_eq!(val >> 0x20, t as u64);
         }
     }
@@ -3169,7 +3216,7 @@ mod tests {
                         let val = ((t + 1) as u64) << 0x20 | (i as u64);
                         let _ = mmap_clone.write(&val, slot).unwrap();
                     } else {
-                        let _ = mmap_clone.read(slot).unwrap();
+                        mmap_clone.read(slot, |_| ()).unwrap();
                     }
                 }
             }));
@@ -3253,10 +3300,10 @@ mod tests {
         let mmap = MemMap::<u64>::new(cfg).unwrap();
 
         assert!(mmap.write(&0xF00D, INIT_T - 1).is_ok());
-        assert_eq!(mmap.read(INIT_T - 1).unwrap(), 0xF00D);
+        assert_eq!(mmap.read(INIT_T - 1, |v| *v).unwrap(), 0xF00D);
 
         assert_eq!(mmap.write(&0xBAD, INIT_T).unwrap_err().reason, err::HCF.reason);
-        assert_eq!(mmap.read(INIT_T).unwrap_err().reason, err::HCF.reason);
+        assert_eq!(mmap.read(INIT_T, |_| ()).unwrap_err().reason, err::HCF.reason);
     }
 
     #[test]
@@ -3272,9 +3319,9 @@ mod tests {
         assert!(mmap.write(&0x1388, 0x1388).is_ok());
         assert!(mmap.write(&0x270F, LARGE_COUNT - 1).is_ok());
 
-        assert_eq!(mmap.read(0).unwrap(), 1);
-        assert_eq!(mmap.read(0x1388).unwrap(), 0x1388);
-        assert_eq!(mmap.read(LARGE_COUNT - 1).unwrap(), 0x270F);
+        assert_eq!(mmap.read(0, |v| *v).unwrap(), 1);
+        assert_eq!(mmap.read(0x1388, |v| *v).unwrap(), 0x1388);
+        assert_eq!(mmap.read(LARGE_COUNT - 1, |v| *v).unwrap(), 0x270F);
     }
 
     #[test]
@@ -3290,7 +3337,7 @@ mod tests {
 
         mmap.sync().unwrap();
         assert!(ticket.is_durable());
-        assert_eq!(mmap.read(0).unwrap(), 0x55AA);
+        assert_eq!(mmap.read(0, |v| *v).unwrap(), 0x55AA);
     }
 
     #[test]
@@ -3323,7 +3370,7 @@ mod tests {
         }
 
         let reopened = MemMap::<u64>::open(cfg).unwrap();
-        assert_eq!(reopened.read(0).unwrap(), 0xCAFE_F00D);
+        assert_eq!(reopened.read(0, |v| *v).unwrap(), 0xCAFE_F00D);
     }
 
     #[test]
@@ -3348,7 +3395,7 @@ mod tests {
         let epoch = ticket.wait().unwrap();
         assert_eq!(epoch, ticket.epoch());
         assert!(ticket.is_durable());
-        assert_eq!(mmap.read(0).unwrap(), 0x9999);
+        assert_eq!(mmap.read(0, |v| *v).unwrap(), 0x9999);
 
         // After flushing, worker should re-park when no new writes arrive
         let start = std::time::Instant::now();
@@ -3388,9 +3435,9 @@ mod tests {
         assert!(t1.is_durable());
         assert!(t2.is_durable());
         assert!(t3.is_durable());
-        assert_eq!(mmap.read(0).unwrap(), 0x1111);
-        assert_eq!(mmap.read(1).unwrap(), 0x2222);
-        assert_eq!(mmap.read(2).unwrap(), 0x3333);
+        assert_eq!(mmap.read(0, |v| *v).unwrap(), 0x1111);
+        assert_eq!(mmap.read(1, |v| *v).unwrap(), 0x2222);
+        assert_eq!(mmap.read(2, |v| *v).unwrap(), 0x3333);
     }
 
     #[test]
@@ -3510,7 +3557,7 @@ mod tests {
             mmap.grow(3).unwrap();
 
             for idx in INIT_T..(INIT_T + 3) {
-                assert_eq!(mmap.read(idx).unwrap(), 0u64);
+                assert_eq!(mmap.read(idx, |v| *v).unwrap(), 0u64);
             }
         }
 
@@ -3526,12 +3573,12 @@ mod tests {
             mmap.grow(4).unwrap();
 
             for i in 0..INIT_T {
-                assert_eq!(mmap.read(i).unwrap(), 0xCAFE_0000 + i as u64);
+                assert_eq!(mmap.read(i, |v| *v).unwrap(), 0xCAFE_0000 + i as u64);
             }
 
             for i in INIT_T..(INIT_T + 4) {
                 mmap.write(&(0xBEEF_0000 + i as u64), i).unwrap();
-                assert_eq!(mmap.read(i).unwrap(), 0xBEEF_0000 + i as u64);
+                assert_eq!(mmap.read(i, |v| *v).unwrap(), 0xBEEF_0000 + i as u64);
             }
         }
 
@@ -3565,7 +3612,7 @@ mod tests {
             assert_eq!(mmap.current_epoch(), mmap.durable_epoch());
 
             mmap.grow(2).unwrap();
-            assert_eq!(mmap.read(0).unwrap(), 0x9999u64);
+            assert_eq!(mmap.read(0, |v| *v).unwrap(), 0x9999u64);
         }
 
         #[test]
@@ -3588,9 +3635,9 @@ mod tests {
             mmap.grow(3).unwrap();
             mmap.write(&0x1Eu64, INIT_T + 2).unwrap();
 
-            assert_eq!(mmap.read(0).unwrap(), 0x0Au64);
-            assert_eq!(mmap.read(INIT_T).unwrap(), 0x14u64);
-            assert_eq!(mmap.read(INIT_T + 2).unwrap(), 0x1Eu64);
+            assert_eq!(mmap.read(0, |v| *v).unwrap(), 0x0Au64);
+            assert_eq!(mmap.read(INIT_T, |v| *v).unwrap(), 0x14u64);
+            assert_eq!(mmap.read(INIT_T + 2, |v| *v).unwrap(), 0x1Eu64);
             assert_eq!(mmap.length(), (INIT_T + 5) * core::mem::size_of::<u64>());
         }
 
@@ -3608,7 +3655,7 @@ mod tests {
                 handles.push(std::thread::spawn(move || {
                     for i in 0..0x32 {
                         let _ = m.write(&((w * 0x3E8 + i) as u64), w % INIT_T);
-                        let _ = m.read(w % INIT_T);
+                        m.read(w % INIT_T, |_| ()).unwrap();
                     }
                 }));
             }
@@ -3700,7 +3747,7 @@ mod tests {
             let ticket = mmap.write(&0x2Au64, 0).unwrap();
             mmap.sync().unwrap();
             assert!(ticket.is_durable());
-            assert_eq!(mmap.read(0).unwrap(), 0x2Au64);
+            assert_eq!(mmap.read(0, |v| *v).unwrap(), 0x2Au64);
         }
     }
 
@@ -3712,20 +3759,20 @@ mod tests {
             let (_dir, cfg) = tmp_cfg();
             let mmap = MemMap::<u64>::new(cfg).unwrap();
 
-            assert_eq!(mmap.read(0).unwrap(), 0);
+            assert_eq!(mmap.read(0, |v| *v).unwrap(), 0);
 
             let t1 = mmap.compare_and_write(&0, &0x64, 0).unwrap();
-            assert_eq!(mmap.read(0).unwrap(), 0x64);
+            assert_eq!(mmap.read(0, |v| *v).unwrap(), 0x64);
             assert_eq!(mmap.current_epoch(), 1);
 
             let err = mmap.compare_and_write(&0, &0xC8, 0).unwrap_err();
             assert_eq!(err.reason, err::CAS.reason);
             assert!(err.context.contains("slot data has changed"));
-            assert_eq!(mmap.read(0).unwrap(), 0x64);
+            assert_eq!(mmap.read(0, |v| *v).unwrap(), 0x64);
             assert_eq!(mmap.current_epoch(), 1); // Epoch does not advance on failure
 
             let t2 = mmap.compare_and_write(&0x64, &0xC8, 0).unwrap();
-            assert_eq!(mmap.read(0).unwrap(), 0xC8);
+            assert_eq!(mmap.read(0, |v| *v).unwrap(), 0xC8);
             assert_eq!(mmap.current_epoch(), 2);
             assert!(t2.epoch() > t1.epoch());
         }
@@ -3751,9 +3798,9 @@ mod tests {
             assert_eq!(epoch_after, epoch_before + 1);
             assert_eq!(ticket.epoch(), epoch_after);
 
-            assert_eq!(mmap.read(0).unwrap(), 0x6F);
-            assert_eq!(mmap.read(1).unwrap(), 0xDE);
-            assert_eq!(mmap.read(2).unwrap(), 0x14D);
+            assert_eq!(mmap.read(0, |v| *v).unwrap(), 0x6F);
+            assert_eq!(mmap.read(1, |v| *v).unwrap(), 0xDE);
+            assert_eq!(mmap.read(2, |v| *v).unwrap(), 0x14D);
 
             ticket.wait().unwrap();
             assert!(ticket.is_durable());
@@ -3778,9 +3825,9 @@ mod tests {
             assert!(err.context.contains("state conflict at index 1"));
 
             // Verify NONE of the slots were modified (all-or-nothing rollback)
-            assert_eq!(mmap.read(0).unwrap(), 0);
-            assert_eq!(mmap.read(1).unwrap(), 0x3E7);
-            assert_eq!(mmap.read(2).unwrap(), 0);
+            assert_eq!(mmap.read(0, |v| *v).unwrap(), 0);
+            assert_eq!(mmap.read(1, |v| *v).unwrap(), 0x3E7);
+            assert_eq!(mmap.read(2, |v| *v).unwrap(), 0);
 
             // Epoch must NOT have advanced
             assert_eq!(mmap.current_epoch(), epoch_before);
@@ -3801,7 +3848,7 @@ mod tests {
             assert_eq!(tx1.commit().unwrap_err().reason, err::CAS.reason);
 
             // Caller observes current slot 1 value is 42, retries transaction with updated precondition
-            let curr_val = mmap.read(1).unwrap();
+            let curr_val = mmap.read(1, |v| *v).unwrap();
             assert_eq!(curr_val, 0x2A);
 
             let mut tx2 = mmap.new_tx();
@@ -3809,8 +3856,8 @@ mod tests {
             tx2.write(&0x2A, &0xC8, 1).unwrap();
             let ticket = tx2.commit().unwrap();
 
-            assert_eq!(mmap.read(0).unwrap(), 0x64);
-            assert_eq!(mmap.read(1).unwrap(), 0xC8);
+            assert_eq!(mmap.read(0, |v| *v).unwrap(), 0x64);
+            assert_eq!(mmap.read(1, |v| *v).unwrap(), 0xC8);
             ticket.wait().unwrap();
             assert!(ticket.is_durable());
         }
@@ -3873,8 +3920,8 @@ mod tests {
                 // tx dropped without calling commit()
             }
 
-            assert_eq!(mmap.read(0).unwrap(), 0);
-            assert_eq!(mmap.read(1).unwrap(), 0);
+            assert_eq!(mmap.read(0, |v| *v).unwrap(), 0);
+            assert_eq!(mmap.read(1, |v| *v).unwrap(), 0);
             assert_eq!(mmap.current_epoch(), epoch_before);
         }
 
@@ -3905,10 +3952,10 @@ mod tests {
 
             for thread_id in 0..4u64 {
                 let base = (thread_id as usize) * 4;
-                assert_eq!(mmap.read(base).unwrap(), thread_id * 0x0A + 1);
-                assert_eq!(mmap.read(base + 1).unwrap(), thread_id * 0x0A + 2);
-                assert_eq!(mmap.read(base + 2).unwrap(), thread_id * 0x0A + 3);
-                assert_eq!(mmap.read(base + 3).unwrap(), thread_id * 0x0A + 4);
+                assert_eq!(mmap.read(base, |v| *v).unwrap(), thread_id * 0x0A + 1);
+                assert_eq!(mmap.read(base + 1, |v| *v).unwrap(), thread_id * 0x0A + 2);
+                assert_eq!(mmap.read(base + 2, |v| *v).unwrap(), thread_id * 0x0A + 3);
+                assert_eq!(mmap.read(base + 3, |v| *v).unwrap(), thread_id * 0x0A + 4);
             }
         }
 
@@ -3928,8 +3975,8 @@ mod tests {
 
             {
                 let reopened = MemMap::<u64>::open(cfg).unwrap();
-                assert_eq!(reopened.read(0).unwrap(), 0xAAAA_BBBB);
-                assert_eq!(reopened.read(1).unwrap(), 0xCCCC_DDDD);
+                assert_eq!(reopened.read(0, |v| *v).unwrap(), 0xAAAA_BBBB);
+                assert_eq!(reopened.read(1, |v| *v).unwrap(), 0xCCCC_DDDD);
             }
         }
 
@@ -3956,7 +4003,7 @@ mod tests {
             // Background worker was unparked and should make ticket durable
             ticket.wait().unwrap();
             assert!(ticket.is_durable());
-            assert_eq!(mmap.read(0).unwrap(), 0x22B);
+            assert_eq!(mmap.read(0, |v| *v).unwrap(), 0x22B);
         }
 
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
