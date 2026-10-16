@@ -20,7 +20,7 @@
 //! let memmap = MemMap::<u64>::new(cfg).unwrap();
 //! assert_eq!(memmap.length(), 8 * std::mem::size_of::<u64>());
 //!
-//! let ticket = memmap.write(&0xDEAD_BEEF_CAFE_BABE, 0).unwrap();
+//! let (ticket, _) = memmap.write(0, |v| *v = 0xDEAD_BEEF_CAFE_BABE).unwrap();
 //! ticket.wait().unwrap();
 //! assert!(ticket.is_durable());
 //!
@@ -451,7 +451,7 @@ impl MemMapInner {
 /// let memmap = MemMap::<u64>::new(cfg).unwrap();
 /// assert_eq!(memmap.length(), 4 * std::mem::size_of::<u64>());
 ///
-/// let ticket = memmap.write(&12345u64, 0).unwrap();
+/// let (ticket, _) = memmap.write(0, |v| *v = 12345u64).unwrap();
 /// assert_eq!(memmap.read(0, |v| *v).unwrap(), 12345u64);
 /// assert!(memmap.delete().is_ok());
 /// ```
@@ -922,7 +922,7 @@ where
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
     /// assert_eq!(mmap.length(), 2 * std::mem::size_of::<u64>());
-    /// mmap.write(&111u64, 0).unwrap();
+    /// mmap.write(0, |v| *v = 111u64).unwrap();
     ///
     /// mmap.grow(3).unwrap();
     /// assert_eq!(mmap.length(), 5 * std::mem::size_of::<u64>());
@@ -1067,7 +1067,7 @@ where
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
     /// assert_eq!(mmap.current_epoch(), 0);
-    /// mmap.write(&999u64, 0).unwrap();
+    /// mmap.write(0, |v| *v = 999u64).unwrap();
     /// assert_eq!(mmap.current_epoch(), 1);
     /// ```
     #[inline]
@@ -1093,7 +1093,7 @@ where
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
-    /// let ticket = mmap.write(&100u64, 0).unwrap();
+    /// let (ticket, _) = mmap.write(0, |v| *v = 100u64).unwrap();
     /// mmap.sync().unwrap();
     /// assert_eq!(mmap.durable_epoch(), ticket.epoch());
     /// ```
@@ -1126,7 +1126,7 @@ where
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
-    /// let ticket = mmap.write(&0xCAFE_BABE, 1).unwrap();
+    /// let (ticket, _) = mmap.write(1, |v| *v = 0xCAFE_BABE).unwrap();
     /// assert!(!ticket.is_durable());
     ///
     /// mmap.sync().unwrap();
@@ -1167,7 +1167,7 @@ where
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
-    /// mmap.write(&42u64, 0).unwrap();
+    /// mmap.write(0, |v| *v = 42u64).unwrap();
     /// assert_eq!(mmap.read(0, |v| *v).unwrap(), 42u64);
     /// ```
     #[inline(always)]
@@ -1247,10 +1247,10 @@ where
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
-    /// mmap.write(&0xAA, 0).unwrap();
-    /// mmap.write(&0xBB, 1).unwrap();
-    /// mmap.write(&0xCC, 2).unwrap();
-    /// mmap.write(&0xDD, 3).unwrap();
+    /// mmap.write(0, |v| *v = 0xAA).unwrap();
+    /// mmap.write(1, |v| *v = 0xBB).unwrap();
+    /// mmap.write(2, |v| *v = 0xCC).unwrap();
+    /// mmap.write(3, |v| *v = 0xDD).unwrap();
     ///
     /// let header = mmap.read_exact(0, |page: &Page| page.header).unwrap();
     /// assert_eq!(header, 0xAA);
@@ -1325,14 +1325,21 @@ where
         Ok(res)
     }
 
-    /// Writes an element `val` of type `T` into the memory mapping at the specified `index`
+    /// Locks slot `index` for writing and invokes `f` with a mutable reference to `T`
     ///
-    /// Returns an [`AckTicket`] representing the durability acknowledgement of this write operation
+    /// Returns a tuple `(AckTicket, R)` containing the durability acknowledgement ticket
+    /// and the result returned by callback `f`
     ///
     /// ## Constraints
     ///
     /// - `index * size_of::<T>()` must not overflow `usize`, otherwise returns [`err::INV`]
     /// - Writing past the mapped memory region returns [`err::HCF`]
+    ///
+    /// ## Deadlock & Safety
+    ///
+    /// - Exclusive writer spinlock for slot `index` is held during closure execution
+    /// - If the closure unwinds / panics, the spinlock is cleanly released via RAII
+    ///   and the durability epoch counter is not incremented
     ///
     /// ## Example
     ///
@@ -1350,11 +1357,14 @@ where
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
-    /// let ticket = mmap.write(&100u64, 2).unwrap();
+    /// let (ticket, _) = mmap.write(2, |v| *v = 100u64).unwrap();
     /// assert_eq!(mmap.read(2, |v| *v).unwrap(), 100u64);
     /// ```
     #[inline(always)]
-    pub fn write(&self, val: &T, index: usize) -> FrozenResult<AckTicket> {
+    pub fn write<R, F>(&self, index: usize, f: F) -> FrozenResult<(AckTicket, R)>
+    where
+        F: FnOnce(&mut T) -> R,
+    {
         let mid = self.cfg.module_id;
         let size = core::mem::size_of::<T>();
 
@@ -1378,7 +1388,7 @@ where
         };
 
         let ptr = unsafe { mmap.as_mut_ptr::<T>(offset) };
-        unsafe { core::ptr::write(ptr, val.clone()) };
+        let res = f(unsafe { &mut *ptr });
         drop(guard);
         drop(_slot_guard);
         drop(slot_locks_guard);
@@ -1392,7 +1402,7 @@ where
             }
         }
 
-        Ok(AckTicket::new(epoch, self.inner.completion.clone()))
+        Ok((AckTicket::new(epoch, self.inner.completion.clone()), res))
     }
 
     /// Atomically locks `N` consecutive slots and invokes `f` with mutable access to `Target`
@@ -1644,7 +1654,7 @@ where
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
-    /// mmap.write(&100u64, 0).unwrap();
+    /// mmap.write(0, |v| *v = 100u64).unwrap();
     ///
     /// // Successful CAS: 100 -> 200
     /// let ticket = mmap.compare_and_write(&100u64, &200u64, 0).unwrap();
@@ -2408,7 +2418,7 @@ mod tests {
         let mmap = MemMap::<u64>::new(cfg).unwrap();
 
         assert_eq!(mmap.read(0, |v| *v).unwrap(), 0);
-        let ticket = mmap.write(&0xDEAD_BEEF_CAFE_BABE, 0).unwrap();
+        let (ticket, _) = mmap.write(0, |v| *v = 0xDEAD_BEEF_CAFE_BABE).unwrap();
         assert_eq!(mmap.read(0, |v| *v).unwrap(), 0xDEAD_BEEF_CAFE_BABE);
         assert_eq!(ticket.epoch(), 1);
     }
@@ -2420,7 +2430,7 @@ mod tests {
 
         for i in 0..INIT_T {
             let val = (i as u64 + 1) * 0x1111_2222_3333_4444;
-            mmap.write(&val, i).unwrap();
+            mmap.write(i, |v| *v = val).unwrap();
         }
 
         for i in 0..INIT_T {
@@ -2437,8 +2447,8 @@ mod tests {
         let val0 = ValidT { a: 0x0A, b: 0x14 };
         let val1 = ValidT { a: 0x64, b: 0xC8 };
 
-        mmap.write(&val0, 0).unwrap();
-        mmap.write(&val1, 1).unwrap();
+        mmap.write(0, |v| *v = val0).unwrap();
+        mmap.write(1, |v| *v = val1).unwrap();
 
         let r0 = mmap.read(0, |v| v.clone()).unwrap();
         let r1 = mmap.read(1, |v| v.clone()).unwrap();
@@ -2455,7 +2465,7 @@ mod tests {
         let mmap = MemMap::<ValidT>::new(cfg).unwrap();
 
         let val = ValidT { a: 0x1234, b: 0x5678 };
-        mmap.write(&val, 0).unwrap();
+        mmap.write(0, |v| *v = val).unwrap();
 
         let a_val = mmap.read(0, |v| v.a).unwrap();
         assert_eq!(a_val, 0x1234);
@@ -2471,7 +2481,7 @@ mod tests {
     fn ok_read_callback_unwind_releases_lock() {
         let (_dir, cfg) = tmp_cfg();
         let mmap = MemMap::<u64>::new(cfg).unwrap();
-        mmap.write(&0x42, 0).unwrap();
+        mmap.write(0, |v| *v = 0x42).unwrap();
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = mmap.read(0, |_| panic!("simulated panic in read callback"));
@@ -2479,8 +2489,113 @@ mod tests {
         assert!(result.is_err());
 
         assert_eq!(mmap.read(0, |v| *v).unwrap(), 0x42);
-        assert!(mmap.write(&0x99, 0).is_ok());
+        assert!(mmap.write(0, |v| *v = 0x99).is_ok());
         assert_eq!(mmap.read(0, |v| *v).unwrap(), 0x99);
+    }
+
+    #[test]
+    fn ok_write_callback_in_place_mutation() {
+        let (_dir, cfg) = tmp_cfg();
+        let mmap = MemMap::<ValidT>::new(cfg).unwrap();
+
+        mmap.write(0, |v| {
+            v.a = 0x1111;
+            v.b = 0x2222;
+        })
+        .unwrap();
+
+        mmap.write(0, |v| {
+            v.b = 0x9999;
+        })
+        .unwrap();
+
+        let val = mmap.read(0, |v| v.clone()).unwrap();
+        assert_eq!(val.a, 0x1111);
+        assert_eq!(val.b, 0x9999);
+    }
+
+    #[test]
+    fn ok_write_callback_returns_derived_value() {
+        let (_dir, cfg) = tmp_cfg();
+        let mmap = MemMap::<u64>::new(cfg).unwrap();
+
+        let (ticket, old_prev) = mmap
+            .write(0, |v| {
+                let prev = *v;
+                *v = 42;
+                prev
+            })
+            .unwrap();
+
+        assert_eq!(old_prev, 0);
+        assert_eq!(ticket.epoch(), 1);
+        assert_eq!(mmap.read(0, |v| *v).unwrap(), 42);
+    }
+
+    #[test]
+    fn ok_write_callback_unwind_releases_lock() {
+        let (_dir, cfg) = tmp_cfg();
+        let mmap = MemMap::<u64>::new(cfg).unwrap();
+        let epoch_before = mmap.current_epoch();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = mmap.write(0, |v| {
+                *v = 0xBAD;
+                panic!("intentional panic inside write callback");
+            });
+        }));
+        assert!(result.is_err());
+
+        assert_eq!(mmap.current_epoch(), epoch_before);
+        assert!(mmap.write(0, |v| *v = 0x600D).is_ok());
+        assert_eq!(mmap.read(0, |v| *v).unwrap(), 0x600D);
+    }
+
+    #[test]
+    fn ok_concurrent_writes_and_reads_single_slot() {
+        let (_dir, mut cfg) = tmp_cfg();
+        cfg.initial_t = 4;
+        let mmap = Arc::new(MemMap::<ValidT>::new(cfg).unwrap());
+
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let mut handles = Vec::new();
+
+        for t in 0..2 {
+            let m = Arc::clone(&mmap);
+            let b = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                for i in 0..0xC8 {
+                    let val = ((t + 1) as u64) << 0x20 | (i as u64);
+                    let _ = m.write(0, |node| {
+                        node.a = val;
+                        node.b = val;
+                    });
+                }
+            }));
+        }
+
+        for _ in 0..2 {
+            let m = Arc::clone(&mmap);
+            let b = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                for _ in 0..0x190 {
+                    let _ = m.read(0, |node| {
+                        assert_eq!(node.a, node.b);
+                    });
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        mmap.read(0, |node| {
+            assert_eq!(node.a, node.b);
+        })
+        .unwrap();
     }
 
     #[test]
@@ -2491,13 +2606,13 @@ mod tests {
         let err_r = mmap.read(INIT_T, |_| ()).unwrap_err();
         assert_eq!(err_r.reason, err::HCF.reason);
 
-        let err_w = mmap.write(&0x3039, INIT_T).unwrap_err();
+        let err_w = mmap.write(INIT_T, |_| ()).unwrap_err();
         assert_eq!(err_w.reason, err::HCF.reason);
 
         let err_r_large = mmap.read(0x64, |_| ()).unwrap_err();
         assert_eq!(err_r_large.reason, err::HCF.reason);
 
-        let err_w_large = mmap.write(&0x3039, 0x64).unwrap_err();
+        let err_w_large = mmap.write(0x64, |_| ()).unwrap_err();
         assert_eq!(err_w_large.reason, err::HCF.reason);
     }
 
@@ -2509,7 +2624,7 @@ mod tests {
         let err_r = mmap.read(usize::MAX, |_| ()).unwrap_err();
         assert_eq!(err_r.reason, err::INV.reason);
 
-        let err_w = mmap.write(&0x3039, usize::MAX).unwrap_err();
+        let err_w = mmap.write(usize::MAX, |_| ()).unwrap_err();
         assert_eq!(err_w.reason, err::INV.reason);
     }
 
@@ -2540,10 +2655,10 @@ mod tests {
             let (_dir, cfg) = tmp_cfg();
             let mmap = MemMap::<u64>::new(cfg).unwrap();
 
-            mmap.write(&0x1111, 0).unwrap();
-            mmap.write(&0x2222, 1).unwrap();
-            mmap.write(&0x3333, 2).unwrap();
-            mmap.write(&0x4444, 3).unwrap();
+            mmap.write(0, |v| *v = 0x1111).unwrap();
+            mmap.write(1, |v| *v = 0x2222).unwrap();
+            mmap.write(2, |v| *v = 0x3333).unwrap();
+            mmap.write(3, |v| *v = 0x4444).unwrap();
 
             let single = mmap.read_exact(0, |val: &u64| *val).unwrap();
             assert_eq!(single, 0x1111);
@@ -2592,10 +2707,10 @@ mod tests {
             cfg.initial_t = 8;
             let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
 
-            mmap.write(&0xCAFE, 0).unwrap();
-            mmap.write(&0xBABE, 1).unwrap();
-            mmap.write(&0x1234, 2).unwrap();
-            mmap.write(&0x5678, 3).unwrap();
+            mmap.write(0, |v| *v = 0xCAFE).unwrap();
+            mmap.write(1, |v| *v = 0xBABE).unwrap();
+            mmap.write(2, |v| *v = 0x1234).unwrap();
+            mmap.write(3, |v| *v = 0x5678).unwrap();
 
             let barrier = Arc::new(std::sync::Barrier::new(4));
             let mut handles = Vec::new();
@@ -2635,8 +2750,8 @@ mod tests {
                     barrier_clone.wait();
                     for i in 0..0x1F4 {
                         let v = i as u64;
-                        let _ = mmap_clone.write(&v, 0).unwrap();
-                        let _ = mmap_clone.write(&v, 1).unwrap();
+                        let _ = mmap_clone.write(0, |val| *val = v).unwrap();
+                        let _ = mmap_clone.write(1, |val| *val = v).unwrap();
                     }
                 }));
             }
@@ -2666,8 +2781,8 @@ mod tests {
             let (_dir, cfg) = tmp_cfg();
             let mmap = MemMap::<u64>::new(cfg).unwrap();
 
-            mmap.write(&0x1111, 0).unwrap();
-            mmap.write(&0x2222, 1).unwrap();
+            mmap.write(0, |v| *v = 0x1111).unwrap();
+            mmap.write(1, |v| *v = 0x2222).unwrap();
 
             let panic_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _ = mmap.read_exact(0, |_pair: &[u64; 2]| {
@@ -2676,11 +2791,11 @@ mod tests {
             }));
             assert!(panic_res.is_err());
 
-            let ticket = mmap.write(&0x9999, 0).unwrap();
+            let (ticket, _) = mmap.write(0, |v| *v = 0x9999).unwrap();
             assert_eq!(mmap.read(0, |v| *v).unwrap(), 0x9999);
             assert_eq!(ticket.epoch(), 3);
 
-            let ticket2 = mmap.write(&0x8888, 1).unwrap();
+            let (ticket2, _) = mmap.write(1, |v| *v = 0x8888).unwrap();
             assert_eq!(mmap.read(1, |v| *v).unwrap(), 0x8888);
             assert_eq!(ticket2.epoch(), 4);
         }
@@ -2891,11 +3006,11 @@ mod tests {
             }));
             assert!(panic_res.is_err());
 
-            let ticket = mmap.write(&0x9999, 0).unwrap();
+            let (ticket, _) = mmap.write(0, |v| *v = 0x9999).unwrap();
             assert_eq!(mmap.read(0, |v| *v).unwrap(), 0x9999);
             assert_eq!(ticket.epoch(), 1);
 
-            let ticket2 = mmap.write(&0x8888, 1).unwrap();
+            let (ticket2, _) = mmap.write(1, |v| *v = 0x8888).unwrap();
             assert_eq!(mmap.read(1, |v| *v).unwrap(), 0x8888);
             assert_eq!(ticket2.epoch(), 2);
         }
@@ -2929,7 +3044,7 @@ mod tests {
         let (_dir, cfg) = tmp_cfg();
         {
             let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
-            mmap.write(&0xCAFE_BABE_1234_5678, 1).unwrap();
+            mmap.write(1, |v| *v = 0xCAFE_BABE_1234_5678).unwrap();
             mmap.inner.sync_internal().unwrap();
         }
 
@@ -2943,7 +3058,7 @@ mod tests {
         cfg.sync_interval = Some(Duration::from_millis(0x19));
 
         let mmap = MemMap::<u64>::new(cfg).unwrap();
-        let ticket = mmap.write(&0x1234, 0).unwrap();
+        let (ticket, _) = mmap.write(0, |v| *v = 0x1234).unwrap();
         let epoch = ticket.wait().unwrap();
 
         assert_eq!(epoch, ticket.epoch());
@@ -2958,7 +3073,7 @@ mod tests {
         cfg.sync_interval = Some(Duration::from_secs(0x0A));
 
         let mmap = MemMap::<u64>::new(cfg).unwrap();
-        let ticket = mmap.write(&0xABCD, 0).unwrap();
+        let (ticket, _) = mmap.write(0, |v| *v = 0xABCD).unwrap();
         assert!(!ticket.is_durable());
 
         let start = std::time::Instant::now();
@@ -2977,7 +3092,7 @@ mod tests {
 
         {
             let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
-            let _ticket = mmap.write(&0xBEEF_CAFE, 0).unwrap();
+            let (_ticket, _) = mmap.write(0, |v| *v = 0xBEEF_CAFE).unwrap();
             drop(mmap);
         }
 
@@ -3003,7 +3118,7 @@ mod tests {
                 barrier_clone.wait();
                 for i in 0..0x1F4 {
                     let val = ((t + 1) as u64) << 0x20 | (i as u64);
-                    let _ = mmap_clone.write(&val, 0).unwrap();
+                    let _ = mmap_clone.write(0, |slot| *slot = val).unwrap();
                 }
             }));
         }
@@ -3137,7 +3252,7 @@ mod tests {
     fn ok_reopen_after_drop_releases_lock() {
         let (_dir, cfg) = tmp_cfg();
         let m1 = MemMap::<u64>::new(cfg.clone()).unwrap();
-        m1.write(&0x1122_3344, 0).unwrap();
+        m1.write(0, |v| *v = 0x1122_3344).unwrap();
         drop(m1);
 
         let m2 = MemMap::<u64>::open(cfg).unwrap();
@@ -3151,7 +3266,7 @@ mod tests {
         for i in 0..4 {
             let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
             let val = (i as u64 + 1) * 0xAA55;
-            mmap.write(&val, 0).unwrap();
+            mmap.write(0, |v| *v = val).unwrap();
             assert_eq!(mmap.read(0, |v| *v).unwrap(), val);
             assert!(mmap.delete().is_ok());
             assert!(!cfg.versioned_path().exists());
@@ -3176,7 +3291,7 @@ mod tests {
                 barrier_clone.wait();
                 for i in 0..0x3E8 {
                     let val = (t as u64) << 0x20 | (i as u64);
-                    let _ = mmap_clone.write(&val, t).unwrap();
+                    let _ = mmap_clone.write(t, |slot| *slot = val).unwrap();
                     let read_val = mmap_clone.read(t, |v| *v).unwrap();
                     assert_eq!(read_val >> 0x20, t as u64);
                 }
@@ -3214,7 +3329,7 @@ mod tests {
                     let slot = (t + i) % NUM_SLOTS;
                     if i % 2 == 0 {
                         let val = ((t + 1) as u64) << 0x20 | (i as u64);
-                        let _ = mmap_clone.write(&val, slot).unwrap();
+                        let _ = mmap_clone.write(slot, |s| *s = val).unwrap();
                     } else {
                         mmap_clone.read(slot, |_| ()).unwrap();
                     }
@@ -3247,7 +3362,7 @@ mod tests {
                 let mut tickets = Vec::with_capacity(0x32);
                 for i in 0..0x32 {
                     let val = (t as u64) * 0x3E8 + i as u64;
-                    tickets.push(mmap_clone.write(&val, t).unwrap());
+                    tickets.push(mmap_clone.write(t, |slot| *slot = val).unwrap().0);
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 for ticket in tickets {
@@ -3281,7 +3396,7 @@ mod tests {
                 barrier_clone.wait();
                 for i in 0..0x14 {
                     let val = (t as u64) * 0x64 + i as u64;
-                    let ticket = mmap_clone.write(&val, t).unwrap();
+                    let (ticket, _) = mmap_clone.write(t, |slot| *slot = val).unwrap();
                     let durable_epoch = ticket.force().unwrap();
                     assert!(ticket.is_durable());
                     assert!(durable_epoch >= ticket.epoch());
@@ -3299,10 +3414,10 @@ mod tests {
         let (_dir, cfg) = tmp_cfg();
         let mmap = MemMap::<u64>::new(cfg).unwrap();
 
-        assert!(mmap.write(&0xF00D, INIT_T - 1).is_ok());
+        assert!(mmap.write(INIT_T - 1, |v| *v = 0xF00D).is_ok());
         assert_eq!(mmap.read(INIT_T - 1, |v| *v).unwrap(), 0xF00D);
 
-        assert_eq!(mmap.write(&0xBAD, INIT_T).unwrap_err().reason, err::HCF.reason);
+        assert_eq!(mmap.write(INIT_T, |_| ()).unwrap_err().reason, err::HCF.reason);
         assert_eq!(mmap.read(INIT_T, |_| ()).unwrap_err().reason, err::HCF.reason);
     }
 
@@ -3315,9 +3430,9 @@ mod tests {
         let mmap = MemMap::<u64>::new(cfg).unwrap();
         assert_eq!(mmap.length(), LARGE_COUNT * core::mem::size_of::<u64>());
 
-        assert!(mmap.write(&1, 0).is_ok());
-        assert!(mmap.write(&0x1388, 0x1388).is_ok());
-        assert!(mmap.write(&0x270F, LARGE_COUNT - 1).is_ok());
+        assert!(mmap.write(0, |v| *v = 1).is_ok());
+        assert!(mmap.write(0x1388, |v| *v = 0x1388).is_ok());
+        assert!(mmap.write(LARGE_COUNT - 1, |v| *v = 0x270F).is_ok());
 
         assert_eq!(mmap.read(0, |v| *v).unwrap(), 1);
         assert_eq!(mmap.read(0x1388, |v| *v).unwrap(), 0x1388);
@@ -3332,7 +3447,7 @@ mod tests {
         let mmap = MemMap::<u64>::new(cfg).unwrap();
         assert!(mmap.bg_thread.is_none());
 
-        let ticket = mmap.write(&0x55AA, 0).unwrap();
+        let (ticket, _) = mmap.write(0, |v| *v = 0x55AA).unwrap();
         assert!(!ticket.is_durable());
 
         mmap.sync().unwrap();
@@ -3348,7 +3463,7 @@ mod tests {
         let mmap = MemMap::<u64>::new(cfg).unwrap();
         assert!(mmap.bg_thread.is_none());
 
-        let ticket = mmap.write(&0x1122, 1).unwrap();
+        let (ticket, _) = mmap.write(1, |v| *v = 0x1122).unwrap();
         assert!(!ticket.is_durable());
 
         let epoch = ticket.force().unwrap();
@@ -3365,7 +3480,7 @@ mod tests {
         {
             let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
             assert!(mmap.bg_thread.is_none());
-            let _ticket = mmap.write(&0xCAFE_F00D, 0).unwrap();
+            let (_ticket, _) = mmap.write(0, |v| *v = 0xCAFE_F00D).unwrap();
             drop(mmap);
         }
 
@@ -3388,7 +3503,7 @@ mod tests {
         assert!(mmap.is_parked());
 
         // First write should unpark the worker
-        let ticket = mmap.write(&0x9999, 0).unwrap();
+        let (ticket, _) = mmap.write(0, |v| *v = 0x9999).unwrap();
         assert!(!mmap.is_parked());
 
         // Ticket should become durable via the unparked background thread
@@ -3420,12 +3535,12 @@ mod tests {
         assert!(mmap.is_parked());
 
         // First write unparks
-        let t1 = mmap.write(&0x1111, 0).unwrap();
+        let (t1, _) = mmap.write(0, |v| *v = 0x1111).unwrap();
         assert!(!mmap.is_parked());
 
         // Subsequent rapid writes find worker already unparked (is_parked == false)
-        let t2 = mmap.write(&0x2222, 1).unwrap();
-        let t3 = mmap.write(&0x3333, 2).unwrap();
+        let (t2, _) = mmap.write(1, |v| *v = 0x2222).unwrap();
+        let (t3, _) = mmap.write(2, |v| *v = 0x3333).unwrap();
         assert!(!mmap.is_parked());
 
         t1.wait().unwrap();
@@ -3458,7 +3573,7 @@ mod tests {
                 for i in 0..WRITES_PER_THREAD {
                     let val = (t as u64) << 0x20 | (i as u64);
                     let slot = t;
-                    let ticket = mmap_clone.write(&val, slot).unwrap();
+                    let (ticket, _) = mmap_clone.write(slot, |s| *s = val).unwrap();
                     tickets.push(ticket);
 
                     // Alternate between short sleep (allowing worker to park) and rapid writes
@@ -3567,7 +3682,7 @@ mod tests {
             let mmap = MemMap::<u64>::new(cfg).unwrap();
 
             for i in 0..INIT_T {
-                mmap.write(&(0xCAFE_0000 + i as u64), i).unwrap();
+                mmap.write(i, |v| *v = 0xCAFE_0000 + i as u64).unwrap();
             }
 
             mmap.grow(4).unwrap();
@@ -3577,7 +3692,7 @@ mod tests {
             }
 
             for i in INIT_T..(INIT_T + 4) {
-                mmap.write(&(0xBEEF_0000 + i as u64), i).unwrap();
+                mmap.write(i, |v| *v = 0xBEEF_0000 + i as u64).unwrap();
                 assert_eq!(mmap.read(i, |v| *v).unwrap(), 0xBEEF_0000 + i as u64);
             }
         }
@@ -3588,7 +3703,7 @@ mod tests {
             cfg.sync_interval = None; // Manual sync mode
 
             let mmap = MemMap::<u64>::new(cfg).unwrap();
-            let ticket = mmap.write(&0x1234_5678u64, 1).unwrap();
+            let (ticket, _) = mmap.write(1, |v| *v = 0x1234_5678u64).unwrap();
 
             assert!(!ticket.is_durable());
             assert!(mmap.current_epoch() > mmap.durable_epoch());
@@ -3606,7 +3721,7 @@ mod tests {
             cfg.sync_interval = None;
 
             let mmap = MemMap::<u64>::new(cfg).unwrap();
-            let ticket = mmap.write(&0x9999u64, 0).unwrap();
+            let (ticket, _) = mmap.write(0, |v| *v = 0x9999u64).unwrap();
             mmap.sync().unwrap();
             assert!(ticket.is_durable());
             assert_eq!(mmap.current_epoch(), mmap.durable_epoch());
@@ -3629,11 +3744,11 @@ mod tests {
             let (_dir, cfg) = tmp_cfg();
             let mmap = MemMap::<u64>::new(cfg).unwrap();
 
-            mmap.write(&0x0Au64, 0).unwrap();
+            mmap.write(0, |v| *v = 0x0Au64).unwrap();
             mmap.grow(2).unwrap();
-            mmap.write(&0x14u64, INIT_T).unwrap();
+            mmap.write(INIT_T, |v| *v = 0x14u64).unwrap();
             mmap.grow(3).unwrap();
-            mmap.write(&0x1Eu64, INIT_T + 2).unwrap();
+            mmap.write(INIT_T + 2, |v| *v = 0x1Eu64).unwrap();
 
             assert_eq!(mmap.read(0, |v| *v).unwrap(), 0x0Au64);
             assert_eq!(mmap.read(INIT_T, |v| *v).unwrap(), 0x14u64);
@@ -3654,7 +3769,7 @@ mod tests {
                 let m = Arc::clone(&mmap);
                 handles.push(std::thread::spawn(move || {
                     for i in 0..0x32 {
-                        let _ = m.write(&((w * 0x3E8 + i) as u64), w % INIT_T);
+                        let _ = m.write(w % INIT_T, |v| *v = (w * 0x3E8 + i) as u64);
                         m.read(w % INIT_T, |_| ()).unwrap();
                     }
                 }));
@@ -3744,7 +3859,7 @@ mod tests {
             assert!(mmap.grow(usize::MAX).is_err());
 
             // The instance and background sync worker remain healthy
-            let ticket = mmap.write(&0x2Au64, 0).unwrap();
+            let (ticket, _) = mmap.write(0, |v| *v = 0x2Au64).unwrap();
             mmap.sync().unwrap();
             assert!(ticket.is_durable());
             assert_eq!(mmap.read(0, |v| *v).unwrap(), 0x2Au64);
@@ -3812,7 +3927,7 @@ mod tests {
             let mmap = MemMap::<u64>::new(cfg).unwrap();
 
             // Prepare slot 1 with a different value
-            mmap.write(&0x3E7, 1).unwrap();
+            mmap.write(1, |v| *v = 0x3E7).unwrap();
             let epoch_before = mmap.current_epoch();
 
             let mut tx = mmap.new_tx();
@@ -3839,7 +3954,7 @@ mod tests {
             let mmap = MemMap::<u64>::new(cfg).unwrap();
 
             // Simulate concurrent write modifying slot 1
-            mmap.write(&0x2A, 1).unwrap();
+            mmap.write(1, |v| *v = 0x2A).unwrap();
 
             // First attempt assuming slot 1 is 0 fails
             let mut tx1 = mmap.new_tx();
