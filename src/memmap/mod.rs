@@ -542,14 +542,30 @@ where
             }
         };
 
-        if initial_bytes % page_size.as_usize() != 0 {
-            return err::raw_error(
-                err::INV,
-                format!(
-                    "initial allocation (initial_t * size_of::<T>() = {initial_bytes} bytes) must be an exact multiple of page size ({page_size})"
-                ),
-            )
-            .with_module(mid);
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            if initial_bytes < 4096 || !initial_bytes.is_power_of_two() {
+                return err::raw_error(
+                    err::INV,
+                    format!(
+                        "initial allocation (initial_t * size_of::<T>() = {initial_bytes} bytes) must be at least 4096 and a power of two"
+                    ),
+                )
+                .with_module(mid);
+            }
+        }
+
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            if initial_bytes % page_size.as_usize() != 0 {
+                return err::raw_error(
+                    err::INV,
+                    format!(
+                        "initial allocation (initial_t * size_of::<T>() = {initial_bytes} bytes) must be an exact multiple of page size ({page_size})"
+                    ),
+                )
+                .with_module(mid);
+            }
         }
 
         Ok(page_size)
