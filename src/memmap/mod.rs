@@ -1382,6 +1382,138 @@ where
         Ok(AckTicket::new(epoch, self.inner.completion.clone()))
     }
 
+    /// Atomically locks `N` consecutive slots and invokes `f` with mutable access to `Target`
+    ///
+    /// Requires `size_of::<Target>() == N * size_of::<T>()` and compatible alignment
+    ///
+    /// Returns a tuple `(AckTicket, R)` containing the durability acknowledgement ticket and the
+    /// result returned by callback `f`
+    ///
+    /// ## Constraints
+    ///
+    /// - `size_of::<Target>()` must not be zero ([`err::ZRO`])
+    /// - `size_of::<Target>()` must be an exact multiple of `size_of::<T>()` ([`err::SZE`])
+    /// - `align_of::<Target>()` must not exceed `align_of::<T>()` ([`err::ALN`])
+    /// - Slot index and byte offset calculations must not overflow `usize` ([`err::INV`])
+    /// - Target slot range `start..start + N` must not exceed mapping bounds ([`err::HCF`])
+    ///
+    /// ## Deadlock Freedom
+    ///
+    /// Exclusive write spinlocks for slots `start..start + N` are acquired in strictly ascending
+    /// order
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::memmap::{MemMap, MemMapCfg};
+    /// use std::time::Duration;
+    ///
+    /// #[repr(C)]
+    /// struct Page {
+    ///     header: u64,
+    ///     payload: [u64; 3],
+    /// }
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = MemMapCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().join("write_exact_demo.bin"),
+    ///     version: 1,
+    ///     initial_t: 8,
+    ///     sync_interval: Some(Duration::from_millis(100)),
+    /// };
+    ///
+    /// let mmap = MemMap::<u64>::new(cfg).unwrap();
+    /// let (ticket, _) = mmap
+    ///     .write_exact(0, |page: &mut Page| {
+    ///         page.header = 0xAA;
+    ///         page.payload[0] = 0xBB;
+    ///     })
+    ///     .unwrap();
+    ///
+    /// assert_eq!(mmap.read(0).unwrap(), 0xAA);
+    /// assert_eq!(mmap.read(1).unwrap(), 0xBB);
+    /// assert_eq!(ticket.epoch(), 1);
+    /// ```
+    #[inline(always)]
+    pub fn write_exact<Target, R, F>(&self, start: usize, f: F) -> FrozenResult<(AckTicket, R)>
+    where
+        F: FnOnce(&mut Target) -> R,
+    {
+        let mid = self.cfg.module_id;
+        let slot_size = core::mem::size_of::<T>();
+        let target_size = core::mem::size_of::<Target>();
+
+        if hints::unlikely(target_size == 0) {
+            return err::default_error(err::ZRO).with_module(mid);
+        }
+
+        if hints::unlikely(target_size % slot_size != 0) {
+            return err::default_error(err::SZE).with_module(mid);
+        }
+
+        if hints::unlikely(core::mem::align_of::<Target>() > core::mem::align_of::<T>()) {
+            return err::default_error(err::ALN).with_module(mid);
+        }
+
+        let n = target_size / slot_size;
+
+        let end_slot = match start.checked_add(n) {
+            Some(end) => end,
+            None => return err::default_error(err::INV).with_module(mid),
+        };
+
+        let offset = match start.checked_mul(slot_size) {
+            Some(off) => off,
+            None => return err::default_error(err::INV).with_module(mid),
+        };
+
+        let end_offset = match end_slot.checked_mul(slot_size) {
+            Some(end) => end,
+            None => return err::default_error(err::INV).with_module(mid),
+        };
+
+        let slot_locks_guard = self.inner.slot_locks.read().unwrap_or_else(|e| e.into_inner());
+
+        if hints::unlikely(end_offset > self.length()) {
+            return err::default_error(err::HCF).with_module(mid);
+        }
+
+        let mut slot_guards = Vec::with_capacity(n);
+        for slot in start..end_slot {
+            slot_guards.push(slot_locks_guard.write_lock(slot));
+        }
+
+        let guard = self.inner.mmap.read().unwrap_or_else(|e| e.into_inner());
+        let mmap = match guard.as_ref() {
+            Some(m) => m,
+            None => return err::default_error(err::INV).with_module(mid),
+        };
+
+        let ptr = unsafe { mmap.as_mut_ptr::<Target>(offset) };
+        if hints::unlikely((ptr as usize) % core::mem::align_of::<Target>() != 0) {
+            return err::default_error(err::ALN).with_module(mid);
+        }
+
+        let target_ref = unsafe { &mut *ptr };
+        let res = f(target_ref);
+
+        drop(guard);
+        drop(slot_guards);
+        drop(slot_locks_guard);
+
+        let epoch = self.inner.completion.increment_current_epoch();
+
+        if self.inner.is_parked.load(atomic::Ordering::Acquire) {
+            let _guard = self.inner.sync_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            if self.inner.is_parked.swap(false, atomic::Ordering::AcqRel) {
+                self.inner.sync_condvar.notify_one();
+            }
+        }
+
+        Ok((AckTicket::new(epoch, self.inner.completion.clone()), res))
+    }
+
     #[cfg(test)]
     pub(crate) fn is_parked(&self) -> bool {
         self.inner.is_parked.load(atomic::Ordering::Acquire)
@@ -2507,6 +2639,244 @@ mod tests {
         }
     }
 
+    mod write_exact {
+        use super::*;
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[repr(C)]
+        struct TestNode {
+            id: u64,
+            flags: u64,
+            keys: [u64; 2],
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[repr(C)]
+        struct TestBadSizeTarget([u8; 12]);
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[repr(C, align(16))]
+        struct TestOveralignedTarget {
+            _a: u64,
+            _b: u64,
+        }
+
+        #[test]
+        fn ok_write_exact_single_and_multi_slot() {
+            let (_dir, cfg) = tmp_cfg();
+            let mmap = MemMap::<u64>::new(cfg).unwrap();
+
+            let (ticket_single, res) = mmap
+                .write_exact(0, |val: &mut u64| {
+                    *val = 0xAAAA;
+                    42u32
+                })
+                .unwrap();
+            assert_eq!(res, 42);
+            assert_eq!(ticket_single.epoch(), 1);
+            assert_eq!(mmap.read(0).unwrap(), 0xAAAA);
+
+            let (ticket_multi, _) = mmap
+                .write_exact(0, |node: &mut TestNode| {
+                    node.id = 0x1111;
+                    node.flags = 0x2222;
+                    node.keys = [0x3333, 0x4444];
+                })
+                .unwrap();
+            assert_eq!(ticket_multi.epoch(), 2);
+            assert_eq!(
+                mmap.read_exact(0, |n: &TestNode| *n).unwrap(),
+                TestNode { id: 0x1111, flags: 0x2222, keys: [0x3333, 0x4444] }
+            );
+
+            let (ticket_partial, _) = mmap
+                .write_exact(2, |keys: &mut [u64; 2]| {
+                    keys[0] = 0x5555;
+                    keys[1] = 0x6666;
+                })
+                .unwrap();
+            assert_eq!(ticket_partial.epoch(), 3);
+            assert_eq!(mmap.read(2).unwrap(), 0x5555);
+            assert_eq!(mmap.read(3).unwrap(), 0x6666);
+        }
+
+        #[test]
+        fn err_write_exact_invariants() {
+            let (_dir, cfg) = tmp_cfg();
+            let mmap = MemMap::<u64>::new(cfg).unwrap();
+
+            let err_zro = mmap.write_exact::<(), _, _>(0, |_| ()).unwrap_err();
+            assert_eq!(err_zro.reason, err::ZRO.reason);
+
+            let err_sze = mmap.write_exact::<TestBadSizeTarget, _, _>(0, |_| ()).unwrap_err();
+            assert_eq!(err_sze.reason, err::SZE.reason);
+
+            let err_aln = mmap.write_exact::<TestOveralignedTarget, _, _>(0, |_| ()).unwrap_err();
+            assert_eq!(err_aln.reason, err::ALN.reason);
+
+            let err_inv = mmap.write_exact::<u64, _, _>(usize::MAX, |_| ()).unwrap_err();
+            assert_eq!(err_inv.reason, err::INV.reason);
+
+            let err_inv_add =
+                mmap.write_exact::<TestNode, _, _>(usize::MAX - 1, |_| ()).unwrap_err();
+            assert_eq!(err_inv_add.reason, err::INV.reason);
+
+            let err_hcf_start = mmap.write_exact::<u64, _, _>(INIT_T, |_| ()).unwrap_err();
+            assert_eq!(err_hcf_start.reason, err::HCF.reason);
+
+            let err_hcf_end = mmap.write_exact::<TestNode, _, _>(INIT_T - 2, |_| ()).unwrap_err();
+            assert_eq!(err_hcf_end.reason, err::HCF.reason);
+        }
+
+        #[test]
+        fn ok_write_exact_concurrent_writers() {
+            let (_dir, mut cfg) = tmp_cfg();
+            cfg.initial_t = 8;
+            let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
+
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let mut handles = Vec::new();
+
+            {
+                let mmap_clone = Arc::clone(&mmap);
+                let barrier_clone = Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    barrier_clone.wait();
+                    for i in 0..0x1F4 {
+                        let _ = mmap_clone
+                            .write_exact(0, |node: &mut TestNode| {
+                                node.id = i as u64;
+                                node.flags = (i as u64) + 1;
+                                node.keys = [(i as u64) + 2, (i as u64) + 3];
+                            })
+                            .unwrap();
+                    }
+                }));
+            }
+
+            {
+                let mmap_clone = Arc::clone(&mmap);
+                let barrier_clone = Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    barrier_clone.wait();
+                    for i in 0..0x1F4 {
+                        let _ = mmap_clone
+                            .write_exact(4, |node: &mut TestNode| {
+                                node.id = (i as u64) * 10;
+                                node.flags = (i as u64) * 10 + 1;
+                                node.keys = [(i as u64) * 10 + 2, (i as u64) * 10 + 3];
+                            })
+                            .unwrap();
+                    }
+                }));
+            }
+
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            let node0 = mmap.read_exact(0, |n: &TestNode| *n).unwrap();
+            assert_eq!(node0.id, 0x1F3);
+            assert_eq!(node0.flags, 0x1F4);
+            assert_eq!(node0.keys, [0x1F5, 0x1F6]);
+
+            let node1 = mmap.read_exact(4, |n: &TestNode| *n).unwrap();
+            assert_eq!(node1.id, 0x1F3 * 10);
+            assert_eq!(node1.flags, 0x1F3 * 10 + 1);
+            assert_eq!(node1.keys, [0x1F3 * 10 + 2, 0x1F3 * 10 + 3]);
+        }
+
+        #[test]
+        fn ok_write_exact_concurrent_readers_writers_isolation() {
+            let (_dir, mut cfg) = tmp_cfg();
+            cfg.initial_t = 8;
+            let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
+
+            let barrier = Arc::new(std::sync::Barrier::new(5));
+            let mut handles = Vec::new();
+
+            {
+                let mmap_clone = Arc::clone(&mmap);
+                let barrier_clone = Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    barrier_clone.wait();
+                    for i in 0..0x1F4 {
+                        let v = i as u64;
+                        let _ = mmap_clone
+                            .write_exact(0, |pair: &mut [u64; 2]| {
+                                pair[0] = v;
+                                pair[1] = v;
+                            })
+                            .unwrap();
+                    }
+                }));
+            }
+
+            for _ in 0..4 {
+                let mmap_clone = Arc::clone(&mmap);
+                let barrier_clone = Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    barrier_clone.wait();
+                    for _ in 0..0x1F4 {
+                        mmap_clone
+                            .read_exact(0, |pair: &[u64; 2]| {
+                                assert_eq!(pair[0], pair[1]);
+                            })
+                            .unwrap();
+                    }
+                }));
+            }
+
+            for h in handles {
+                h.join().unwrap();
+            }
+        }
+
+        #[test]
+        fn ok_write_exact_unwind_releases_locks() {
+            let (_dir, cfg) = tmp_cfg();
+            let mmap = MemMap::<u64>::new(cfg).unwrap();
+
+            let panic_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = mmap.write_exact(0, |_pair: &mut [u64; 2]| {
+                    panic!("intentional panic inside write_exact callback");
+                });
+            }));
+            assert!(panic_res.is_err());
+
+            let ticket = mmap.write(&0x9999, 0).unwrap();
+            assert_eq!(mmap.read(0).unwrap(), 0x9999);
+            assert_eq!(ticket.epoch(), 1);
+
+            let ticket2 = mmap.write(&0x8888, 1).unwrap();
+            assert_eq!(mmap.read(1).unwrap(), 0x8888);
+            assert_eq!(ticket2.epoch(), 2);
+        }
+
+        #[test]
+        fn ok_write_exact_durability() {
+            let (_dir, cfg) = tmp_cfg();
+            {
+                let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
+                let (ticket, _) = mmap
+                    .write_exact(0, |node: &mut TestNode| {
+                        node.id = 0xDEAD;
+                        node.flags = 0xBEEF;
+                        node.keys = [0xCAFE, 0xBABE];
+                    })
+                    .unwrap();
+                mmap.inner.sync_internal().unwrap();
+                assert_eq!(ticket.epoch(), 1);
+            }
+
+            let reopened = MemMap::<u64>::open(cfg).unwrap();
+            assert_eq!(
+                reopened.read_exact(0, |n: &TestNode| *n).unwrap(),
+                TestNode { id: 0xDEAD, flags: 0xBEEF, keys: [0xCAFE, 0xBABE] }
+            );
+        }
+    }
+
     #[test]
     fn ok_durability_across_reopen() {
         let (_dir, cfg) = tmp_cfg();
@@ -3587,6 +3957,156 @@ mod tests {
             ticket.wait().unwrap();
             assert!(ticket.is_durable());
             assert_eq!(mmap.read(0).unwrap(), 0x22B);
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[repr(C)]
+        struct TxNode {
+            id: u64,
+            flags: u64,
+            keys: [u64; 2],
+        }
+
+        #[test]
+        fn ok_concurrent_tx_read_exact_and_write_exact_same_slots() {
+            let (_dir, mut cfg) = tmp_cfg();
+            cfg.initial_t = 8;
+            let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
+
+            let barrier = Arc::new(std::sync::Barrier::new(6));
+            let mut handles = Vec::new();
+
+            for t in 0..2 {
+                let m = Arc::clone(&mmap);
+                let b = Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    b.wait();
+                    for i in 0..0xC8 {
+                        let val = ((t + 1) as u64) << 0x20 | (i as u64);
+                        let _ = m
+                            .write_exact(0, |node: &mut TxNode| {
+                                node.id = val;
+                                node.flags = val;
+                                node.keys = [val, val];
+                            })
+                            .unwrap();
+                    }
+                }));
+            }
+
+            for t in 2..4 {
+                let m = Arc::clone(&mmap);
+                let b = Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    b.wait();
+                    for i in 0..0xC8 {
+                        let new_val = ((t + 1) as u64) << 0x20 | (i as u64);
+                        let current_node = m.read_exact(0, |n: &TxNode| *n).unwrap();
+                        let mut tx = m.new_tx();
+                        if tx.write(&current_node.id, &new_val, 0).is_ok()
+                            && tx.write(&current_node.flags, &new_val, 1).is_ok()
+                            && tx.write(&current_node.keys[0], &new_val, 2).is_ok()
+                            && tx.write(&current_node.keys[1], &new_val, 3).is_ok()
+                        {
+                            let _ = tx.commit();
+                        }
+                    }
+                }));
+            }
+
+            for _ in 0..2 {
+                let m = Arc::clone(&mmap);
+                let b = Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    b.wait();
+                    for _ in 0..0x190 {
+                        m.read_exact(0, |node: &TxNode| {
+                            assert_eq!(node.id, node.flags);
+                            assert_eq!(node.id, node.keys[0]);
+                            assert_eq!(node.id, node.keys[1]);
+                        })
+                        .unwrap();
+                    }
+                }));
+            }
+
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            let final_node = mmap.read_exact(0, |n: &TxNode| *n).unwrap();
+            assert_eq!(final_node.id, final_node.flags);
+            assert_eq!(final_node.id, final_node.keys[0]);
+            assert_eq!(final_node.id, final_node.keys[1]);
+        }
+
+        #[test]
+        fn ok_tx_retry_loop_against_concurrent_write_exact_and_read_exact() {
+            let (_dir, mut cfg) = tmp_cfg();
+            cfg.initial_t = 8;
+            let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
+
+            let barrier = Arc::new(std::sync::Barrier::new(4));
+            let mut handles = Vec::new();
+
+            {
+                let m = Arc::clone(&mmap);
+                let b = Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    b.wait();
+                    for i in 0..0x64 {
+                        let _ = m
+                            .write_exact(0, |pair: &mut [u64; 2]| {
+                                pair[0] = i as u64;
+                                pair[1] = i as u64;
+                            })
+                            .unwrap();
+                    }
+                }));
+            }
+
+            {
+                let m = Arc::clone(&mmap);
+                let b = Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    b.wait();
+                    let mut successful_commits = 0;
+                    while successful_commits < 10 {
+                        let current = m.read_exact(0, |pair: &[u64; 2]| *pair).unwrap();
+                        let new_val = 0x8000_0000 + successful_commits;
+                        let mut tx = m.new_tx();
+                        if tx.write(&current[0], &new_val, 0).is_ok()
+                            && tx.write(&current[1], &new_val, 1).is_ok()
+                            && tx.commit().is_ok()
+                        {
+                            successful_commits += 1;
+                        }
+                    }
+                }));
+            }
+
+            for _ in 0..2 {
+                let m = Arc::clone(&mmap);
+                let b = Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    b.wait();
+                    for _ in 0..0xC8 {
+                        m.read_exact(0, |pair: &[u64; 2]| {
+                            assert_eq!(pair[0], pair[1]);
+                        })
+                        .unwrap();
+                    }
+                }));
+            }
+
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            mmap.read_exact(0, |pair: &[u64; 2]| {
+                assert_eq!(pair[0], pair[1]);
+            })
+            .unwrap();
         }
     }
 
