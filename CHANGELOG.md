@@ -1,5 +1,16 @@
 # Changelog
 
+## `0.0.35`
+
+- `memmap`
+  - Impl of callback-based `read_exact()` for zero-copy multi-slot reads (#97)
+  - Impl of callback-based `write_exact()` for in-place multi-slot writes (#98)
+  - Impl of callback-based `read()` for zero-copy access (#99)
+  - Impl of callback-based `write()` for in-place mutation (#100)
+  - Represented `MemMap::page_size()` as a typed `PageSize` enum (#101)
+  - Added `page_size` configuration in `MemMapCfg` and updated `MemMap::grow()` to accept page
+    count (#102)
+
 ## `0.0.34`
 
 - Impl of `memmap` module with POSIX and Windows backends
