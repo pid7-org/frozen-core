@@ -1,5 +1,12 @@
 # Changelog
 
+## `0.0.36`
+
+- `memmap`
+  - Allowed any 4KiB multiple for initial allocation on macOS aarch64, instead of requiring a power
+    of two
+  - Fixed the `MemMap::grow()` doctest to account for the configured page size
+
 ## `0.0.35`
 
 - `memmap`
