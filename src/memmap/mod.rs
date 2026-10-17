@@ -544,11 +544,11 @@ where
 
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            if initial_bytes < 4096 || !initial_bytes.is_power_of_two() {
+            if initial_bytes < 4096 || initial_bytes % 4096 != 0 {
                 return err::raw_error(
                     err::INV,
                     format!(
-                        "initial allocation (initial_t * size_of::<T>() = {initial_bytes} bytes) must be at least 4096 and a power of two"
+                        "initial allocation (initial_t * size_of::<T>() = {initial_bytes} bytes) must be at least 4096 and a multiple of 4096"
                     ),
                 )
                 .with_module(mid);
@@ -1001,7 +1001,7 @@ where
     /// mmap.write(0, |v| *v = 111u64).unwrap();
     ///
     /// mmap.grow(1).unwrap();
-    /// assert_eq!(mmap.length(), 1024 * std::mem::size_of::<u64>());
+    /// assert_eq!(mmap.length(), (512 * std::mem::size_of::<u64>()) + MemMap::<u64>::page_size().unwrap().as_usize());
     /// assert_eq!(mmap.read(0, |v| *v).unwrap(), 111u64);
     /// assert_eq!(mmap.read(512, |v| *v).unwrap(), 0u64);
     /// ```
