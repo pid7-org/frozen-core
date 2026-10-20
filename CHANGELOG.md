@@ -1,5 +1,10 @@
 # Changelog
 
+## `0.0.37`
+
+- `memmap`
+  - Allowed `PageSize::K4` on macOS aarch64 as logical virtual page size (#103)
+
 ## `0.0.36`
 
 - `memmap`
