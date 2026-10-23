@@ -7,24 +7,23 @@
 //! use std::time::Duration;
 //!
 //! let dir = tempfile::tempdir().unwrap();
-//! let path = dir.path().join("memmap_demo.bin");
-//!
 //! let cfg = MemMapCfg {
 //!     module_id: 1,
-//!     path,
+//!     path: dir.path().to_path_buf(),
+//!     name: *b"demo",
 //!     version: 1,
 //!     initial_pages: 1,
-//!     sync_interval: Some(Duration::from_millis(50)),
+//!     sync_interval: Some(Duration::from_millis(0x32)),
 //! };
 //!
 //! let memmap = MemMap::<u64>::new(cfg).unwrap();
 //! assert_eq!(memmap.length(), MemMap::<u64>::page_size().unwrap().as_usize());
 //!
-//! let (ticket, _) = memmap.write(0, |v| *v = 0xDEAD_BEEF_CAFE_BABE).unwrap();
+//! let (ticket, _) = memmap.write(0, |v| *v = 0xDEAD_C0DE_CAFE_BABE).unwrap();
 //! ticket.wait().unwrap();
 //! assert!(ticket.is_durable());
 //!
-//! assert_eq!(memmap.read(0, |v| *v).unwrap(), 0xDEAD_BEEF_CAFE_BABE);
+//! assert_eq!(memmap.read(0, |v| *v).unwrap(), 0xDEAD_C0DE_CAFE_BABE);
 //! assert!(memmap.delete().is_ok());
 //! ```
 
@@ -98,7 +97,7 @@ pub(in crate::memmap) mod err {
     pub const INV: ErrCode =
         ErrCode::new(0x18, "`size_of::<T>()` must not exceed system page size");
 
-    /// parent directory does not exist
+    /// directory does not exist
     pub const DIR: ErrCode = ErrCode::new(0x1A, "directory does not exist");
 
     /// invalid path to file
@@ -115,6 +114,9 @@ pub(in crate::memmap) mod err {
 
     /// state conflict
     pub const CAS: ErrCode = ErrCode::new(0x24, "compare and swap check failed");
+
+    /// invalid name tag
+    pub const TAG: ErrCode = ErrCode::new(0x26, "invalid name tag");
 
     #[inline]
     pub(in crate::memmap) fn raw_error<R, E: std::fmt::Display>(
@@ -148,14 +150,17 @@ pub(in crate::memmap) mod err {
 /// use frozen_core::memmap::MemMapCfg;
 /// use std::time::Duration;
 ///
+/// let dir = tempfile::tempdir().unwrap();
 /// let cfg = MemMapCfg {
 ///     module_id: 1,
-///     path: std::path::PathBuf::from("test.db"),
+///     path: dir.path().to_path_buf(),
+///     name: *b"tbfx",
 ///     version: 1,
 ///     initial_pages: 1,
 ///     sync_interval: Some(Duration::from_millis(0x64)),
 /// };
 ///
+/// assert_eq!(cfg.name, *b"tbfx");
 /// assert_eq!(cfg.version, 1);
 /// assert_eq!(cfg.initial_pages, 1);
 /// assert_eq!(cfg.sync_interval, Some(Duration::from_millis(0x64)));
@@ -165,15 +170,11 @@ pub struct MemMapCfg {
     /// Identifier used while error propagation
     pub module_id: u8,
 
-    /// Base path for/of the file
-    ///
-    /// ## Notes
-    ///
-    /// - The caller must make sure that the path represents a file and all the parent directories
-    ///   included in the path do exist
-    /// - The actual file created on disk is derived by appending the [`version`](Self::version) to
-    ///   the base file name (e.g. `data.bin` with version `1` becomes `data_1.bin`)
+    /// Directory path hosting the backing file
     pub path: std::path::PathBuf,
+
+    /// 4-byte ASCII identifier tag
+    pub name: [u8; 4],
 
     /// Schema or layout version of the underlying memory-mapped file
     ///
@@ -199,24 +200,11 @@ pub struct MemMapCfg {
 }
 
 impl MemMapCfg {
-    /// Computes the versioned file path by appending `_{version}` to the base file stem
-    ///
-    /// Preserves file extension if present (e.g., `data.bin` with version `1` becomes `data_1.bin`)
+    /// Computes the versioned file path formatted as `{dir}/{name}_{version}`
     #[inline]
-    fn versioned_path(&self) -> std::path::PathBuf {
-        let parent = self.path.parent();
-        let stem = self.path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        let extension = self.path.extension().and_then(|e| e.to_str());
-
-        let versioned_filename = match extension {
-            Some(ext) if !ext.is_empty() => format!("{}_{}.{}", stem, self.version, ext),
-            _ => format!("{}_{}", stem, self.version),
-        };
-
-        match parent {
-            Some(p) if !p.as_os_str().is_empty() => p.join(versioned_filename),
-            _ => std::path::PathBuf::from(versioned_filename),
-        }
+    pub fn versioned_path(&self) -> std::path::PathBuf {
+        let name = core::str::from_utf8(&self.name).unwrap_or_default();
+        self.path.join(format!("{}_{}", name, self.version))
     }
 }
 
@@ -224,7 +212,6 @@ const WRITER_BIT: u32 = 0x8000_0000;
 const L1_CONTENTION: usize = 0x10;
 const L2_CONTENTION: usize = 0x20;
 
-/// Table of reader-writer spinlocks per slot for memory-mapped items
 #[derive(Debug)]
 struct SlotLocks {
     locks: Box<[atomic::AtomicU32]>,
@@ -247,9 +234,11 @@ impl SlotLocks {
 
         let total = self.locks.len() + additional_slots;
         let mut slots = Vec::with_capacity(total);
+
         for val in self.locks.iter() {
             slots.push(atomic::AtomicU32::new(val.load(atomic::Ordering::Relaxed)));
         }
+
         for _ in 0..additional_slots {
             slots.push(atomic::AtomicU32::new(0));
         }
@@ -264,6 +253,7 @@ impl SlotLocks {
 
         loop {
             let state = val.load(atomic::Ordering::Relaxed);
+
             if hints::likely(state & WRITER_BIT == 0)
                 && val
                     .compare_exchange_weak(
@@ -446,10 +436,11 @@ impl MemMapInner {
 /// let dir = tempfile::tempdir().unwrap();
 /// let cfg = MemMapCfg {
 ///     module_id: 1,
-///     path: dir.path().join("storage.bin"),
+///     path: dir.path().to_path_buf(),
+///     name: *b"stor",
 ///     version: 1,
 ///     initial_pages: 1,
-///     sync_interval: Some(Duration::from_millis(100)),
+///     sync_interval: Some(Duration::from_millis(0x64)),
 /// };
 ///
 /// let memmap = MemMap::<u64>::new(cfg).unwrap();
@@ -535,30 +526,18 @@ where
     fn validate_path(cfg: &MemMapCfg) -> FrozenResult<()> {
         let mid = cfg.module_id;
 
-        if cfg.path.as_os_str().is_empty() {
-            return err::default_error(err::PTH).with_module(mid);
+        if !cfg.path.exists() || !cfg.path.is_dir() {
+            return err::default_error(err::DIR).with_module(mid);
         }
 
-        let stem = cfg.path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        if stem.is_empty() {
-            return err::default_error(err::PTH).with_module(mid);
-        }
-
-        if cfg.path.exists() && cfg.path.is_dir() {
-            return err::default_error(err::PTH).with_module(mid);
-        }
-
-        if let Some(parent) = cfg.path.parent() {
-            if !parent.as_os_str().is_empty() && (!parent.exists() || !parent.is_dir()) {
-                return err::default_error(err::DIR).with_module(mid);
-            }
+        if !cfg.name.iter().all(|b| b.is_ascii_alphanumeric()) {
+            return err::default_error(err::TAG).with_module(mid);
         }
 
         Ok(())
     }
 
     fn file_cfg(cfg: &MemMapCfg, page_size: PageSize) -> FrozenResult<FileCfg> {
-        let size = core::mem::size_of::<T>();
         let initial_bytes = match cfg.initial_pages.checked_mul(page_size.as_usize()) {
             Some(b) => b,
             None => {
@@ -566,6 +545,8 @@ where
                     .with_module(cfg.module_id);
             }
         };
+
+        let size = core::mem::size_of::<T>();
         let initial_available_buffers = initial_bytes / size;
 
         Ok(FileCfg {
@@ -608,6 +589,7 @@ where
 
         let bg_thread = if let Some(interval) = sync_interval {
             let worker_inner = Arc::clone(&inner);
+
             let handle = std::thread::Builder::new().name("frozen-mmap-sync-worker".into()).spawn(
                 move || {
                     let mut guard =
@@ -621,6 +603,7 @@ where
                             let _ = worker_inner.sync_internal();
                             guard =
                                 worker_inner.sync_mutex.lock().unwrap_or_else(|e| e.into_inner());
+
                             continue;
                         }
 
@@ -639,6 +622,7 @@ where
                                 .sync_condvar
                                 .wait(guard)
                                 .unwrap_or_else(|e| e.into_inner());
+
                             guard = new_guard;
                             worker_inner.is_parked.store(false, atomic::Ordering::Release);
 
@@ -664,6 +648,7 @@ where
                                 .sync_condvar
                                 .wait_timeout(guard, interval)
                                 .unwrap_or_else(|e| e.into_inner());
+
                             guard = new_guard;
                         }
 
@@ -685,11 +670,13 @@ where
                 Err(spawn_err) => {
                     let mut mmap_guard = inner.mmap.write().unwrap_or_else(|e| e.into_inner());
                     let mut err = err::make_raw_error(err::FXE, spawn_err);
+
                     if let Some(m) = mmap_guard.take() {
                         if let Err(unmap_err) = m.unmap() {
                             err.add_suppressed(unmap_err);
                         }
                     }
+
                     return Err(err.with_module(cfg.module_id));
                 }
             };
@@ -702,7 +689,7 @@ where
         Ok(Self { cfg, file: Some(file), inner, bg_thread, _marker: PhantomData })
     }
 
-    /// Creates and memory-maps a new [`File`] at `cfg.versioned_path()`
+    /// Creates and memory-maps a new [`File`] w/ provided config
     ///
     /// Allocates an underlying file with capacity for `initial_pages * page_size` bytes, acquires
     /// an exclusive advisory lock on the descriptor, establishes the memory mapping, and spawns the
@@ -727,16 +714,16 @@ where
     /// let dir = tempfile::tempdir().unwrap();
     /// let cfg = MemMapCfg {
     ///     module_id: 1,
-    ///     path: dir.path().join("new_memmap.bin"),
+    ///     path: dir.path().to_path_buf(),
+    ///     name: *b"demo",
     ///     version: 1,
     ///     initial_pages: 1,
-    ///     sync_interval: Some(Duration::from_millis(100)),
+    ///     sync_interval: Some(Duration::from_millis(0x64)),
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
     /// assert_eq!(mmap.length(), MemMap::<u64>::page_size().unwrap().as_usize());
     ///
-    /// // Creating another file at the same path fails
     /// assert!(MemMap::<u64>::new(cfg).is_err());
     /// ```
     pub fn new(cfg: MemMapCfg) -> FrozenResult<Self> {
@@ -771,7 +758,7 @@ where
         Self::from_components(cfg, mmap, file, page_size)
     }
 
-    /// Opens an existing memory-mapped [`File`] at `cfg.versioned_path()`
+    /// Opens an existing memory-mapped [`File`] w/ provided config
     ///
     /// Opens the underlying versioned file, verifies its length matches the requested layout,
     /// acquires an exclusive advisory lock on the descriptor, maps its memory region, and spawns
@@ -793,17 +780,19 @@ where
     /// let dir = tempfile::tempdir().unwrap();
     /// let cfg = MemMapCfg {
     ///     module_id: 1,
-    ///     path: dir.path().join("open_memmap.bin"),
+    ///     path: dir.path().to_path_buf(),
+    ///     name: *b"demo",
     ///     version: 1,
     ///     initial_pages: 1,
-    ///     sync_interval: Some(Duration::from_millis(100)),
+    ///     sync_interval: Some(Duration::from_millis(0x64)),
     /// };
     ///
     /// let page_size = MemMap::<u64>::page_size().unwrap().as_usize();
-    /// {
-    ///     let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
-    ///     assert_eq!(mmap.length(), page_size);
-    /// }
+    ///
+    /// let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
+    /// assert_eq!(mmap.length(), page_size);
+    ///
+    /// drop(mmap);
     ///
     /// let opened = MemMap::<u64>::open(cfg).unwrap();
     /// assert_eq!(opened.length(), page_size);
@@ -816,6 +805,7 @@ where
         if !vpath.exists() {
             return err::default_error(err::NEX).with_module(cfg.module_id);
         }
+
         if vpath.is_dir() {
             return err::default_error(err::PTH).with_module(cfg.module_id);
         }
@@ -824,7 +814,6 @@ where
         let file = File::open(file_cfg)?;
 
         let mmap = PlatformMemMap::new(file.fd(), file.length()).with_module(cfg.module_id)?;
-
         Self::from_components(cfg, mmap, file, page_size)
     }
 
@@ -850,17 +839,19 @@ where
     /// let dir = tempfile::tempdir().unwrap();
     /// let cfg = MemMapCfg {
     ///     module_id: 1,
-    ///     path: dir.path().join("open_or_create_memmap.bin"),
+    ///     path: dir.path().to_path_buf(),
+    ///     name: *b"demo",
     ///     version: 1,
     ///     initial_pages: 1,
-    ///     sync_interval: Some(Duration::from_millis(100)),
+    ///     sync_interval: Some(Duration::from_millis(0x64)),
     /// };
     ///
     /// let page_size = MemMap::<u64>::page_size().unwrap().as_usize();
-    /// {
-    ///     let mmap = MemMap::<u64>::open_or_create(cfg.clone()).unwrap();
-    ///     assert_eq!(mmap.length(), page_size);
-    /// }
+    ///
+    /// let mmap = MemMap::<u64>::open_or_create(cfg.clone()).unwrap();
+    /// assert_eq!(mmap.length(), page_size);
+    ///
+    /// drop(mmap);
     ///
     /// let reopened = MemMap::<u64>::open_or_create(cfg).unwrap();
     /// assert_eq!(reopened.length(), page_size);
@@ -878,8 +869,40 @@ where
         let file = File::open_or_create(file_cfg)?;
 
         let mmap = PlatformMemMap::new(file.fd(), file.length()).with_module(cfg.module_id)?;
-
         Self::from_components(cfg, mmap, file, page_size)
+    }
+
+    /// Checks whether the backing file for the given configuration exists on the filesystem
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::memmap::{MemMap, MemMapCfg};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = MemMapCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().to_path_buf(),
+    ///     name: *b"tbfx",
+    ///     version: 0,
+    ///     initial_pages: 1,
+    ///     sync_interval: None,
+    /// };
+    ///
+    /// assert!(!MemMap::<u64>::exists(&cfg));
+    ///
+    /// let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
+    /// assert!(MemMap::<u64>::exists(&cfg));
+    /// assert!(mmap.delete().is_ok());
+    /// assert!(!MemMap::<u64>::exists(&cfg));
+    /// ```
+    #[inline]
+    pub fn exists(cfg: &MemMapCfg) -> bool {
+        if !cfg.path.is_dir() || !cfg.name.iter().all(|b| b.is_ascii_alphanumeric()) {
+            return false;
+        }
+
+        cfg.versioned_path().is_file()
     }
 
     /// Returns the system memory page size queried from kernel settings
@@ -890,7 +913,7 @@ where
     /// use frozen_core::memmap::{MemMap, PageSize};
     ///
     /// let page_size = MemMap::<u64>::page_size().unwrap();
-    /// assert!(page_size.as_usize() >= 4096);
+    /// assert!(page_size.as_usize() >= 0x1000);
     /// assert!(page_size.is_power_of_two());
     /// ```
     #[inline]
@@ -911,10 +934,11 @@ where
     /// let dir = tempfile::tempdir().unwrap();
     /// let cfg = MemMapCfg {
     ///     module_id: 1,
-    ///     path: dir.path().join("length_demo.bin"),
+    ///     path: dir.path().to_path_buf(),
+    ///     name: *b"leng",
     ///     version: 1,
     ///     initial_pages: 1,
-    ///     sync_interval: Some(Duration::from_millis(100)),
+    ///     sync_interval: Some(Duration::from_millis(0x64)),
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -958,16 +982,18 @@ where
     /// let dir = tempfile::tempdir().unwrap();
     /// let cfg = MemMapCfg {
     ///     module_id: 1,
-    ///     path: dir.path().join("grow_demo.bin"),
+    ///     path: dir.path().to_path_buf(),
+    ///     name: *b"grow",
     ///     version: 1,
     ///     initial_pages: 1,
     ///     sync_interval: None,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
+    /// mmap.write(0, |v| *v = 111u64).unwrap();
+    ///
     /// let page_size = MemMap::<u64>::page_size().unwrap().as_usize();
     /// assert_eq!(mmap.length(), page_size);
-    /// mmap.write(0, |v| *v = 111u64).unwrap();
     ///
     /// mmap.grow(1).unwrap();
     /// assert_eq!(mmap.length(), 2 * page_size);
@@ -1002,7 +1028,6 @@ where
 
         // Halt all sync ops (including background sync worker) by taking exclusive write lock on mmap
         let mut mmap_guard = self.inner.mmap.write().unwrap_or_else(|e| e.into_inner());
-
         let mmap = match mmap_guard.as_ref() {
             Some(m) => m,
             None => return err::default_error(err::INV).with_module(mid),
@@ -1029,6 +1054,7 @@ where
             if let Ok(restored) = PlatformMemMap::new(file.fd(), curr_len).with_module(mid) {
                 *mmap_guard = Some(restored);
             }
+
             return Err(e);
         }
 
@@ -1036,6 +1062,7 @@ where
             if let Ok(restored) = PlatformMemMap::new(file.fd(), curr_len).with_module(mid) {
                 *mmap_guard = Some(restored);
             }
+
             return Err(e);
         }
 
@@ -1046,6 +1073,7 @@ where
                 self.inner.length.store(new_length, atomic::Ordering::Release);
                 slot_locks_guard.grow(additional_slots);
             }
+
             return Err(e);
         }
 
@@ -1055,14 +1083,15 @@ where
                 if let Ok(restored) = PlatformMemMap::new(file.fd(), curr_len).with_module(mid) {
                     *mmap_guard = Some(restored);
                 }
+
                 return Err(e);
             }
         };
 
         *mmap_guard = Some(new_mmap);
         slot_locks_guard.grow(additional_slots);
-        self.inner.length.store(new_length, atomic::Ordering::Release);
 
+        self.inner.length.store(new_length, atomic::Ordering::Release);
         self.inner.completion.increment_current_epoch();
 
         Ok(())
@@ -1079,13 +1108,15 @@ where
     /// let dir = tempfile::tempdir().unwrap();
     /// let cfg = MemMapCfg {
     ///     module_id: 1,
-    ///     path: dir.path().join("cfg_demo.bin"),
+    ///     path: dir.path().to_path_buf(),
+    ///     name: *b"cfgt",
     ///     version: 2,
     ///     initial_pages: 1,
-    ///     sync_interval: Some(Duration::from_millis(100)),
+    ///     sync_interval: Some(Duration::from_millis(0x64)),
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
+    /// assert_eq!(mmap.cfg().name, *b"cfgt");
     /// assert_eq!(mmap.cfg().version, 2);
     /// assert_eq!(mmap.cfg().initial_pages, 1);
     /// ```
@@ -1107,14 +1138,16 @@ where
     /// let dir = tempfile::tempdir().unwrap();
     /// let cfg = MemMapCfg {
     ///     module_id: 1,
-    ///     path: dir.path().join("epoch_demo.bin"),
+    ///     path: dir.path().to_path_buf(),
+    ///     name: *b"epch",
     ///     version: 1,
     ///     initial_pages: 1,
-    ///     sync_interval: Some(Duration::from_millis(100)),
+    ///     sync_interval: Some(Duration::from_millis(0x64)),
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
     /// assert_eq!(mmap.current_epoch(), 0);
+    ///
     /// mmap.write(0, |v| *v = 999u64).unwrap();
     /// assert_eq!(mmap.current_epoch(), 1);
     /// ```
@@ -1134,14 +1167,16 @@ where
     /// let dir = tempfile::tempdir().unwrap();
     /// let cfg = MemMapCfg {
     ///     module_id: 1,
-    ///     path: dir.path().join("durable_demo.bin"),
+    ///     path: dir.path().to_path_buf(),
+    ///     name: *b"durp",
     ///     version: 1,
     ///     initial_pages: 1,
-    ///     sync_interval: Some(Duration::from_millis(100)),
+    ///     sync_interval: Some(Duration::from_millis(0x64)),
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
     /// let (ticket, _) = mmap.write(0, |v| *v = 100u64).unwrap();
+    ///
     /// mmap.sync().unwrap();
     /// assert_eq!(mmap.durable_epoch(), ticket.epoch());
     /// ```
@@ -1167,7 +1202,8 @@ where
     /// let dir = tempfile::tempdir().unwrap();
     /// let cfg = MemMapCfg {
     ///     module_id: 1,
-    ///     path: dir.path().join("sync_demo.bin"),
+    ///     path: dir.path().to_path_buf(),
+    ///     name: *b"sync",
     ///     version: 1,
     ///     initial_pages: 1,
     ///     sync_interval: None,
@@ -1208,13 +1244,15 @@ where
     /// let dir = tempfile::tempdir().unwrap();
     /// let cfg = MemMapCfg {
     ///     module_id: 1,
-    ///     path: dir.path().join("read_test.bin"),
+    ///     path: dir.path().to_path_buf(),
+    ///     name: *b"read",
     ///     version: 1,
     ///     initial_pages: 1,
-    ///     sync_interval: Some(Duration::from_millis(100)),
+    ///     sync_interval: Some(Duration::from_millis(0x64)),
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
+    ///
     /// mmap.write(0, |v| *v = 42u64).unwrap();
     /// assert_eq!(mmap.read(0, |v| *v).unwrap(), 42u64);
     /// ```
@@ -1232,14 +1270,13 @@ where
         };
 
         let slot_locks_guard = self.inner.slot_locks.read().unwrap_or_else(|e| e.into_inner());
-
         if hints::unlikely(offset.checked_add(size).is_none_or(|end| end > self.length())) {
             return err::default_error(err::HCF).with_module(mid);
         }
 
         let _slot_guard = slot_locks_guard.read_lock(index);
-
         let guard = self.inner.mmap.read().unwrap_or_else(|e| e.into_inner());
+
         let mmap = match guard.as_ref() {
             Some(m) => m,
             None => return err::default_error(err::INV).with_module(mid),
@@ -1288,10 +1325,11 @@ where
     /// let dir = tempfile::tempdir().unwrap();
     /// let cfg = MemMapCfg {
     ///     module_id: 1,
-    ///     path: dir.path().join("read_exact_demo.bin"),
+    ///     path: dir.path().to_path_buf(),
+    ///     name: *b"rdex",
     ///     version: 1,
     ///     initial_pages: 1,
-    ///     sync_interval: Some(Duration::from_millis(100)),
+    ///     sync_interval: Some(Duration::from_millis(0x64)),
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1325,7 +1363,6 @@ where
         }
 
         let n = target_size / slot_size;
-
         let end_slot = match start.checked_add(n) {
             Some(end) => end,
             None => return err::default_error(err::INV).with_module(mid),
@@ -1342,7 +1379,6 @@ where
         };
 
         let slot_locks_guard = self.inner.slot_locks.read().unwrap_or_else(|e| e.into_inner());
-
         if hints::unlikely(end_offset > self.length()) {
             return err::default_error(err::HCF).with_module(mid);
         }
@@ -1398,10 +1434,11 @@ where
     /// let dir = tempfile::tempdir().unwrap();
     /// let cfg = MemMapCfg {
     ///     module_id: 1,
-    ///     path: dir.path().join("write_test.bin"),
+    ///     path: dir.path().to_path_buf(),
+    ///     name: *b"writ",
     ///     version: 1,
     ///     initial_pages: 1,
-    ///     sync_interval: Some(Duration::from_millis(100)),
+    ///     sync_interval: Some(Duration::from_millis(0x64)),
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1422,14 +1459,13 @@ where
         };
 
         let slot_locks_guard = self.inner.slot_locks.read().unwrap_or_else(|e| e.into_inner());
-
         if hints::unlikely(offset.checked_add(size).is_none_or(|end| end > self.length())) {
             return err::default_error(err::HCF).with_module(mid);
         }
 
         let _slot_guard = slot_locks_guard.write_lock(index);
-
         let guard = self.inner.mmap.read().unwrap_or_else(|e| e.into_inner());
+
         let mmap = match guard.as_ref() {
             Some(m) => m,
             None => return err::default_error(err::INV).with_module(mid),
@@ -1437,12 +1473,12 @@ where
 
         let ptr = unsafe { mmap.as_mut_ptr::<T>(offset) };
         let res = f(unsafe { &mut *ptr });
+
         drop(guard);
         drop(_slot_guard);
         drop(slot_locks_guard);
 
         let epoch = self.inner.completion.increment_current_epoch();
-
         if self.inner.is_parked.load(atomic::Ordering::Acquire) {
             let _guard = self.inner.sync_mutex.lock().unwrap_or_else(|e| e.into_inner());
             if self.inner.is_parked.swap(false, atomic::Ordering::AcqRel) {
@@ -1488,10 +1524,11 @@ where
     /// let dir = tempfile::tempdir().unwrap();
     /// let cfg = MemMapCfg {
     ///     module_id: 1,
-    ///     path: dir.path().join("write_exact_demo.bin"),
+    ///     path: dir.path().to_path_buf(),
+    ///     name: *b"wrex",
     ///     version: 1,
     ///     initial_pages: 1,
-    ///     sync_interval: Some(Duration::from_millis(100)),
+    ///     sync_interval: Some(Duration::from_millis(0x64)),
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1528,7 +1565,6 @@ where
         }
 
         let n = target_size / slot_size;
-
         let end_slot = match start.checked_add(n) {
             Some(end) => end,
             None => return err::default_error(err::INV).with_module(mid),
@@ -1545,7 +1581,6 @@ where
         };
 
         let slot_locks_guard = self.inner.slot_locks.read().unwrap_or_else(|e| e.into_inner());
-
         if hints::unlikely(end_offset > self.length()) {
             return err::default_error(err::HCF).with_module(mid);
         }
@@ -1574,9 +1609,9 @@ where
         drop(slot_locks_guard);
 
         let epoch = self.inner.completion.increment_current_epoch();
-
         if self.inner.is_parked.load(atomic::Ordering::Acquire) {
             let _guard = self.inner.sync_mutex.lock().unwrap_or_else(|e| e.into_inner());
+
             if self.inner.is_parked.swap(false, atomic::Ordering::AcqRel) {
                 self.inner.sync_condvar.notify_one();
             }
@@ -1610,31 +1645,31 @@ where
     /// use std::time::Duration;
     ///
     /// let dir = tempfile::tempdir().unwrap();
-    /// let path = dir.path().join("delete_demo.bin");
-    /// let versioned_path = dir.path().join("delete_demo_1.bin");
     /// let cfg = MemMapCfg {
     ///     module_id: 1,
-    ///     path,
+    ///     path: dir.path().to_path_buf(),
+    ///     name: *b"delt",
     ///     version: 1,
     ///     initial_pages: 1,
-    ///     sync_interval: Some(Duration::from_millis(100)),
+    ///     sync_interval: Some(Duration::from_millis(0x64)),
     /// };
     ///
-    /// let mmap = MemMap::<u64>::new(cfg).unwrap();
-    /// assert!(versioned_path.exists());
+    /// let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
+    /// assert!(MemMap::<u64>::exists(&cfg));
     ///
     /// mmap.delete().unwrap();
-    /// assert!(!versioned_path.exists());
+    /// assert!(!MemMap::<u64>::exists(&cfg));
     /// ```
     pub fn delete(mut self) -> FrozenResult<()> {
         let mid = self.cfg.module_id;
         self.inner.shutdown.store(true, atomic::Ordering::Release);
+
         {
             let mut guard = self.inner.sync_mutex.lock().unwrap_or_else(|e| e.into_inner());
             *guard = true;
         }
-        self.inner.sync_condvar.notify_all();
 
+        self.inner.sync_condvar.notify_all();
         if let Some(handle) = self.bg_thread.take() {
             let _ = handle.join();
         }
@@ -1652,7 +1687,6 @@ where
         };
 
         let delete_res = file.delete().with_module(mid);
-
         match (unmap_res, delete_res) {
             (Err(mut unmap_err), Err(del_err)) => {
                 unmap_err.add_suppressed(del_err);
@@ -1695,20 +1729,21 @@ where
     /// let dir = tempfile::tempdir().unwrap();
     /// let cfg = MemMapCfg {
     ///     module_id: 1,
-    ///     path: dir.path().join("cas_demo.bin"),
+    ///     path: dir.path().to_path_buf(),
+    ///     name: *b"casd",
     ///     version: 1,
     ///     initial_pages: 1,
-    ///     sync_interval: Some(Duration::from_millis(100)),
+    ///     sync_interval: Some(Duration::from_millis(0x64)),
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
     /// mmap.write(0, |v| *v = 100u64).unwrap();
     ///
-    /// // Successful CAS: 100 -> 200
+    /// // Successful CAS (100 -> 200)
     /// let ticket = mmap.compare_and_write(&100u64, &200u64, 0).unwrap();
     /// assert_eq!(mmap.read(0, |v| *v).unwrap(), 200u64);
     ///
-    /// // Failed CAS: expected 100, but slot is 200
+    /// // Failed CAS (expected 100, but slot is 200)
     /// assert!(mmap.compare_and_write(&100u64, &300u64, 0).is_err());
     /// assert_eq!(mmap.read(0, |v| *v).unwrap(), 200u64);
     /// ```
@@ -1727,14 +1762,13 @@ where
         };
 
         let slot_locks_guard = self.inner.slot_locks.read().unwrap_or_else(|e| e.into_inner());
-
         if hints::unlikely(offset.checked_add(size).is_none_or(|end| end > self.length())) {
             return err::default_error(err::HCF).with_module(mid);
         }
 
         let _slot_guard = slot_locks_guard.write_lock(index);
-
         let guard = self.inner.mmap.read().unwrap_or_else(|e| e.into_inner());
+
         let mmap = match guard.as_ref() {
             Some(m) => m,
             None => return err::default_error(err::INV).with_module(mid),
@@ -1742,10 +1776,12 @@ where
 
         let ptr = unsafe { mmap.as_mut_ptr::<T>(offset) };
         let current = unsafe { ptr.read() };
+
         if current != *expected {
             drop(guard);
             drop(_slot_guard);
             drop(slot_locks_guard);
+
             return err::raw_error(
                 err::CAS,
                 format!("state conflict at index {}: slot data has changed", index),
@@ -1754,14 +1790,15 @@ where
         }
 
         unsafe { core::ptr::write(ptr, val.clone()) };
+
         drop(guard);
         drop(_slot_guard);
         drop(slot_locks_guard);
 
         let epoch = self.inner.completion.increment_current_epoch();
-
         if self.inner.is_parked.load(atomic::Ordering::Acquire) {
             let _guard = self.inner.sync_mutex.lock().unwrap_or_else(|e| e.into_inner());
+
             if self.inner.is_parked.swap(false, atomic::Ordering::AcqRel) {
                 self.inner.sync_condvar.notify_one();
             }
@@ -1793,10 +1830,11 @@ where
     /// let dir = tempfile::tempdir().unwrap();
     /// let cfg = MemMapCfg {
     ///     module_id: 1,
-    ///     path: dir.path().join("tx_demo.bin"),
+    ///     path: dir.path().to_path_buf(),
+    ///     name: *b"txde",
     ///     version: 1,
     ///     initial_pages: 1,
-    ///     sync_interval: Some(Duration::from_millis(100)),
+    ///     sync_interval: Some(Duration::from_millis(0x64)),
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1834,10 +1872,11 @@ where
 /// let dir = tempfile::tempdir().unwrap();
 /// let cfg = MemMapCfg {
 ///     module_id: 1,
-///     path: dir.path().join("tx_struct_demo.bin"),
+///     path: dir.path().to_path_buf(),
+///     name: *b"txst",
 ///     version: 1,
 ///     initial_pages: 1,
-///     sync_interval: Some(Duration::from_millis(100)),
+///     sync_interval: Some(Duration::from_millis(0x64)),
 /// };
 ///
 /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1877,18 +1916,19 @@ where
     /// let dir = tempfile::tempdir().unwrap();
     /// let cfg = MemMapCfg {
     ///     module_id: 1,
-    ///     path: dir.path().join("tx_write_demo.bin"),
+    ///     path: dir.path().to_path_buf(),
+    ///     name: *b"txwr",
     ///     version: 1,
     ///     initial_pages: 1,
-    ///     sync_interval: Some(Duration::from_millis(100)),
+    ///     sync_interval: Some(Duration::from_millis(0x64)),
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
+    ///
     /// let mut tx = mmap.new_tx();
     /// tx.write(&0u64, &111u64, 0).unwrap();
     /// tx.write(&0u64, &222u64, 1).unwrap();
     ///
-    /// // Staging an out-of-order or duplicate index fails
     /// assert!(tx.write(&0u64, &333u64, 1).is_err());
     /// assert!(tx.write(&0u64, &333u64, 0).is_err());
     /// ```
@@ -1941,10 +1981,11 @@ where
     /// let dir = tempfile::tempdir().unwrap();
     /// let cfg = MemMapCfg {
     ///     module_id: 1,
-    ///     path: dir.path().join("tx_commit_demo.bin"),
+    ///     path: dir.path().to_path_buf(),
+    ///     name: *b"txcm",
     ///     version: 1,
     ///     initial_pages: 1,
-    ///     sync_interval: Some(Duration::from_millis(100)),
+    ///     sync_interval: Some(Duration::from_millis(0x64)),
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1969,20 +2010,19 @@ where
         let size = core::mem::size_of::<T>();
         let slot_locks_guard =
             self.memmap.inner.slot_locks.read().unwrap_or_else(|e| e.into_inner());
-        let current_length = self.memmap.length();
 
-        // Verify bounds under slot_locks read guard
+        let current_length = self.memmap.length();
         for (index, _, _) in &self.ops {
             let offset = match index.checked_mul(size) {
                 Some(off) => off,
                 None => return err::default_error(err::INV).with_module(mid),
             };
+
             if hints::unlikely(offset.checked_add(size).is_none_or(|end| end > current_length)) {
                 return err::default_error(err::HCF).with_module(mid);
             }
         }
 
-        // Acquire all slot write locks in strictly ascending index order
         let mut slot_guards = Vec::with_capacity(self.ops.len());
         for (index, _, _) in &self.ops {
             slot_guards.push(slot_locks_guard.write_lock(*index));
@@ -1994,15 +2034,17 @@ where
             None => return err::default_error(err::INV).with_module(mid),
         };
 
-        // Phase 1: State Precondition Verification (CAS)
+        // (T1) State Precondition Verification (CAS)
         for (index, expected, _) in &self.ops {
             let offset = *index * size;
             let ptr = unsafe { mmap.as_ptr::<T>(offset) };
             let current = unsafe { ptr.read() };
+
             if current != *expected {
                 drop(guard);
                 drop(slot_guards);
                 drop(slot_locks_guard);
+
                 return err::raw_error(
                     err::CAS,
                     format!("state conflict at index {}: slot data has changed", index),
@@ -2011,10 +2053,11 @@ where
             }
         }
 
-        // Phase 2: Apply mutations
+        // (T2) Apply mutations
         for (index, _, new) in self.ops {
             let offset = index * size;
             let ptr = unsafe { mmap.as_mut_ptr::<T>(offset) };
+
             unsafe { core::ptr::write(ptr, new) };
         }
 
@@ -2023,7 +2066,6 @@ where
         drop(slot_locks_guard);
 
         let epoch = self.memmap.inner.completion.increment_current_epoch();
-
         if self.memmap.inner.is_parked.load(atomic::Ordering::Acquire) {
             let _guard = self.memmap.inner.sync_mutex.lock().unwrap_or_else(|e| e.into_inner());
             if self.memmap.inner.is_parked.swap(false, atomic::Ordering::AcqRel) {
@@ -2044,15 +2086,18 @@ where
     /// let dir = tempfile::tempdir().unwrap();
     /// let cfg = MemMapCfg {
     ///     module_id: 1,
-    ///     path: dir.path().join("tx_len_demo.bin"),
+    ///     path: dir.path().to_path_buf(),
+    ///     name: *b"txln",
     ///     version: 1,
     ///     initial_pages: 1,
     ///     sync_interval: None,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
+    ///
     /// let mut tx = mmap.new_tx();
     /// assert_eq!(tx.len(), 0);
+    ///
     /// tx.write(&0u64, &10u64, 0).unwrap();
     /// assert_eq!(tx.len(), 1);
     /// ```
@@ -2071,13 +2116,15 @@ where
     /// let dir = tempfile::tempdir().unwrap();
     /// let cfg = MemMapCfg {
     ///     module_id: 1,
-    ///     path: dir.path().join("tx_empty_demo.bin"),
+    ///     path: dir.path().to_path_buf(),
+    ///     name: *b"txmt",
     ///     version: 1,
     ///     initial_pages: 1,
     ///     sync_interval: None,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
+    ///
     /// let tx = mmap.new_tx();
     /// assert!(tx.is_empty());
     /// ```
@@ -2093,10 +2140,12 @@ where
 {
     fn drop(&mut self) {
         self.inner.shutdown.store(true, atomic::Ordering::Release);
+
         {
             let mut guard = self.inner.sync_mutex.lock().unwrap_or_else(|e| e.into_inner());
             *guard = true;
         }
+
         self.inner.sync_condvar.notify_all();
 
         if let Some(handle) = self.bg_thread.take() {
@@ -2156,10 +2205,10 @@ mod tests {
 
     fn tmp_cfg() -> (tempfile::TempDir, MemMapCfg) {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tmp_memmap");
         let cfg = MemMapCfg {
             module_id: MID,
-            path,
+            path: dir.path().to_path_buf(),
+            name: *b"tbfx",
             version: 1,
             initial_pages: INIT_PAGES,
             sync_interval: Some(Duration::from_millis(0x64)),
@@ -2259,7 +2308,8 @@ mod tests {
         let non_existent_dir = dir.path().join("missing_dir_xyz");
         let cfg = MemMapCfg {
             module_id: MID,
-            path: non_existent_dir.join("file.bin"),
+            path: non_existent_dir,
+            name: *b"tbfx",
             version: 1,
             initial_pages: INIT_PAGES,
             sync_interval: Some(Duration::from_millis(0x64)),
@@ -2276,14 +2326,15 @@ mod tests {
     }
 
     #[test]
-    fn err_path_when_parent_is_not_dir() {
+    fn err_path_when_not_a_dir() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("regular_file");
         std::fs::write(&file_path, b"test").unwrap();
 
         let cfg = MemMapCfg {
             module_id: MID,
-            path: file_path.join("subfile.bin"),
+            path: file_path,
+            name: *b"tbfx",
             version: 1,
             initial_pages: INIT_PAGES,
             sync_interval: Some(Duration::from_millis(0x64)),
@@ -2304,176 +2355,130 @@ mod tests {
         let cfg = MemMapCfg {
             module_id: MID,
             path: std::path::PathBuf::from(""),
+            name: *b"tbfx",
             version: 1,
             initial_pages: INIT_PAGES,
             sync_interval: Some(Duration::from_millis(0x64)),
         };
 
         let err_new = MemMap::<u64>::new(cfg.clone()).unwrap_err();
-        assert_eq!(err_new.reason, err::PTH.reason);
+        assert_eq!(err_new.reason, err::DIR.reason);
 
         let err_open = MemMap::<u64>::open(cfg.clone()).unwrap_err();
-        assert_eq!(err_open.reason, err::PTH.reason);
+        assert_eq!(err_open.reason, err::DIR.reason);
 
         let err_open_or_create = MemMap::<u64>::open_or_create(cfg).unwrap_err();
-        assert_eq!(err_open_or_create.reason, err::PTH.reason);
+        assert_eq!(err_open_or_create.reason, err::DIR.reason);
     }
 
     #[test]
-    fn err_path_when_is_directory() {
+    fn err_name_invalid() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = MemMapCfg {
-            module_id: MID,
-            path: dir.path().to_path_buf(),
-            version: 1,
-            initial_pages: INIT_PAGES,
-            sync_interval: Some(Duration::from_millis(0x64)),
-        };
+        let invalid_tags = [*b"tb-x", *b"tb x", *b"tb\0x", [0xFF, 0x00, 0x01, 0x02]];
+        for tag in invalid_tags {
+            let cfg = MemMapCfg {
+                module_id: MID,
+                path: dir.path().to_path_buf(),
+                name: tag,
+                version: 1,
+                initial_pages: INIT_PAGES,
+                sync_interval: Some(Duration::from_millis(0x64)),
+            };
 
-        let err_new = MemMap::<u64>::new(cfg.clone()).unwrap_err();
-        assert_eq!(err_new.reason, err::PTH.reason);
+            let err_new = MemMap::<u64>::new(cfg.clone()).unwrap_err();
+            assert_eq!(err_new.reason, err::TAG.reason);
 
-        let err_open = MemMap::<u64>::open(cfg.clone()).unwrap_err();
-        assert_eq!(err_open.reason, err::PTH.reason);
+            let err_open = MemMap::<u64>::open(cfg.clone()).unwrap_err();
+            assert_eq!(err_open.reason, err::TAG.reason);
 
-        let err_open_or_create = MemMap::<u64>::open_or_create(cfg).unwrap_err();
-        assert_eq!(err_open_or_create.reason, err::PTH.reason);
-    }
-
-    #[test]
-    fn err_path_when_no_filename() {
-        let cfg = MemMapCfg {
-            module_id: MID,
-            path: std::path::PathBuf::from("/"),
-            version: 1,
-            initial_pages: INIT_PAGES,
-            sync_interval: Some(Duration::from_millis(0x64)),
-        };
-
-        let err_new = MemMap::<u64>::new(cfg.clone()).unwrap_err();
-        assert_eq!(err_new.reason, err::PTH.reason);
-
-        let err_open = MemMap::<u64>::open(cfg.clone()).unwrap_err();
-        assert_eq!(err_open.reason, err::PTH.reason);
-
-        let err_open_or_create = MemMap::<u64>::open_or_create(cfg).unwrap_err();
-        assert_eq!(err_open_or_create.reason, err::PTH.reason);
+            let err_open_or_create = MemMap::<u64>::open_or_create(cfg).unwrap_err();
+            assert_eq!(err_open_or_create.reason, err::TAG.reason);
+        }
     }
 
     #[test]
     fn ok_delete() {
         let (_dir, cfg) = tmp_cfg();
         let path = cfg.versioned_path();
-        let mmap = MemMap::<u64>::new(cfg).unwrap();
+        let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
         assert!(path.exists());
+        assert!(MemMap::<u64>::exists(&cfg));
         assert!(mmap.delete().is_ok());
         assert!(!path.exists());
+        assert!(!MemMap::<u64>::exists(&cfg));
     }
 
     #[test]
     fn ok_versioned_path_resolution() {
+        let dir = std::path::PathBuf::from("/var/data");
         let cfg = MemMapCfg {
             module_id: MID,
-            path: std::path::PathBuf::from("data.bin"),
-            version: 1,
-            initial_pages: 1,
-            sync_interval: Some(Duration::from_millis(0x64)),
-        };
-        assert_eq!(cfg.versioned_path(), std::path::PathBuf::from("data_1.bin"));
-
-        let cfg = MemMapCfg {
-            module_id: MID,
-            path: std::path::PathBuf::from("datastore"),
-            version: 2,
-            initial_pages: 1,
-            sync_interval: Some(Duration::from_millis(0x64)),
-        };
-        assert_eq!(cfg.versioned_path(), std::path::PathBuf::from("datastore_2"));
-
-        let cfg = MemMapCfg {
-            module_id: MID,
-            path: std::path::PathBuf::from("archive.tar.gz"),
-            version: 3,
-            initial_pages: 1,
-            sync_interval: Some(Duration::from_millis(0x64)),
-        };
-        assert_eq!(cfg.versioned_path(), std::path::PathBuf::from("archive.tar_3.gz"));
-
-        let cfg = MemMapCfg {
-            module_id: MID,
-            path: std::path::PathBuf::from("/var/data/store.db"),
-            version: 0x0A,
-            initial_pages: 1,
-            sync_interval: Some(Duration::from_millis(0x64)),
-        };
-        assert_eq!(cfg.versioned_path(), std::path::PathBuf::from("/var/data/store_10.db"));
-
-        let cfg = MemMapCfg {
-            module_id: MID,
-            path: std::path::PathBuf::from("dir/sub/file.dat"),
+            path: dir.clone(),
+            name: *b"tbfx",
             version: 0,
             initial_pages: 1,
             sync_interval: Some(Duration::from_millis(0x64)),
         };
-        assert_eq!(cfg.versioned_path(), std::path::PathBuf::from("dir/sub/file_0.dat"));
+        assert_eq!(cfg.versioned_path(), dir.join("tbfx_0"));
 
         let cfg = MemMapCfg {
             module_id: MID,
-            path: std::path::PathBuf::from(".env"),
+            path: dir.clone(),
+            name: *b"DATA",
             version: 5,
             initial_pages: 1,
             sync_interval: Some(Duration::from_millis(0x64)),
         };
-        assert_eq!(cfg.versioned_path(), std::path::PathBuf::from(".env_5"));
-
-        let cfg = MemMapCfg {
-            module_id: MID,
-            path: std::path::PathBuf::from(".config.json"),
-            version: 1,
-            initial_pages: 1,
-            sync_interval: Some(Duration::from_millis(0x64)),
-        };
-        assert_eq!(cfg.versioned_path(), std::path::PathBuf::from(".config_1.json"));
+        assert_eq!(cfg.versioned_path(), dir.join("DATA_5"));
     }
 
     #[test]
     fn ok_versioned_path_and_multiversion() {
         let dir = tempfile::tempdir().unwrap();
-        let base_path = dir.path().join("store.dat");
 
         let cfg_v1 = MemMapCfg {
             module_id: MID,
-            path: base_path.clone(),
+            path: dir.path().to_path_buf(),
+            name: *b"tbfx",
             version: 1,
             initial_pages: 1,
             sync_interval: Some(Duration::from_millis(0x64)),
         };
-        assert_eq!(cfg_v1.versioned_path(), dir.path().join("store_1.dat"));
+        assert_eq!(cfg_v1.versioned_path(), dir.path().join("tbfx_1"));
 
         let cfg_v2 = MemMapCfg {
             module_id: MID,
-            path: base_path.clone(),
+            path: dir.path().to_path_buf(),
+            name: *b"tbfx",
             version: 2,
             initial_pages: 1,
             sync_interval: Some(Duration::from_millis(0x64)),
         };
-        assert_eq!(cfg_v2.versioned_path(), dir.path().join("store_2.dat"));
+        assert_eq!(cfg_v2.versioned_path(), dir.path().join("tbfx_2"));
+
+        assert!(!MemMap::<u64>::exists(&cfg_v1));
+        assert!(!MemMap::<ValidT>::exists(&cfg_v2));
 
         // Both versions can coexist independently on disk
         let mmap_v1 = MemMap::<u64>::new(cfg_v1.clone()).unwrap();
         let mmap_v2 = MemMap::<ValidT>::new(cfg_v2.clone()).unwrap();
         let page_size = MemMap::<u64>::page_size().unwrap().as_usize();
 
+        assert!(MemMap::<u64>::exists(&cfg_v1));
+        assert!(MemMap::<ValidT>::exists(&cfg_v2));
         assert!(cfg_v1.versioned_path().exists());
         assert!(cfg_v2.versioned_path().exists());
         assert_eq!(mmap_v1.length(), page_size);
         assert_eq!(mmap_v2.length(), page_size);
 
         assert!(mmap_v1.delete().is_ok());
+        assert!(!MemMap::<u64>::exists(&cfg_v1));
+        assert!(MemMap::<ValidT>::exists(&cfg_v2));
         assert!(!cfg_v1.versioned_path().exists());
         assert!(cfg_v2.versioned_path().exists());
 
         assert!(mmap_v2.delete().is_ok());
+        assert!(!MemMap::<ValidT>::exists(&cfg_v2));
         assert!(!cfg_v2.versioned_path().exists());
     }
 
@@ -2483,8 +2488,8 @@ mod tests {
         let mmap = MemMap::<u64>::new(cfg).unwrap();
 
         assert_eq!(mmap.read(0, |v| *v).unwrap(), 0);
-        let (ticket, _) = mmap.write(0, |v| *v = 0xDEAD_BEEF_CAFE_BABE).unwrap();
-        assert_eq!(mmap.read(0, |v| *v).unwrap(), 0xDEAD_BEEF_CAFE_BABE);
+        let (ticket, _) = mmap.write(0, |v| *v = 0xDEAD_C0DE_CAFE_BABE).unwrap();
+        assert_eq!(mmap.read(0, |v| *v).unwrap(), 0xDEAD_C0DE_CAFE_BABE);
         assert_eq!(ticket.epoch(), 1);
     }
 
@@ -3087,7 +3092,7 @@ mod tests {
                 let (ticket, _) = mmap
                     .write_exact(0, |node: &mut TestNode| {
                         node.id = 0xDEAD;
-                        node.flags = 0xBEEF;
+                        node.flags = 0xC0DE;
                         node.keys = [0xCAFE, 0xBABE];
                     })
                     .unwrap();
@@ -3098,7 +3103,7 @@ mod tests {
             let reopened = MemMap::<u64>::open(cfg).unwrap();
             assert_eq!(
                 reopened.read_exact(0, |n: &TestNode| *n).unwrap(),
-                TestNode { id: 0xDEAD, flags: 0xBEEF, keys: [0xCAFE, 0xBABE] }
+                TestNode { id: 0xDEAD, flags: 0xC0DE, keys: [0xCAFE, 0xBABE] }
             );
         }
     }
@@ -3156,12 +3161,12 @@ mod tests {
 
         {
             let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
-            let (_ticket, _) = mmap.write(0, |v| *v = 0xBEEF_CAFE).unwrap();
+            let (_ticket, _) = mmap.write(0, |v| *v = 0xC0DE_CAFE).unwrap();
             drop(mmap);
         }
 
         let reopened = MemMap::<u64>::open(cfg).unwrap();
-        assert_eq!(reopened.read(0, |v| *v).unwrap(), 0xBEEF_CAFE);
+        assert_eq!(reopened.read(0, |v| *v).unwrap(), 0xC0DE_CAFE);
     }
 
     #[test]
@@ -3764,8 +3769,8 @@ mod tests {
             }
 
             for i in initial_slots..(initial_slots + page_slots) {
-                mmap.write(i, |v| *v = 0xBEEF_0000 + i as u64).unwrap();
-                assert_eq!(mmap.read(i, |v| *v).unwrap(), 0xBEEF_0000 + i as u64);
+                mmap.write(i, |v| *v = 0xC0DE_0000 + i as u64).unwrap();
+                assert_eq!(mmap.read(i, |v| *v).unwrap(), 0xC0DE_0000 + i as u64);
             }
         }
 
