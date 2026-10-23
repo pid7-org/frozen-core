@@ -62,8 +62,10 @@ impl PageSize {
     /// ## Platform rules
     ///
     /// - **Windows**: Only `PageSize::K4` (4096 bytes) is valid
-    /// - **macOS**: `PageSize::K16` or `PageSize::K4` on `aarch64`; `PageSize::K4` on `x86_64`
-    /// - **Linux**: `PageSize::K4` on `x86`/`x86_64`; `PageSize::K4`, `PageSize::K16`, `PageSize::K64`
+    /// - **macOS**: `PageSize::K16` (16384 bytes) on Apple Silicon (`aarch64`);
+    ///   `PageSize::K4` (4096 bytes) on Intel (`x86_64`)
+    /// - **Linux**: `PageSize::K4` (4096 bytes) on `x86`/`x86_64`;
+    ///   `PageSize::K4`, `PageSize::K16`, or `PageSize::K64` on `aarch64`
     pub fn validate_platform(self) -> FrozenResult<Self> {
         Self::validate_target_platform(self, std::env::consts::OS, std::env::consts::ARCH)
     }
@@ -71,9 +73,7 @@ impl PageSize {
     pub(crate) fn validate_target_platform(self, os: &str, arch: &str) -> FrozenResult<Self> {
         let valid = match (os, arch) {
             ("windows", _) => self == Self::K4,
-            // Historical strict MMU invariant preserved for future OS adaptation:
-            // ("macos", "aarch64") => self == Self::K16,
-            ("macos", "aarch64") => matches!(self, Self::K4 | Self::K16),
+            ("macos", "aarch64") => self == Self::K16,
             ("macos", "x86_64") => self == Self::K4,
             ("linux", "x86" | "x86_64") => self == Self::K4,
             ("linux", "aarch64") => matches!(self, Self::K4 | Self::K16 | Self::K64),
@@ -184,9 +184,9 @@ mod tests {
         assert!(PageSize::K16.validate_target_platform("windows", "x86_64").is_err());
         assert!(PageSize::K64.validate_target_platform("windows", "x86_64").is_err());
 
-        // macOS Apple Silicon (aarch64) allows K4 and K16
+        // macOS Apple Silicon (aarch64) allows only K16
         assert!(PageSize::K16.validate_target_platform("macos", "aarch64").is_ok());
-        assert!(PageSize::K4.validate_target_platform("macos", "aarch64").is_ok());
+        assert!(PageSize::K4.validate_target_platform("macos", "aarch64").is_err());
         assert!(PageSize::K64.validate_target_platform("macos", "aarch64").is_err());
 
         // macOS Intel (x86_64) allows only K4
@@ -225,7 +225,7 @@ mod tests {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
             assert!(PageSize::K16.validate_platform().is_ok());
-            assert!(PageSize::K4.validate_platform().is_ok());
+            assert!(PageSize::K4.validate_platform().is_err());
         }
 
         #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
