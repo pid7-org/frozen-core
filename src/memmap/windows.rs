@@ -8,16 +8,17 @@ use core::ptr;
 use std::time::Duration;
 use windows_sys::Win32::{
     Foundation::{
-        CloseHandle, ERROR_ACCESS_DENIED, ERROR_COMMITMENT_LIMIT, ERROR_DISK_FULL,
-        ERROR_HANDLE_DISK_FULL, ERROR_INVALID_ADDRESS, ERROR_INVALID_HANDLE,
-        ERROR_INVALID_PARAMETER, ERROR_IO_DEVICE, ERROR_LOCK_VIOLATION, ERROR_NOT_ENOUGH_MEMORY,
-        ERROR_NOT_LOCKED, ERROR_OUTOFMEMORY, ERROR_SHARING_VIOLATION, HANDLE, INVALID_HANDLE_VALUE,
+        CloseHandle, ERROR_ACCESS_DENIED, ERROR_COMMITMENT_LIMIT, ERROR_INVALID_ADDRESS,
+        ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, ERROR_IO_DEVICE, ERROR_LOCK_VIOLATION,
+        ERROR_NOT_ENOUGH_MEMORY, ERROR_NOT_LOCKED, ERROR_OUTOFMEMORY, ERROR_SHARING_VIOLATION,
+        HANDLE, INVALID_HANDLE_VALUE,
     },
     System::{
         Memory::{
-            CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, FlushViewOfFile,
-            MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile,
-            VirtualUnlock,
+            CreateFileMappingW, FlushViewOfFile, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE,
+            MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER,
+            MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3, PAGE_NOACCESS, PAGE_READWRITE,
+            UnmapViewOfFile, VirtualAlloc2, VirtualFreeEx, VirtualUnlock,
         },
         ProcessStatus::{
             K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_BLOCK, PSAPI_WORKING_SET_EX_INFORMATION,
@@ -52,19 +53,37 @@ const MAX_RETRIES: usize = 0x80;
 pub(super) struct WINMemMap {
     ptr: TPtr,
     length: usize,
+    max_len: usize,
+    views: Vec<(TPtr, usize)>,
 }
 
 unsafe impl Send for WINMemMap {}
 unsafe impl Sync for WINMemMap {}
 
 impl Drop for WINMemMap {
-    /// Automatically releases mapped memory via `UnmapViewOfFile` when going out of scope if not
-    /// explicitly unmapped
+    /// Automatically releases mapped memory views and reserved placeholder when going out of scope
     fn drop(&mut self) {
-        if !self.ptr.is_null() && self.length > 0 {
-            let _ = munmap_raw(self.ptr, self.length);
+        if !self.ptr.is_null() && self.max_len > 0 {
+            for &(view_ptr, len) in &self.views {
+                let _ = munmap_raw(view_ptr, len);
+            }
+
+            if self.length < self.max_len {
+                let remaining_placeholder = unsafe { self.ptr.add(self.length) };
+                let _ = unsafe {
+                    VirtualFreeEx(
+                        GetCurrentProcess(),
+                        remaining_placeholder as *mut core::ffi::c_void,
+                        0,
+                        MEM_RELEASE,
+                    )
+                };
+            }
+
             self.ptr = ptr::null_mut();
             self.length = 0;
+            self.max_len = 0;
+            self.views.clear();
         }
     }
 }
@@ -72,12 +91,22 @@ impl Drop for WINMemMap {
 impl MemMapInterface for WINMemMap {
     type Id = FileId;
 
-    /// Create a new [`WINMemMap`] by mapping `length` bytes of the file represented by `handle`
-    ///
-    /// Maps memory from offset 0 with `PAGE_READWRITE` and `FILE_MAP_READ | FILE_MAP_WRITE`
-    fn new(handle: FileId, length: usize) -> FrozenResult<Self> {
-        let ptr = mmap_raw(handle, length)?;
-        Ok(Self { ptr, length })
+    /// Create a new [`WINMemMap`] by reserving `max_len` virtual address space and mapping `length`
+    /// bytes of the file represented by `handle`
+    fn new(handle: FileId, length: usize, max_len: usize) -> FrozenResult<Self> {
+        let (ptr, views) = mmap_raw(handle, length, max_len)?;
+        Ok(Self { ptr, length, max_len, views })
+    }
+
+    /// In-place expansion of the memory mapping over a newly extended file range
+    fn grow(&mut self, handle: FileId, curr_len: usize, added_len: usize) -> FrozenResult<()> {
+        let view = mmap_grow_raw(self.ptr, handle, curr_len, added_len, self.max_len)?;
+        if view.1 > 0 {
+            self.views.push(view);
+            self.length = curr_len + added_len;
+        }
+
+        Ok(())
     }
 
     /// Unmap [`WINMemMap`] to explicitly release mapped memory resources
@@ -86,20 +115,54 @@ impl MemMapInterface for WINMemMap {
     ///
     /// Clears internal state so subsequent [`Drop`] execution becomes a safe no-op
     fn unmap(mut self) -> FrozenResult<()> {
-        if !self.ptr.is_null() && self.length > 0 {
-            let res = munmap_raw(self.ptr, self.length);
+        if !self.ptr.is_null() && self.max_len > 0 {
+            let mut first_err = None;
+            for &(view_ptr, len) in &self.views {
+                let res = munmap_raw(view_ptr, len);
+
+                if hints::unlikely(res.is_err() && first_err.is_none()) {
+                    first_err = Some(res);
+                }
+            }
+
+            if self.length < self.max_len {
+                let remaining_placeholder = unsafe { self.ptr.add(self.length) };
+                let ok = unsafe {
+                    VirtualFreeEx(
+                        GetCurrentProcess(),
+                        remaining_placeholder as *mut core::ffi::c_void,
+                        0,
+                        MEM_RELEASE,
+                    )
+                };
+
+                if hints::unlikely(ok == 0 && first_err.is_none()) {
+                    let code = last_error();
+                    first_err = Some(raw_error(err::UNK, err_msg(code)));
+                }
+            }
+
             self.ptr = ptr::null_mut();
             self.length = 0;
-            res
-        } else {
-            Ok(())
+            self.max_len = 0;
+            self.views.clear();
+
+            return first_err.unwrap_or(Ok(()));
         }
+
+        Ok(())
     }
 
     /// Returns the length of the memory mapping in bytes
     #[inline]
     fn length(&self) -> usize {
         self.length
+    }
+
+    /// Returns the maximum reserved virtual length of the memory mapping in bytes
+    #[inline]
+    fn max_len(&self) -> usize {
+        self.max_len
     }
 
     /// Returns the system memory page size queried from kernel settings
@@ -184,6 +247,7 @@ impl MemMapInterface for WINMemMap {
                         std::thread::sleep(Duration::from_millis(1));
                         continue;
                     }
+
                     return raw_error(err::UNK, err_msg);
                 }
                 ERROR_INVALID_PARAMETER | ERROR_INVALID_ADDRESS => {
@@ -314,9 +378,13 @@ impl MemMapInterface for WINMemMap {
     }
 }
 
-/// Create a new memory mapping w/ `CreateFileMappingW` + `MapViewOfFile` on given `handle` and
-/// `length`
-fn mmap_raw(handle: isize, length: usize) -> FrozenResult<TPtr> {
+/// Create a new memory mapping w/ `VirtualAlloc2` + `CreateFileMappingW` + `MapViewOfFile3` on
+/// given `handle`, active `length`, and reserved `max_len`
+fn mmap_raw(
+    handle: isize,
+    length: usize,
+    max_len: usize,
+) -> FrozenResult<(TPtr, Vec<(TPtr, usize)>)> {
     if hints::unlikely(
         handle == CLOSED_HANDLE
             || (handle as usize as HANDLE) == INVALID_HANDLE_VALUE
@@ -325,25 +393,188 @@ fn mmap_raw(handle: isize, length: usize) -> FrozenResult<TPtr> {
         return raw_error(err::HCF, "invalid handle for memory mapping");
     }
 
-    if hints::unlikely(length == 0) {
-        return raw_error(err::HCF, "mapping length must be greater than 0");
+    if hints::unlikely(length == 0 || max_len == 0 || length > max_len) {
+        return raw_error(err::HCF, "invalid mapping length or max_len");
+    }
+
+    let h_process = unsafe { GetCurrentProcess() };
+    let base_addr = unsafe {
+        VirtualAlloc2(
+            h_process,
+            core::ptr::null(),
+            max_len,
+            MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+            PAGE_NOACCESS,
+            core::ptr::null_mut(),
+            0,
+        )
+    };
+
+    if hints::unlikely(base_addr.is_null()) {
+        let code = last_error();
+        let err_msg = err_msg(code);
+
+        return match code {
+            ERROR_NOT_ENOUGH_MEMORY | ERROR_OUTOFMEMORY | ERROR_COMMITMENT_LIMIT => {
+                raw_error(err::NMM, err_msg)
+            }
+            _ => raw_error(err::UNK, err_msg),
+        };
+    }
+
+    let base_ptr = base_addr as *mut u8;
+    if length < max_len {
+        let ok = unsafe {
+            VirtualFreeEx(
+                h_process,
+                base_ptr as *mut core::ffi::c_void,
+                length,
+                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+            )
+        };
+
+        if hints::unlikely(ok == 0) {
+            let code = last_error();
+            let err_msg = err_msg(code);
+
+            unsafe { VirtualFreeEx(h_process, base_addr, 0, MEM_RELEASE) };
+            return raw_error(err::UNK, err_msg);
+        }
     }
 
     let h_file = handle as usize as HANDLE;
-    let max_size_hi = (length >> 0x20) as u32;
-    let max_size_lo = (length & 0xFFFF_FFFF) as u32;
-
     let mut retries = 0;
+
     loop {
         let h_map = unsafe {
-            CreateFileMappingW(
-                h_file,
-                core::ptr::null(),
+            CreateFileMappingW(h_file, core::ptr::null(), PAGE_READWRITE, 0, 0, core::ptr::null())
+        };
+
+        if hints::unlikely(h_map.is_null()) {
+            let code = last_error();
+            let err_msg = err_msg(code);
+
+            match code {
+                ERROR_LOCK_VIOLATION | ERROR_SHARING_VIOLATION => {
+                    if retries < MAX_RETRIES {
+                        retries += 1;
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+
+                    unsafe { VirtualFreeEx(h_process, base_addr, 0, MEM_RELEASE) };
+                    return raw_error(err::UNK, err_msg);
+                }
+                ERROR_ACCESS_DENIED => {
+                    unsafe { VirtualFreeEx(h_process, base_addr, 0, MEM_RELEASE) };
+                    return raw_error(err::PRM, err_msg);
+                }
+                ERROR_INVALID_HANDLE | ERROR_INVALID_PARAMETER | ERROR_FILE_INVALID => {
+                    unsafe { VirtualFreeEx(h_process, base_addr, 0, MEM_RELEASE) };
+                    return raw_error(err::HCF, err_msg);
+                }
+                ERROR_NOT_ENOUGH_MEMORY | ERROR_OUTOFMEMORY | ERROR_COMMITMENT_LIMIT => {
+                    unsafe { VirtualFreeEx(h_process, base_addr, 0, MEM_RELEASE) };
+                    return raw_error(err::NMM, err_msg);
+                }
+                _ => {
+                    unsafe { VirtualFreeEx(h_process, base_addr, 0, MEM_RELEASE) };
+                    return raw_error(err::UNK, err_msg);
+                }
+            }
+        }
+
+        let view = unsafe {
+            MapViewOfFile3(
+                h_map,
+                h_process,
+                base_ptr as *const core::ffi::c_void,
+                0,
+                length,
+                MEM_REPLACE_PLACEHOLDER,
                 PAGE_READWRITE,
-                max_size_hi,
-                max_size_lo,
-                core::ptr::null(),
+                core::ptr::null_mut(),
+                0,
             )
+        };
+
+        unsafe { CloseHandle(h_map) };
+        if hints::unlikely(view.Value.is_null()) {
+            let code = last_error();
+            let err_msg = err_msg(code);
+
+            unsafe { VirtualFreeEx(h_process, base_addr, 0, MEM_RELEASE) };
+
+            return match code {
+                ERROR_NOT_ENOUGH_MEMORY | ERROR_OUTOFMEMORY | ERROR_COMMITMENT_LIMIT => {
+                    raw_error(err::NMM, err_msg)
+                }
+                _ => raw_error(err::UNK, err_msg),
+            };
+        }
+
+        return Ok((base_ptr, vec![(base_ptr, length)]));
+    }
+}
+
+/// Commits newly added file range in-place into reserved placeholder
+///
+/// ## Why the base pointer remains stable
+///
+/// `VirtualAlloc2` with `MEM_RESERVE | MEM_RESERVE_PLACEHOLDER` reserved `max_len` bytes at
+/// `base_ptr` upfront; when expanding, `VirtualFreeEx` splits the reservation at `target_addr =
+/// base_ptr + curr_len`, and `MapViewOfFile3` replaces that placeholder with
+/// `MEM_REPLACE_PLACEHOLDER`
+///
+/// Because each view is placed contiguously in the process virtual address space, all indexing
+/// and caller accesses continue using standard pointer arithmetic on the original `base_ptr`
+/// (`base_ptr.add(offset)`); the returned `(target_addr, added_len)` tuple is stored internally
+/// solely so [`WINMemMap::unmap`] can invoke `UnmapViewOfFile` per mapped view
+///
+/// ## Concurrency and Win32 section guarantees
+///
+/// * Active reads and writes referencing earlier views continue uninterrupted without pointer
+///   invalidation or section teardown
+/// * Zero-extends backing storage prior to opening the transient mapping handle, avoiding
+///   `ERROR_USER_MAPPED_FILE` (error `0x4C8`) conflicts on Windows
+/// * `curr_len` and `added_len` are guaranteed to align with system allocation granularity,
+///   satisfying Win32 placeholder replacement invariants
+fn mmap_grow_raw(
+    base_ptr: TPtr,
+    handle: isize,
+    curr_len: usize,
+    added_len: usize,
+    max_len: usize,
+) -> FrozenResult<(TPtr, usize)> {
+    if hints::unlikely(added_len == 0) {
+        return Ok((base_ptr, 0));
+    }
+
+    let h_process = unsafe { GetCurrentProcess() };
+    let target_addr = unsafe { base_ptr.add(curr_len) };
+
+    if curr_len + added_len < max_len {
+        let ok = unsafe {
+            VirtualFreeEx(
+                h_process,
+                target_addr as *mut core::ffi::c_void,
+                added_len,
+                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+            )
+        };
+
+        if hints::unlikely(ok == 0) {
+            let code = last_error();
+            return raw_error(err::UNK, err_msg(code));
+        }
+    }
+
+    let h_file = handle as usize as HANDLE;
+    let mut retries = 0;
+
+    loop {
+        let h_map = unsafe {
+            CreateFileMappingW(h_file, core::ptr::null(), PAGE_READWRITE, 0, 0, core::ptr::null())
         };
 
         if hints::unlikely(h_map.is_null()) {
@@ -359,50 +590,32 @@ fn mmap_raw(handle: isize, length: usize) -> FrozenResult<TPtr> {
                     }
                     return raw_error(err::UNK, err_msg);
                 }
-                ERROR_ACCESS_DENIED => return raw_error(err::PRM, err_msg),
-                ERROR_INVALID_HANDLE | ERROR_INVALID_PARAMETER | ERROR_FILE_INVALID => {
-                    return raw_error(err::HCF, err_msg);
-                }
-                ERROR_NOT_ENOUGH_MEMORY | ERROR_OUTOFMEMORY | ERROR_COMMITMENT_LIMIT => {
-                    return raw_error(err::NMM, err_msg);
-                }
-                ERROR_DISK_FULL | ERROR_HANDLE_DISK_FULL => return raw_error(err::NMM, err_msg),
                 _ => return raw_error(err::UNK, err_msg),
             }
         }
 
-        let view = unsafe { MapViewOfFile(h_map, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, length) };
+        let view = unsafe {
+            MapViewOfFile3(
+                h_map,
+                h_process,
+                target_addr as *const core::ffi::c_void,
+                curr_len as u64,
+                added_len,
+                MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
+
+        unsafe { CloseHandle(h_map) };
 
         if hints::unlikely(view.Value.is_null()) {
             let code = last_error();
-            let err_msg = err_msg(code);
-
-            unsafe { CloseHandle(h_map) };
-
-            match code {
-                ERROR_LOCK_VIOLATION | ERROR_SHARING_VIOLATION => {
-                    if retries < MAX_RETRIES {
-                        retries += 1;
-                        std::thread::sleep(Duration::from_millis(1));
-                        continue;
-                    }
-                    return raw_error(err::UNK, err_msg);
-                }
-                ERROR_ACCESS_DENIED => return raw_error(err::PRM, err_msg),
-                ERROR_INVALID_HANDLE | ERROR_INVALID_PARAMETER => {
-                    return raw_error(err::HCF, err_msg);
-                }
-                ERROR_NOT_ENOUGH_MEMORY | ERROR_OUTOFMEMORY | ERROR_COMMITMENT_LIMIT => {
-                    return raw_error(err::NMM, err_msg);
-                }
-                _ => return raw_error(err::UNK, err_msg),
-            }
+            return raw_error(err::UNK, err_msg(code));
         }
 
-        // Close mapping object handle immediately; the view maintains an internal reference
-        unsafe { CloseHandle(h_map) };
-
-        return Ok(view.Value as *mut u8);
+        return Ok((target_addr, added_len));
     }
 }
 
@@ -651,7 +864,7 @@ mod tests {
             let page_size = WINMemMap::page_size().unwrap().as_usize();
 
             unsafe {
-                let mmap = WINMemMap::new(file.fd(), total_len).unwrap();
+                let mmap = WINMemMap::new(file.fd(), total_len, total_len).unwrap();
 
                 let p0 = mmap.as_mut_ptr::<u8>(0);
                 *p0 = 0xAA;
@@ -675,7 +888,7 @@ mod tests {
             let page_size = WINMemMap::page_size().unwrap().as_usize();
 
             unsafe {
-                let mmap = WINMemMap::new(file.fd(), total_len).unwrap();
+                let mmap = WINMemMap::new(file.fd(), total_len, total_len).unwrap();
 
                 for i in 0..3 {
                     let ptr = mmap.as_mut_ptr::<u8>(i * page_size);
@@ -695,7 +908,7 @@ mod tests {
             let page_size = WINMemMap::page_size().unwrap().as_usize();
 
             unsafe {
-                let mmap = WINMemMap::new(file.fd(), total_len).unwrap();
+                let mmap = WINMemMap::new(file.fd(), total_len, total_len).unwrap();
 
                 // Read page 1 to trigger page fault
                 let p1 = mmap.as_ptr::<u8>(page_size);
@@ -711,7 +924,7 @@ mod tests {
         #[test]
         fn ok_active_pages_consecutive_consistency() {
             let (_dir, file, total_len) = new_paged_tmp(2);
-            let mmap = WINMemMap::new(file.fd(), total_len).unwrap();
+            let mmap = WINMemMap::new(file.fd(), total_len, total_len).unwrap();
             let first = mmap.active_page_indices().unwrap();
             let second = mmap.active_page_indices().unwrap();
             assert_eq!(first, second);
@@ -743,7 +956,7 @@ mod tests {
         #[test]
         fn ok_evict_empty_indices() {
             let (_dir, file, total_len) = new_paged_tmp(2);
-            let mmap = WINMemMap::new(file.fd(), total_len).unwrap();
+            let mmap = WINMemMap::new(file.fd(), total_len, total_len).unwrap();
             assert!(mmap.evict_pages(&[]).is_ok());
             mmap.unmap().unwrap();
         }
@@ -752,7 +965,7 @@ mod tests {
         fn ok_evict_single_page() {
             let (_dir, file, total_len) = new_paged_tmp(2);
             unsafe {
-                let mmap = WINMemMap::new(file.fd(), total_len).unwrap();
+                let mmap = WINMemMap::new(file.fd(), total_len, total_len).unwrap();
                 let p0 = mmap.as_mut_ptr::<u8>(0);
                 *p0 = 0xAA;
                 mmap.sync(total_len).unwrap();
@@ -768,7 +981,7 @@ mod tests {
             let page_size = WINMemMap::page_size().unwrap().as_usize();
 
             unsafe {
-                let mmap = WINMemMap::new(file.fd(), total_len).unwrap();
+                let mmap = WINMemMap::new(file.fd(), total_len, total_len).unwrap();
                 for i in 0..4 {
                     let ptr = mmap.as_mut_ptr::<u8>(i * page_size);
                     *ptr = (i + 1) as u8;
@@ -788,7 +1001,7 @@ mod tests {
             let page_size = WINMemMap::page_size().unwrap().as_usize();
 
             unsafe {
-                let mmap = WINMemMap::new(file.fd(), total_len).unwrap();
+                let mmap = WINMemMap::new(file.fd(), total_len, total_len).unwrap();
                 for i in 0..3 {
                     let ptr = mmap.as_mut_ptr::<u8>(i * page_size);
                     *ptr = 0xFF;
@@ -806,7 +1019,7 @@ mod tests {
             let page_size = WINMemMap::page_size().unwrap().as_usize();
 
             unsafe {
-                let mmap = WINMemMap::new(file.fd(), total_len).unwrap();
+                let mmap = WINMemMap::new(file.fd(), total_len, total_len).unwrap();
                 for i in 0..3 {
                     let ptr = mmap.as_mut_ptr::<u8>(i * page_size);
                     *ptr = 0x55;
@@ -823,7 +1036,7 @@ mod tests {
         #[test]
         fn err_evict_out_of_bounds() {
             let (_dir, file, total_len) = new_paged_tmp(2);
-            let mmap = WINMemMap::new(file.fd(), total_len).unwrap();
+            let mmap = WINMemMap::new(file.fd(), total_len, total_len).unwrap();
             let err = mmap.evict_pages(&[2]).unwrap_err();
             assert_eq!(err.reason, err::HCF.reason);
 
@@ -840,7 +1053,7 @@ mod tests {
 
             let (_dir, file, total_len) = new_paged_tmp(1);
             unsafe {
-                let mmap = WINMemMap::new(file.fd(), total_len).unwrap();
+                let mmap = WINMemMap::new(file.fd(), total_len, total_len).unwrap();
                 let unaligned = (mmap.as_ptr::<u8>(0) as usize + 1) as *mut core::ffi::c_void;
                 let err_unaligned = discard_raw(unaligned, BUFFER_SIZE).unwrap_err();
                 assert_eq!(err_unaligned.reason, err::HCF.reason);
@@ -857,7 +1070,7 @@ mod tests {
         fn ok_map_unmap_cycle() {
             let (_dir, file) = new_tmp();
 
-            let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
+            let mmap = WINMemMap::new(file.fd(), LENGTH, LENGTH).unwrap();
             mmap.unmap().unwrap();
         }
 
@@ -867,7 +1080,7 @@ mod tests {
             const BUF: [u8; LENGTH] = [0; LENGTH];
 
             unsafe {
-                let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
+                let mmap = WINMemMap::new(file.fd(), LENGTH, LENGTH).unwrap();
 
                 let ptr = mmap.as_ptr::<[u8; LENGTH]>(0);
                 assert_eq!(*ptr, BUF);
@@ -880,7 +1093,7 @@ mod tests {
         fn ok_unmap_consumes_self() {
             let (_dir, file) = new_tmp();
 
-            let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
+            let mmap = WINMemMap::new(file.fd(), LENGTH, LENGTH).unwrap();
             assert!(mmap.unmap().is_ok());
         }
 
@@ -890,8 +1103,8 @@ mod tests {
             let (_dir, file) = new_tmp();
 
             unsafe {
-                let mmap1 = WINMemMap::new(file.fd(), LENGTH).unwrap();
-                let mmap2 = WINMemMap::new(file.fd(), LENGTH).unwrap();
+                let mmap1 = WINMemMap::new(file.fd(), LENGTH, LENGTH).unwrap();
+                let mmap2 = WINMemMap::new(file.fd(), LENGTH, LENGTH).unwrap();
 
                 let wptr = mmap1.as_mut_ptr::<u64>(0);
                 *wptr = VAL;
@@ -907,17 +1120,17 @@ mod tests {
         #[test]
         fn err_map_on_invalid_length() {
             let (_dir, file) = new_tmp();
-            let err = WINMemMap::new(file.fd(), 0).unwrap_err();
+            let err = WINMemMap::new(file.fd(), 0, 0).unwrap_err();
             assert_eq!(err.reason, err::HCF.reason);
         }
 
         #[test]
         fn err_map_on_invalid_handle() {
             let (_dir, _) = new_tmp();
-            let err = WINMemMap::new(-1isize, LENGTH).unwrap_err();
+            let err = WINMemMap::new(-1isize, LENGTH, LENGTH).unwrap_err();
             assert_eq!(err.reason, err::HCF.reason);
 
-            let err_zero = WINMemMap::new(0isize, LENGTH).unwrap_err();
+            let err_zero = WINMemMap::new(0isize, LENGTH, LENGTH).unwrap_err();
             assert_eq!(err_zero.reason, err::HCF.reason);
         }
 
@@ -952,7 +1165,7 @@ mod tests {
             };
             assert_ne!(handle, INVALID_HANDLE_VALUE, "open read-only must succeed");
 
-            let err = WINMemMap::new(handle as isize, LENGTH).unwrap_err();
+            let err = WINMemMap::new(handle as isize, LENGTH, LENGTH).unwrap_err();
             assert_eq!(err.reason, err::PRM.reason);
             unsafe {
                 CloseHandle(handle);
@@ -964,7 +1177,7 @@ mod tests {
             let (_dir, file) = new_tmp();
 
             unsafe {
-                let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
+                let mmap = WINMemMap::new(file.fd(), LENGTH, LENGTH).unwrap();
                 let err = munmap_raw(mmap.as_ptr::<u8>(0) as *mut u8, 0).unwrap_err();
                 assert_eq!(err.reason, err::HCF.reason);
                 mmap.unmap().unwrap();
@@ -979,7 +1192,7 @@ mod tests {
         fn ok_sync() {
             let (_dir, file) = new_tmp();
 
-            let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
+            let mmap = WINMemMap::new(file.fd(), LENGTH, LENGTH).unwrap();
             mmap.sync(LENGTH).unwrap();
             mmap.unmap().unwrap();
         }
@@ -988,7 +1201,7 @@ mod tests {
         fn ok_sync_after_sync() {
             let (_dir, file) = new_tmp();
 
-            let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
+            let mmap = WINMemMap::new(file.fd(), LENGTH, LENGTH).unwrap();
 
             mmap.sync(LENGTH).unwrap();
             mmap.sync(LENGTH).unwrap();
@@ -1002,7 +1215,7 @@ mod tests {
         fn ok_sync_zero_length() {
             let (_dir, file) = new_tmp();
 
-            let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
+            let mmap = WINMemMap::new(file.fd(), LENGTH, LENGTH).unwrap();
             assert!(mmap.sync(0).is_ok());
             mmap.unmap().unwrap();
         }
@@ -1012,7 +1225,7 @@ mod tests {
             const VAL: u64 = 0xA5A5_A5A5_A5A5_A5A5;
             let (_dir, file) = new_tmp();
             unsafe {
-                let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
+                let mmap = WINMemMap::new(file.fd(), LENGTH, LENGTH).unwrap();
                 let wptr = mmap.as_mut_ptr::<u64>(0);
                 *wptr = VAL;
                 assert!(mmap.sync(BUFFER_SIZE).is_ok());
@@ -1024,7 +1237,7 @@ mod tests {
         fn err_sync_on_unaligned_pointer() {
             let (_dir, file) = new_tmp();
             unsafe {
-                let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
+                let mmap = WINMemMap::new(file.fd(), LENGTH, LENGTH).unwrap();
                 let unaligned = (mmap.as_ptr::<u8>(0) as usize + 1) as *mut u8;
                 let err = msync_raw(unaligned, BUFFER_SIZE).unwrap_err();
                 assert_eq!(err.reason, err::HCF.reason);
@@ -1042,7 +1255,7 @@ mod tests {
             let (_dir, file) = new_tmp();
 
             unsafe {
-                let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
+                let mmap = WINMemMap::new(file.fd(), LENGTH, LENGTH).unwrap();
 
                 let wptr = mmap.as_mut_ptr::<u64>(0);
                 *wptr = VAL;
@@ -1060,7 +1273,7 @@ mod tests {
             let (_dir, file) = new_tmp();
 
             unsafe {
-                let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
+                let mmap = WINMemMap::new(file.fd(), LENGTH, LENGTH).unwrap();
 
                 let wptr = mmap.as_mut_ptr::<u64>(8);
                 *wptr = VAL;
@@ -1079,7 +1292,7 @@ mod tests {
             let (_dir, file) = new_tmp();
 
             unsafe {
-                let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
+                let mmap = WINMemMap::new(file.fd(), LENGTH, LENGTH).unwrap();
 
                 let wptr = mmap.as_mut_ptr::<u64>(OFFSET);
                 *wptr = VAL;
@@ -1097,7 +1310,7 @@ mod tests {
             let (_dir, file) = new_tmp();
 
             unsafe {
-                let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
+                let mmap = WINMemMap::new(file.fd(), LENGTH, LENGTH).unwrap();
 
                 let wptr = mmap.as_mut_ptr::<[u32; 0x0A]>(0);
                 *wptr = VAL;
@@ -1116,7 +1329,7 @@ mod tests {
             let (_dir, file) = new_tmp();
 
             unsafe {
-                let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
+                let mmap = WINMemMap::new(file.fd(), LENGTH, LENGTH).unwrap();
 
                 let rptr = mmap.as_ptr::<u64>(0);
                 assert_eq!(*rptr, 0);
@@ -1129,7 +1342,7 @@ mod tests {
         fn ok_write_read_heterogeneous_types() {
             let (_dir, file) = new_tmp();
             unsafe {
-                let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
+                let mmap = WINMemMap::new(file.fd(), LENGTH, LENGTH).unwrap();
 
                 let p_u8 = mmap.as_mut_ptr::<u8>(0);
                 *p_u8 = 0xAA;
@@ -1162,7 +1375,7 @@ mod tests {
             let (_dir, file) = new_tmp();
 
             unsafe {
-                let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
+                let mmap = WINMemMap::new(file.fd(), LENGTH, LENGTH).unwrap();
 
                 let ptr = mmap.as_mut_ptr::<u64>(0);
                 *ptr = VAL;
@@ -1172,7 +1385,7 @@ mod tests {
             }
 
             unsafe {
-                let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
+                let mmap = WINMemMap::new(file.fd(), LENGTH, LENGTH).unwrap();
 
                 let ptr = mmap.as_ptr::<u64>(0);
                 assert_eq!(*ptr, VAL);
@@ -1187,7 +1400,7 @@ mod tests {
             let (dir, file) = new_tmp();
 
             unsafe {
-                let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
+                let mmap = WINMemMap::new(file.fd(), LENGTH, LENGTH).unwrap();
 
                 let ptr = mmap.as_mut_ptr::<u64>(0);
                 *ptr = VAL;
@@ -1208,7 +1421,7 @@ mod tests {
                 };
 
                 let file = File::open(cfg).expect("open FF");
-                let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
+                let mmap = WINMemMap::new(file.fd(), LENGTH, LENGTH).unwrap();
 
                 let ptr = mmap.as_ptr::<u64>(0);
                 assert_eq!(*ptr, VAL);
@@ -1222,7 +1435,7 @@ mod tests {
             const VAL: u64 = 0x0123_4567_89AB_CDEF;
             let (dir, file) = new_tmp();
             unsafe {
-                let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
+                let mmap = WINMemMap::new(file.fd(), LENGTH, LENGTH).unwrap();
                 let ptr = mmap.as_mut_ptr::<u64>(0);
                 *ptr = VAL;
                 mmap.sync(LENGTH).unwrap();
@@ -1240,7 +1453,7 @@ mod tests {
                     sync_interval: None,
                 };
                 let file = File::open(cfg).expect("open FF");
-                let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
+                let mmap = WINMemMap::new(file.fd(), LENGTH, LENGTH).unwrap();
                 let ptr = mmap.as_ptr::<u64>(0);
                 assert_eq!(*ptr, VAL);
                 mmap.unmap().unwrap();
@@ -1254,14 +1467,14 @@ mod tests {
         #[test]
         fn ok_drop_tracks_length() {
             let (_dir, file) = new_tmp();
-            let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
+            let mmap = WINMemMap::new(file.fd(), LENGTH, LENGTH).unwrap();
             assert_eq!(mmap.length(), LENGTH);
         }
 
         #[test]
         fn ok_explicit_unmap_prevents_drop_double_unmap() {
             let (_dir, file) = new_tmp();
-            let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
+            let mmap = WINMemMap::new(file.fd(), LENGTH, LENGTH).unwrap();
             assert!(mmap.unmap().is_ok());
         }
 
@@ -1272,14 +1485,14 @@ mod tests {
 
             unsafe {
                 {
-                    let mmap = WINMemMap::new(file.fd(), LENGTH).unwrap();
+                    let mmap = WINMemMap::new(file.fd(), LENGTH, LENGTH).unwrap();
                     let wptr = mmap.as_mut_ptr::<u64>(0);
                     *wptr = VAL;
                     mmap.sync(LENGTH).unwrap();
                 }
 
                 // Re-open and verify data persisted across drop
-                let mmap2 = WINMemMap::new(file.fd(), LENGTH).unwrap();
+                let mmap2 = WINMemMap::new(file.fd(), LENGTH, LENGTH).unwrap();
                 let rptr = mmap2.as_ptr::<u64>(0);
                 assert_eq!(*rptr, VAL);
                 mmap2.unmap().unwrap();

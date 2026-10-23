@@ -13,6 +13,7 @@
 //!     name: *b"demo",
 //!     version: 1,
 //!     initial_pages: 1,
+//!     max_len: 0x10_0000,
 //!     sync_interval: Some(Duration::from_millis(0x32)),
 //! };
 //!
@@ -157,12 +158,14 @@ pub(in crate::memmap) mod err {
 ///     name: *b"tbfx",
 ///     version: 1,
 ///     initial_pages: 1,
+///     max_len: 0x10_0000,
 ///     sync_interval: Some(Duration::from_millis(0x64)),
 /// };
 ///
 /// assert_eq!(cfg.name, *b"tbfx");
 /// assert_eq!(cfg.version, 1);
 /// assert_eq!(cfg.initial_pages, 1);
+/// assert_eq!(cfg.max_len, 0x10_0000);
 /// assert_eq!(cfg.sync_interval, Some(Duration::from_millis(0x64)));
 /// ```
 #[derive(Debug, Clone)]
@@ -190,6 +193,13 @@ pub struct MemMapCfg {
     ///
     /// Initial file length will be `initial_pages * page_size` (bytes)
     pub initial_pages: usize,
+
+    /// Maximum virtual address space reservation in bytes
+    ///
+    /// Defines the upper boundary of virtual memory reserved upfront for the memory mapping
+    ///
+    /// Must be page-aligned and greater than or equal to `initial_pages * page_size`
+    pub max_len: usize,
 
     /// Optional interval for the background sync thread
     ///
@@ -440,6 +450,7 @@ impl MemMapInner {
 ///     name: *b"stor",
 ///     version: 1,
 ///     initial_pages: 1,
+///     max_len: 0x10_0000,
 ///     sync_interval: Some(Duration::from_millis(0x64)),
 /// };
 ///
@@ -512,13 +523,36 @@ where
             return err::default_error(err::INV).with_module(mid);
         }
 
-        match cfg.initial_pages.checked_mul(page_size.as_usize()) {
-            Some(_) => (),
+        let initial_bytes = match cfg.initial_pages.checked_mul(page_size.as_usize()) {
+            Some(b) => b,
             None => {
                 return err::raw_error(err::INV, "initial_pages calculation overflowed usize")
                     .with_module(mid);
             }
         };
+
+        if cfg.max_len == 0 {
+            return err::default_error(err::INV).with_module(mid);
+        }
+
+        if cfg.max_len % page_size.as_usize() != 0 {
+            return err::raw_error(
+                err::INV,
+                format!("max_len {} must be a multiple of page size {page_size}", cfg.max_len),
+            )
+            .with_module(mid);
+        }
+
+        if cfg.max_len < initial_bytes {
+            return err::raw_error(
+                err::INV,
+                format!(
+                    "max_len {} cannot be less than initial file size {initial_bytes}",
+                    cfg.max_len
+                ),
+            )
+            .with_module(mid);
+        }
 
         Ok(page_size)
     }
@@ -718,6 +752,7 @@ where
     ///     name: *b"demo",
     ///     version: 1,
     ///     initial_pages: 1,
+    ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
     /// };
     ///
@@ -744,7 +779,7 @@ where
             Err(e) => return Err(e),
         };
 
-        let mmap = match PlatformMemMap::new(file.fd(), file.length()) {
+        let mmap = match PlatformMemMap::new(file.fd(), file.length(), cfg.max_len) {
             Ok(m) => m,
             Err(mut e) => {
                 if let Err(del_err) = file.delete() {
@@ -784,6 +819,7 @@ where
     ///     name: *b"demo",
     ///     version: 1,
     ///     initial_pages: 1,
+    ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
     /// };
     ///
@@ -813,7 +849,20 @@ where
         let file_cfg = Self::file_cfg(&cfg, page_size)?;
         let file = File::open(file_cfg)?;
 
-        let mmap = PlatformMemMap::new(file.fd(), file.length()).with_module(cfg.module_id)?;
+        if cfg.max_len < file.length() {
+            return err::raw_error(
+                err::INV,
+                format!(
+                    "max_len {} cannot be less than existing file length {}",
+                    cfg.max_len,
+                    file.length()
+                ),
+            )
+            .with_module(cfg.module_id);
+        }
+
+        let mmap = PlatformMemMap::new(file.fd(), file.length(), cfg.max_len)
+            .with_module(cfg.module_id)?;
         Self::from_components(cfg, mmap, file, page_size)
     }
 
@@ -843,6 +892,7 @@ where
     ///     name: *b"demo",
     ///     version: 1,
     ///     initial_pages: 1,
+    ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
     /// };
     ///
@@ -868,7 +918,20 @@ where
         let file_cfg = Self::file_cfg(&cfg, page_size)?;
         let file = File::open_or_create(file_cfg)?;
 
-        let mmap = PlatformMemMap::new(file.fd(), file.length()).with_module(cfg.module_id)?;
+        if cfg.max_len < file.length() {
+            return err::raw_error(
+                err::INV,
+                format!(
+                    "max_len {} cannot be less than existing file length {}",
+                    cfg.max_len,
+                    file.length()
+                ),
+            )
+            .with_module(cfg.module_id);
+        }
+
+        let mmap = PlatformMemMap::new(file.fd(), file.length(), cfg.max_len)
+            .with_module(cfg.module_id)?;
         Self::from_components(cfg, mmap, file, page_size)
     }
 
@@ -886,6 +949,7 @@ where
     ///     name: *b"tbfx",
     ///     version: 0,
     ///     initial_pages: 1,
+    ///     max_len: 0x10_0000,
     ///     sync_interval: None,
     /// };
     ///
@@ -938,6 +1002,7 @@ where
     ///     name: *b"leng",
     ///     version: 1,
     ///     initial_pages: 1,
+    ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
     /// };
     ///
@@ -986,6 +1051,7 @@ where
     ///     name: *b"grow",
     ///     version: 1,
     ///     initial_pages: 1,
+    ///     max_len: 0x10_0000,
     ///     sync_interval: None,
     /// };
     ///
@@ -1023,16 +1089,6 @@ where
             None => return err::default_error(err::INV).with_module(mid),
         };
 
-        // Halt all read and write ops by taking exclusive write lock on slot_locks
-        let mut slot_locks_guard = self.inner.slot_locks.write().unwrap_or_else(|e| e.into_inner());
-
-        // Halt all sync ops (including background sync worker) by taking exclusive write lock on mmap
-        let mut mmap_guard = self.inner.mmap.write().unwrap_or_else(|e| e.into_inner());
-        let mmap = match mmap_guard.as_ref() {
-            Some(m) => m,
-            None => return err::default_error(err::INV).with_module(mid),
-        };
-
         let curr_len = self.inner.length.load(atomic::Ordering::Acquire);
         let new_length = match curr_len.checked_add(bytes_to_add) {
             Some(len) => len,
@@ -1042,58 +1098,38 @@ where
             }
         };
 
-        // Pre-growth sync: only if needed (curr_epoch > durable_epoch)
-        self.inner.sync_mmap_if_needed(mmap, curr_len)?;
-
-        let old_mmap = match mmap_guard.take() {
-            Some(m) => m,
-            None => return err::default_error(err::INV).with_module(mid),
-        };
-
-        if let Err(e) = old_mmap.unmap().with_module(mid) {
-            if let Ok(restored) = PlatformMemMap::new(file.fd(), curr_len).with_module(mid) {
-                *mmap_guard = Some(restored);
-            }
-
-            return Err(e);
+        if new_length > self.cfg.max_len {
+            return err::raw_error(err::GRW, "file growth exceeds configured max_len")
+                .with_module(mid);
         }
 
-        if let Err(e) = file.grow(additional_slots).with_module(mid) {
-            if let Ok(restored) = PlatformMemMap::new(file.fd(), curr_len).with_module(mid) {
-                *mmap_guard = Some(restored);
-            }
+        // pre-growth sync (only if needed (curr_epoch > durable_epoch))
+        self.inner.sync_internal()?;
 
-            return Err(e);
+        file.grow(additional_slots).with_module(mid)?;
+
+        // sync new file meta to disk for crash safety
+        file.sync().with_module(mid)?;
+
+        {
+            let mut mmap_guard = self.inner.mmap.write().unwrap_or_else(|e| e.into_inner());
+            let mmap = match mmap_guard.as_mut() {
+                Some(m) => m,
+                None => return err::default_error(err::INV).with_module(mid),
+            };
+
+            mmap.grow(file.fd(), curr_len, bytes_to_add).with_module(mid)?;
         }
 
-        // Flush new file metadata to disk for crash safety
-        if let Err(e) = file.sync().with_module(mid) {
-            if let Ok(restored) = PlatformMemMap::new(file.fd(), new_length).with_module(mid) {
-                *mmap_guard = Some(restored);
-                self.inner.length.store(new_length, atomic::Ordering::Release);
-                slot_locks_guard.grow(additional_slots);
-            }
+        {
+            let mut slot_locks_guard =
+                self.inner.slot_locks.write().unwrap_or_else(|e| e.into_inner());
 
-            return Err(e);
+            slot_locks_guard.grow(additional_slots);
+            self.inner.length.store(new_length, atomic::Ordering::Release);
         }
 
-        let new_mmap = match PlatformMemMap::new(file.fd(), new_length).with_module(mid) {
-            Ok(m) => m,
-            Err(e) => {
-                if let Ok(restored) = PlatformMemMap::new(file.fd(), curr_len).with_module(mid) {
-                    *mmap_guard = Some(restored);
-                }
-
-                return Err(e);
-            }
-        };
-
-        *mmap_guard = Some(new_mmap);
-        slot_locks_guard.grow(additional_slots);
-
-        self.inner.length.store(new_length, atomic::Ordering::Release);
         self.inner.completion.increment_current_epoch();
-
         Ok(())
     }
 
@@ -1112,6 +1148,7 @@ where
     ///     name: *b"cfgt",
     ///     version: 2,
     ///     initial_pages: 1,
+    ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
     /// };
     ///
@@ -1142,6 +1179,7 @@ where
     ///     name: *b"epch",
     ///     version: 1,
     ///     initial_pages: 1,
+    ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
     /// };
     ///
@@ -1171,6 +1209,7 @@ where
     ///     name: *b"durp",
     ///     version: 1,
     ///     initial_pages: 1,
+    ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
     /// };
     ///
@@ -1206,6 +1245,7 @@ where
     ///     name: *b"sync",
     ///     version: 1,
     ///     initial_pages: 1,
+    ///     max_len: 0x10_0000,
     ///     sync_interval: None,
     /// };
     ///
@@ -1248,6 +1288,7 @@ where
     ///     name: *b"read",
     ///     version: 1,
     ///     initial_pages: 1,
+    ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
     /// };
     ///
@@ -1329,6 +1370,7 @@ where
     ///     name: *b"rdex",
     ///     version: 1,
     ///     initial_pages: 1,
+    ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
     /// };
     ///
@@ -1438,6 +1480,7 @@ where
     ///     name: *b"writ",
     ///     version: 1,
     ///     initial_pages: 1,
+    ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
     /// };
     ///
@@ -1528,6 +1571,7 @@ where
     ///     name: *b"wrex",
     ///     version: 1,
     ///     initial_pages: 1,
+    ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
     /// };
     ///
@@ -1651,6 +1695,7 @@ where
     ///     name: *b"delt",
     ///     version: 1,
     ///     initial_pages: 1,
+    ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
     /// };
     ///
@@ -1733,6 +1778,7 @@ where
     ///     name: *b"casd",
     ///     version: 1,
     ///     initial_pages: 1,
+    ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
     /// };
     ///
@@ -1834,6 +1880,7 @@ where
     ///     name: *b"txde",
     ///     version: 1,
     ///     initial_pages: 1,
+    ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
     /// };
     ///
@@ -1876,6 +1923,7 @@ where
 ///     name: *b"txst",
 ///     version: 1,
 ///     initial_pages: 1,
+///     max_len: 0x10_0000,
 ///     sync_interval: Some(Duration::from_millis(0x64)),
 /// };
 ///
@@ -1920,6 +1968,7 @@ where
     ///     name: *b"txwr",
     ///     version: 1,
     ///     initial_pages: 1,
+    ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
     /// };
     ///
@@ -1985,6 +2034,7 @@ where
     ///     name: *b"txcm",
     ///     version: 1,
     ///     initial_pages: 1,
+    ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
     /// };
     ///
@@ -2090,6 +2140,7 @@ where
     ///     name: *b"txln",
     ///     version: 1,
     ///     initial_pages: 1,
+    ///     max_len: 0x10_0000,
     ///     sync_interval: None,
     /// };
     ///
@@ -2120,6 +2171,7 @@ where
     ///     name: *b"txmt",
     ///     version: 1,
     ///     initial_pages: 1,
+    ///     max_len: 0x10_0000,
     ///     sync_interval: None,
     /// };
     ///
@@ -2211,6 +2263,7 @@ mod tests {
             name: *b"tbfx",
             version: 1,
             initial_pages: INIT_PAGES,
+            max_len: 0x10_0000,
             sync_interval: Some(Duration::from_millis(0x64)),
         };
 
@@ -2242,6 +2295,41 @@ mod tests {
         let mut overflow_cfg = cfg.clone();
         overflow_cfg.initial_pages = usize::MAX;
         assert_eq!(MemMap::<u64>::validate_t(&overflow_cfg).unwrap_err().reason, err::INV.reason);
+
+        let mut zero_max_len = cfg.clone();
+        zero_max_len.max_len = 0;
+        assert_eq!(MemMap::<u64>::validate_t(&zero_max_len).unwrap_err().reason, err::INV.reason);
+
+        let page_size = MemMap::<u64>::page_size().unwrap().as_usize();
+        let mut unaligned_max_len = cfg.clone();
+        unaligned_max_len.max_len = page_size + 1;
+        assert_eq!(
+            MemMap::<u64>::validate_t(&unaligned_max_len).unwrap_err().reason,
+            err::INV.reason
+        );
+
+        let mut small_max_len = cfg.clone();
+        small_max_len.initial_pages = 2;
+        small_max_len.max_len = page_size;
+        assert_eq!(MemMap::<u64>::validate_t(&small_max_len).unwrap_err().reason, err::INV.reason);
+    }
+
+    #[test]
+    fn err_open_when_max_len_less_than_existing_file() {
+        let (_dir, mut cfg) = tmp_cfg();
+        let page_size = MemMap::<u64>::page_size().unwrap().as_usize();
+        cfg.initial_pages = 2;
+        cfg.max_len = 4 * page_size;
+
+        let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
+        assert_eq!(mmap.length(), 2 * page_size);
+        drop(mmap);
+
+        let mut open_cfg = cfg.clone();
+        open_cfg.initial_pages = 1;
+        open_cfg.max_len = page_size;
+        let err = MemMap::<u64>::open(open_cfg).unwrap_err();
+        assert_eq!(err.reason, err::INV.reason);
     }
 
     #[test]
@@ -2312,6 +2400,7 @@ mod tests {
             name: *b"tbfx",
             version: 1,
             initial_pages: INIT_PAGES,
+            max_len: 0x10_0000,
             sync_interval: Some(Duration::from_millis(0x64)),
         };
 
@@ -2337,6 +2426,7 @@ mod tests {
             name: *b"tbfx",
             version: 1,
             initial_pages: INIT_PAGES,
+            max_len: 0x10_0000,
             sync_interval: Some(Duration::from_millis(0x64)),
         };
 
@@ -2358,6 +2448,7 @@ mod tests {
             name: *b"tbfx",
             version: 1,
             initial_pages: INIT_PAGES,
+            max_len: 0x10_0000,
             sync_interval: Some(Duration::from_millis(0x64)),
         };
 
@@ -2382,6 +2473,7 @@ mod tests {
                 name: tag,
                 version: 1,
                 initial_pages: INIT_PAGES,
+                max_len: 0x10_0000,
                 sync_interval: Some(Duration::from_millis(0x64)),
             };
 
@@ -2417,6 +2509,7 @@ mod tests {
             name: *b"tbfx",
             version: 0,
             initial_pages: 1,
+            max_len: 0x10_0000,
             sync_interval: Some(Duration::from_millis(0x64)),
         };
         assert_eq!(cfg.versioned_path(), dir.join("tbfx_0"));
@@ -2427,6 +2520,7 @@ mod tests {
             name: *b"DATA",
             version: 5,
             initial_pages: 1,
+            max_len: 0x10_0000,
             sync_interval: Some(Duration::from_millis(0x64)),
         };
         assert_eq!(cfg.versioned_path(), dir.join("DATA_5"));
@@ -2442,6 +2536,7 @@ mod tests {
             name: *b"tbfx",
             version: 1,
             initial_pages: 1,
+            max_len: 0x10_0000,
             sync_interval: Some(Duration::from_millis(0x64)),
         };
         assert_eq!(cfg_v1.versioned_path(), dir.path().join("tbfx_1"));
@@ -2452,6 +2547,7 @@ mod tests {
             name: *b"tbfx",
             version: 2,
             initial_pages: 1,
+            max_len: 0x10_0000,
             sync_interval: Some(Duration::from_millis(0x64)),
         };
         assert_eq!(cfg_v2.versioned_path(), dir.path().join("tbfx_2"));
@@ -3872,6 +3968,53 @@ mod tests {
             grower_handle.join().unwrap();
 
             assert_eq!(mmap.length(), initial_len + 6 * page_size);
+        }
+
+        #[test]
+        fn err_grow_exceeds_max_len() {
+            let (_dir, mut cfg) = tmp_cfg();
+            let page_size = MemMap::<u64>::page_size().unwrap().as_usize();
+            cfg.initial_pages = 1;
+            cfg.max_len = 2 * page_size;
+
+            let mmap = MemMap::<u64>::new(cfg).unwrap();
+            let err = mmap.grow(2).unwrap_err();
+            assert_eq!(err.reason, err::GRW.reason);
+        }
+
+        #[test]
+        fn ok_grow_up_to_max_len() {
+            let (_dir, mut cfg) = tmp_cfg();
+            let page_size = MemMap::<u64>::page_size().unwrap().as_usize();
+            cfg.initial_pages = 1;
+            cfg.max_len = 3 * page_size;
+
+            let mmap = MemMap::<u64>::new(cfg).unwrap();
+            mmap.grow(2).unwrap();
+            assert_eq!(mmap.length(), 3 * page_size);
+        }
+
+        #[test]
+        fn ok_grow_in_place_preserves_base_ptr() {
+            let (_dir, mut cfg) = tmp_cfg();
+            let page_size = MemMap::<u64>::page_size().unwrap().as_usize();
+            cfg.initial_pages = 1;
+            cfg.max_len = 4 * page_size;
+
+            let mmap = MemMap::<u64>::new(cfg).unwrap();
+            mmap.write(0, |v| *v = 0xAA_BBu64).unwrap();
+
+            let base_ptr_before = mmap.read(0, |v| v as *const u64).unwrap();
+
+            mmap.grow(2).unwrap();
+
+            let base_ptr_after = mmap.read(0, |v| v as *const u64).unwrap();
+            assert_eq!(base_ptr_before, base_ptr_after);
+            assert_eq!(mmap.read(0, |v| *v).unwrap(), 0xAA_BBu64);
+
+            let new_slot = (page_size / core::mem::size_of::<u64>()) + 1;
+            mmap.write(new_slot, |v| *v = 0xCC_DDu64).unwrap();
+            assert_eq!(mmap.read(new_slot, |v| *v).unwrap(), 0xCC_DDu64);
         }
     }
 

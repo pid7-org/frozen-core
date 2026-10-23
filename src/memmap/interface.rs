@@ -8,10 +8,16 @@ pub(in crate::memmap) trait MemMapInterface: Sized + Send + Sync {
     /// Associated type for the underlying operating system file descriptor or kernel handle
     type Id: Copy + Eq + PartialEq + core::fmt::Debug + Send + Sync;
 
-    /// Create a new memory mapping by mapping `length` bytes of the file represented by `id`
+    /// Create a new memory mapping by reserving `max_len` virtual address space and mapping
+    /// `length` bytes of the file represented by `id`
     ///
     /// Maps memory from offset 0 with read and write permissions in shared mode
-    fn new(id: Self::Id, length: usize) -> FrozenResult<Self>;
+    fn new(id: Self::Id, length: usize, max_len: usize) -> FrozenResult<Self>;
+
+    /// In-place expansion of the memory mapping over a newly extended file range
+    ///
+    /// Maps `added_len` bytes at `base_ptr + curr_len` from file `id` at offset `curr_len`
+    fn grow(&mut self, id: Self::Id, curr_len: usize, added_len: usize) -> FrozenResult<()>;
 
     /// Unmap memory mapping to explicitly release mapped resources
     ///
@@ -20,8 +26,12 @@ pub(in crate::memmap) trait MemMapInterface: Sized + Send + Sync {
     /// Clears internal state so subsequent [`Drop`] execution becomes a safe no-op
     fn unmap(self) -> FrozenResult<()>;
 
-    /// Returns the length of the memory mapping in bytes
+    /// Returns the active length of the memory mapping in bytes
     fn length(&self) -> usize;
+
+    /// Returns the maximum reserved virtual length of the memory mapping in bytes
+    #[allow(unused)]
+    fn max_len(&self) -> usize;
 
     /// Returns the system memory page size queried from kernel settings
     fn page_size() -> FrozenResult<PageSize>;
