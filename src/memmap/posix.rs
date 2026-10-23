@@ -1133,7 +1133,7 @@ mod tests {
 
         #[test]
         fn ok_write_read_at_boundary() {
-            const VAL: u64 = 0xFEEDFACECAFEBEEF;
+            const VAL: u64 = 0xFEEDFACECAFEC0DE;
             const OFFSET: usize = LENGTH - std::mem::size_of::<u64>();
             let (_dir, file) = new_tmp();
 
@@ -1327,7 +1327,7 @@ mod tests {
 
         #[test]
         fn ok_drop_persists_written_data() {
-            const VAL: u64 = 0xCAFEBABE_DEADBEEF;
+            const VAL: u64 = 0xCAFEBABE_DEADC0DE;
             let (_dir, file) = new_tmp();
 
             unsafe {
