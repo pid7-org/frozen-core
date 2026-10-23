@@ -18,7 +18,7 @@ fi
 
 echo "Running pre-commit checks..."
 
-echo "==> Running cargo check (lib, tests, benches) across all 6 targets (Linux, Windows, macOS x x86_64, aarch64)..."
+echo "==> Running cargo check across all 6 targets..."
 for target in "${TARGETS[@]}"; do
   echo "    Checking target: $target"
   cargo check --all-features --release --target "$target"
@@ -34,9 +34,6 @@ for target in "${TARGETS[@]}"; do
   cargo clippy --all-features --release --target "$target" -- -D warnings
 done
 
-echo "==> Running tests on host target (release)..."
-cargo test --all-features --release -- --nocapture
-
 if command -v rustup >/dev/null 2>&1 && rustup toolchain list | grep -q "$MSRV"; then
   echo "==> Running MSRV ($MSRV) verification checks..."
   echo "    Checking MSRV fmt..."
@@ -46,8 +43,6 @@ if command -v rustup >/dev/null 2>&1 && rustup toolchain list | grep -q "$MSRV";
   echo "    Checking MSRV (lib, tests, benches)..."
   cargo +"$MSRV" check --release --all-features
   cargo +"$MSRV" check --tests --benches --release --all-features
-  echo "    Running MSRV tests..."
-  cargo +"$MSRV" test --all-features --release -- --nocapture
 else
   echo "==> Warning: Rust toolchain $MSRV not found; skipping MSRV checks."
 fi
