@@ -20,21 +20,23 @@ use crate::{
 /// ```
 /// use frozen_core::memmap::PageSize;
 ///
-/// let ps = PageSize::try_from(4096).unwrap();
+/// let ps = PageSize::try_from(0x1000).unwrap();
 /// assert_eq!(ps, PageSize::K4);
-/// assert_eq!(ps.as_usize(), 4096);
-/// assert_eq!(ps.as_u32(), 4096);
+/// assert_eq!(ps.as_usize(), 0x1000);
+/// assert_eq!(ps.as_u32(), 0x1000);
 /// assert!(ps.is_power_of_two());
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(usize)]
 pub enum PageSize {
     /// 4 KiB (4,096 bytes) - Standard x86_64, Windows, and default Linux AArch64
-    K4 = 4096,
+    K4 = 0x1000,
+
     /// 16 KiB (16,384 bytes) - Native Apple Silicon macOS and 16k Linux kernels
-    K16 = 16384,
+    K16 = 0x4000,
+
     /// 64 KiB (65,536 bytes) - Enterprise Linux AArch64 (RHEL, CentOS, Amazon Linux)
-    K64 = 65536,
+    K64 = 0x10000,
 }
 
 impl PageSize {
@@ -126,9 +128,9 @@ impl TryFrom<usize> for PageSize {
 
     fn try_from(size: usize) -> Result<Self, Self::Error> {
         match size {
-            4096 => Ok(Self::K4),
-            16384 => Ok(Self::K16),
-            65536 => Ok(Self::K64),
+            0x1000 => Ok(Self::K4),
+            0x4000 => Ok(Self::K16),
+            0x10000 => Ok(Self::K64),
             other => err::raw_error(err::INV, format!("unsupported page size: {other}")),
         }
     }
@@ -140,21 +142,21 @@ mod tests {
 
     #[test]
     fn ok_page_size_conversions() {
-        assert_eq!(PageSize::K4.as_usize(), 4096);
-        assert_eq!(PageSize::K16.as_usize(), 16384);
-        assert_eq!(PageSize::K64.as_usize(), 65536);
+        assert_eq!(PageSize::K4.as_usize(), 0x1000);
+        assert_eq!(PageSize::K16.as_usize(), 0x4000);
+        assert_eq!(PageSize::K64.as_usize(), 0x10000);
 
-        assert_eq!(PageSize::K4.as_u32(), 4096);
-        assert_eq!(PageSize::K16.as_u32(), 16384);
-        assert_eq!(PageSize::K64.as_u32(), 65536);
+        assert_eq!(PageSize::K4.as_u32(), 0x1000);
+        assert_eq!(PageSize::K16.as_u32(), 0x4000);
+        assert_eq!(PageSize::K64.as_u32(), 0x10000);
 
-        assert_eq!(usize::from(PageSize::K4), 4096);
-        assert_eq!(u32::from(PageSize::K16), 16384);
-        assert_eq!(u64::from(PageSize::K64), 65536);
+        assert_eq!(usize::from(PageSize::K4), 0x1000);
+        assert_eq!(u32::from(PageSize::K16), 0x4000);
+        assert_eq!(u64::from(PageSize::K64), 0x10000);
 
-        assert_eq!(PageSize::try_from(4096).unwrap(), PageSize::K4);
-        assert_eq!(PageSize::try_from(16384).unwrap(), PageSize::K16);
-        assert_eq!(PageSize::try_from(65536).unwrap(), PageSize::K64);
+        assert_eq!(PageSize::try_from(0x1000).unwrap(), PageSize::K4);
+        assert_eq!(PageSize::try_from(0x4000).unwrap(), PageSize::K16);
+        assert_eq!(PageSize::try_from(0x10000).unwrap(), PageSize::K64);
 
         assert_eq!(format!("{}", PageSize::K4), "4096");
         assert_eq!(format!("{}", PageSize::K16), "16384");
@@ -167,13 +169,13 @@ mod tests {
 
     #[test]
     fn err_page_size_invalid_values() {
-        assert!(PageSize::try_from(0).is_err());
-        assert!(PageSize::try_from(1024).is_err());
-        assert!(PageSize::try_from(2048).is_err());
-        assert!(PageSize::try_from(5000).is_err());
-        assert!(PageSize::try_from(8192).is_err());
-        assert!(PageSize::try_from(32768).is_err());
-        assert!(PageSize::try_from(131072).is_err());
+        assert!(PageSize::try_from(0x0).is_err());
+        assert!(PageSize::try_from(0x400).is_err());
+        assert!(PageSize::try_from(0x800).is_err());
+        assert!(PageSize::try_from(0x1388).is_err());
+        assert!(PageSize::try_from(0x2000).is_err());
+        assert!(PageSize::try_from(0x8000).is_err());
+        assert!(PageSize::try_from(0x20000).is_err());
     }
 
     #[test]
