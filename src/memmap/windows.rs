@@ -326,14 +326,34 @@ impl MemMapInterface for WINMemMap {
 
     /// Syncs in-cache data updates on the storage device
     ///
-    /// ## Durability
+    /// ## POSIX vs Windows difference
     ///
-    /// In Windows systems `FlushViewOfFile` pushes dirty pages to the filesystem cache
+    /// On POSIX, `msync(2)` accepts arbitrary contiguous virtual ranges regardless of how many
+    /// times `mmap(2)` was invoked; on Windows, `FlushViewOfFile` strictly requires the target
+    /// range to reside entirely within a single mapped view
+    ///
+    /// Crossing view boundaries causes Win32 to fail with `ERROR_INVALID_ADDRESS` (`0x1E7` / 487);
+    /// we therefore iterate over each slice in `self.views` and flush them individually
     ///
     /// For strong durability, use of [`File::sync`](crate::file::File::sync) (`FlushFileBuffers`)
     /// is required right after calling [`WINMemMap::sync`]
     fn sync(&self, length: usize) -> FrozenResult<()> {
-        msync_raw(self.ptr, length)
+        if hints::unlikely(length == 0 || self.ptr.is_null()) {
+            return Ok(());
+        }
+
+        let mut remaining = length;
+        for &(view_ptr, view_len) in &self.views {
+            if remaining == 0 {
+                break;
+            }
+
+            let flush_len = remaining.min(view_len);
+            msync_raw(view_ptr, flush_len)?;
+            remaining -= flush_len;
+        }
+
+        Ok(())
     }
 
     /// Get a mutable (read/write) typed pointer to `T` at given `offset`
