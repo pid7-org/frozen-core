@@ -9,9 +9,9 @@ use crate::{error::FrozenResult, hints};
 use core::ptr;
 use libc::{
     _SC_PAGESIZE, EACCES, EAGAIN, EBADF, EBUSY, EINTR, EINVAL, EIO, ENODEV, ENOMEM, EOVERFLOW,
-    EPERM, ETXTBSY, MADV_DONTNEED, MAP_ANON, MAP_FAILED, MAP_FIXED, MAP_NORESERVE, MAP_PRIVATE,
-    MAP_SHARED, MS_SYNC, PROT_NONE, PROT_READ, PROT_WRITE, c_int, c_void, madvise, mincore, mmap,
-    msync, munmap, off_t, size_t, sysconf,
+    EPERM, ETXTBSY, MADV_DONTNEED, MADV_SEQUENTIAL, MADV_WILLNEED, MAP_ANON, MAP_FAILED, MAP_FIXED,
+    MAP_NORESERVE, MAP_PRIVATE, MAP_SHARED, MS_SYNC, PROT_NONE, PROT_READ, PROT_WRITE, c_int,
+    c_void, madvise, mincore, mmap, msync, munmap, off_t, size_t, sysconf,
 };
 
 /// File descriptor type for POSIX systems
@@ -253,6 +253,45 @@ impl MemMapInterface for POSIXMemMap {
     #[inline]
     fn apply_memory_priority_hint() -> FrozenResult<()> {
         Ok(())
+    }
+
+    /// Advises the kernel that the mapped memory range from `offset` for `length` bytes will be
+    /// accessed sequentially
+    fn advise_sequential(&self, offset: usize, length: usize) -> FrozenResult<()> {
+        if hints::unlikely(length == 0 || self.ptr.is_null()) {
+            return Ok(());
+        }
+
+        if offset.checked_add(length).is_none_or(|end| end > self.length) {
+            return raw_error(err::HCF, "range out of bounds for memory mapping");
+        }
+
+        let page_size = Self::page_size()?.as_usize();
+        let start_offset = offset - (offset % page_size);
+        let end_offset = (offset + length).div_ceil(page_size) * page_size;
+        let target_len = (self.length - start_offset).min(end_offset - start_offset);
+        let target_ptr = unsafe { self.ptr.add(start_offset) as *mut c_void };
+
+        madvise_raw_with_advice(target_ptr, target_len, MADV_SEQUENTIAL)
+    }
+
+    /// Prefetches the specified virtual memory range into physical memory (RAM) asynchronously
+    fn prefetch(&self, offset: usize, length: usize) -> FrozenResult<()> {
+        if hints::unlikely(length == 0 || self.ptr.is_null()) {
+            return Ok(());
+        }
+
+        if offset.checked_add(length).is_none_or(|end| end > self.length) {
+            return raw_error(err::HCF, "range out of bounds for memory mapping");
+        }
+
+        let page_size = Self::page_size()?.as_usize();
+        let start_offset = offset - (offset % page_size);
+        let end_offset = (offset + length).div_ceil(page_size) * page_size;
+        let target_len = (self.length - start_offset).min(end_offset - start_offset);
+        let target_ptr = unsafe { self.ptr.add(start_offset) as *mut c_void };
+
+        madvise_raw_with_advice(target_ptr, target_len, MADV_WILLNEED)
     }
 
     /// Syncs in-cache data updates on the storage device
@@ -544,9 +583,9 @@ fn msync_raw(ptr: TPtr, length: size_t) -> FrozenResult<()> {
     }
 }
 
-/// Advises the kernel to discard/evict mapped pages w/ `madvise(MADV_DONTNEED)`
+/// Advises the kernel regarding mapped pages w/ specified advice
 #[allow(unused)]
-fn madvise_raw(ptr: *mut c_void, length: size_t) -> FrozenResult<()> {
+fn madvise_raw_with_advice(ptr: *mut c_void, length: size_t, advice: c_int) -> FrozenResult<()> {
     if hints::unlikely(ptr.is_null()) {
         return raw_error(err::NMM, "cannot advise unmapped null pointer");
     }
@@ -558,7 +597,7 @@ fn madvise_raw(ptr: *mut c_void, length: size_t) -> FrozenResult<()> {
 
     let mut retries = 0;
     loop {
-        let res = unsafe { madvise(ptr, length, MADV_DONTNEED) };
+        let res = unsafe { madvise(ptr, length, advice) };
         if hints::likely(res == 0) {
             return Ok(());
         }
@@ -583,6 +622,13 @@ fn madvise_raw(ptr: *mut c_void, length: size_t) -> FrozenResult<()> {
             _ => return raw_error(err::UNK, err_msg),
         }
     }
+}
+
+/// Advises the kernel to discard/evict mapped pages w/ `madvise(MADV_DONTNEED)`
+#[allow(unused)]
+#[inline]
+fn madvise_raw(ptr: *mut c_void, length: size_t) -> FrozenResult<()> {
+    madvise_raw_with_advice(ptr, length, MADV_DONTNEED)
 }
 
 /// Fetch the last thread-local `errno` value for the current target OS
@@ -625,6 +671,7 @@ mod tests {
             buffer_size: BUFFER_SIZE,
             initial_available_buffers: INIT_BUFFERS,
             sync_interval: None,
+            sequential_access_hint: false,
         })
         .expect("new FF");
 
@@ -710,6 +757,7 @@ mod tests {
                 buffer_size: BUFFER_SIZE,
                 initial_available_buffers: total_len / BUFFER_SIZE,
                 sync_interval: None,
+                sequential_access_hint: false,
             })
             .expect("new paged file");
 
@@ -806,6 +854,7 @@ mod tests {
                 buffer_size: BUFFER_SIZE,
                 initial_available_buffers: total_len / BUFFER_SIZE,
                 sync_interval: None,
+                sequential_access_hint: false,
             })
             .expect("new paged file");
 
@@ -971,6 +1020,26 @@ mod tests {
 
             let mmap = POSIXMemMap::new(file.fd(), LENGTH, LENGTH).unwrap();
             assert!(mmap.unmap().is_ok());
+        }
+
+        #[test]
+        fn ok_advise_sequential_and_prefetch() {
+            let (_dir, file) = new_tmp();
+            let mmap = POSIXMemMap::new(file.fd(), LENGTH, LENGTH).unwrap();
+
+            assert!(mmap.advise_sequential(0, 0).is_ok());
+            assert!(mmap.prefetch(0, 0).is_ok());
+            assert!(mmap.advise_sequential(0, LENGTH).is_ok());
+            assert!(mmap.prefetch(0, LENGTH).is_ok());
+            assert!(mmap.advise_sequential(0, BUFFER_SIZE).is_ok());
+            assert!(mmap.prefetch(BUFFER_SIZE, BUFFER_SIZE).is_ok());
+
+            let err_seq = mmap.advise_sequential(0, LENGTH + 1).unwrap_err();
+            assert_eq!(err_seq.reason, err::HCF.reason);
+            let err_pref = mmap.prefetch(LENGTH, 1).unwrap_err();
+            assert_eq!(err_pref.reason, err::HCF.reason);
+
+            mmap.unmap().unwrap();
         }
 
         #[test]
@@ -1272,6 +1341,7 @@ mod tests {
                     buffer_size: BUFFER_SIZE,
                     initial_available_buffers: INIT_BUFFERS,
                     sync_interval: None,
+                    sequential_access_hint: false,
                 };
 
                 let file = File::open(cfg).expect("open FF");
@@ -1304,6 +1374,7 @@ mod tests {
                     buffer_size: BUFFER_SIZE,
                     initial_available_buffers: INIT_BUFFERS,
                     sync_interval: None,
+                    sequential_access_hint: false,
                 };
                 let file = File::open(cfg).expect("open FF");
                 let mmap = POSIXMemMap::new(file.fd(), LENGTH, LENGTH).unwrap();

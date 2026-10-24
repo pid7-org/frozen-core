@@ -18,7 +18,8 @@ use windows_sys::Win32::{
             CreateFileMappingW, FlushViewOfFile, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE,
             MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER,
             MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3, PAGE_NOACCESS, PAGE_READWRITE,
-            UnmapViewOfFile, VirtualAlloc2, VirtualFreeEx, VirtualUnlock,
+            PrefetchVirtualMemory, UnmapViewOfFile, VirtualAlloc2, VirtualFreeEx, VirtualUnlock,
+            WIN32_MEMORY_RANGE_ENTRY,
         },
         ProcessStatus::{
             K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_BLOCK, PSAPI_WORKING_SET_EX_INFORMATION,
@@ -334,6 +335,59 @@ impl MemMapInterface for WINMemMap {
     #[inline]
     fn apply_memory_priority_hint() -> FrozenResult<()> {
         set_memory_priority_raw()
+    }
+
+    /// Advises the kernel that the mapped memory range from `offset` for `length` bytes will be
+    /// accessed sequentially
+    ///
+    /// Windows configures sequential read-ahead through `FILE_FLAG_SEQUENTIAL_SCAN` on the file
+    /// handle; this method prefetches virtual memory into physical RAM where applicable
+    fn advise_sequential(&self, offset: usize, length: usize) -> FrozenResult<()> {
+        if hints::unlikely(length == 0 || self.ptr.is_null()) {
+            return Ok(());
+        }
+
+        if offset.checked_add(length).is_none_or(|end| end > self.length) {
+            return raw_error(err::HCF, "range out of bounds for memory mapping");
+        }
+
+        self.prefetch(offset, length)
+    }
+
+    /// Prefetches the specified virtual memory range into physical memory (RAM) asynchronously
+    fn prefetch(&self, offset: usize, length: usize) -> FrozenResult<()> {
+        if hints::unlikely(length == 0 || self.ptr.is_null()) {
+            return Ok(());
+        }
+
+        if offset.checked_add(length).is_none_or(|end| end > self.length) {
+            return raw_error(err::HCF, "range out of bounds for memory mapping");
+        }
+
+        let mut entries = Vec::new();
+        let mut curr_view_offset = 0;
+        let req_end = offset + length;
+
+        for &(view_ptr, view_len) in &self.views {
+            let view_start = curr_view_offset;
+            let view_end = curr_view_offset + view_len;
+
+            if req_end > view_start && offset < view_end {
+                let overlap_start = offset.max(view_start);
+                let overlap_end = req_end.min(view_end);
+                let rel_offset = overlap_start - view_start;
+                let rel_len = overlap_end - overlap_start;
+
+                entries.push(WIN32_MEMORY_RANGE_ENTRY {
+                    VirtualAddress: unsafe { view_ptr.add(rel_offset) as *mut _ },
+                    NumberOfBytes: rel_len,
+                });
+            }
+
+            curr_view_offset = view_end;
+        }
+
+        prefetch_raw(&entries)
     }
 
     /// Syncs in-cache data updates on the storage device
@@ -806,6 +860,29 @@ fn set_memory_priority_raw() -> FrozenResult<()> {
     }
 }
 
+/// Prefetch virtual memory pages asynchronously via `PrefetchVirtualMemory`
+fn prefetch_raw(entries: &[WIN32_MEMORY_RANGE_ENTRY]) -> FrozenResult<()> {
+    if hints::unlikely(entries.is_empty()) {
+        return Ok(());
+    }
+
+    let ok =
+        unsafe { PrefetchVirtualMemory(GetCurrentProcess(), entries.len(), entries.as_ptr(), 0) };
+
+    if hints::likely(ok != 0) {
+        return Ok(());
+    }
+
+    let code = last_error();
+    let msg = err_msg(code);
+
+    match code {
+        ERROR_ACCESS_DENIED => raw_error(err::PRM, msg),
+        ERROR_INVALID_PARAMETER => raw_error(err::HCF, msg),
+        _ => raw_error(err::UNK, msg),
+    }
+}
+
 /// Query active memory priority for calling process via `GetProcessInformation`
 #[cfg(test)]
 fn get_memory_priority_raw() -> FrozenResult<u32> {
@@ -895,6 +972,7 @@ mod tests {
             buffer_size: BUFFER_SIZE,
             initial_available_buffers: INIT_BUFFERS,
             sync_interval: None,
+            sequential_access_hint: false,
         })
         .expect("new FF");
 
@@ -1023,6 +1101,7 @@ mod tests {
                 buffer_size: BUFFER_SIZE,
                 initial_available_buffers: total_len / BUFFER_SIZE,
                 sync_interval: None,
+                sequential_access_hint: false,
             })
             .expect("new paged file");
 
@@ -1118,6 +1197,7 @@ mod tests {
                 buffer_size: BUFFER_SIZE,
                 initial_available_buffers: total_len / BUFFER_SIZE,
                 sync_interval: None,
+                sequential_access_hint: false,
             })
             .expect("new paged file");
 
@@ -1266,6 +1346,26 @@ mod tests {
 
             let mmap = WINMemMap::new(file.fd(), LENGTH, LENGTH).unwrap();
             assert!(mmap.unmap().is_ok());
+        }
+
+        #[test]
+        fn ok_advise_sequential_and_prefetch() {
+            let (_dir, file) = new_tmp();
+            let mmap = WINMemMap::new(file.fd(), LENGTH, LENGTH).unwrap();
+
+            assert!(mmap.advise_sequential(0, 0).is_ok());
+            assert!(mmap.prefetch(0, 0).is_ok());
+            assert!(mmap.advise_sequential(0, LENGTH).is_ok());
+            assert!(mmap.prefetch(0, LENGTH).is_ok());
+            assert!(mmap.advise_sequential(0, BUFFER_SIZE).is_ok());
+            assert!(mmap.prefetch(BUFFER_SIZE, BUFFER_SIZE).is_ok());
+
+            let err_seq = mmap.advise_sequential(0, LENGTH + 1).unwrap_err();
+            assert_eq!(err_seq.reason, err::HCF.reason);
+            let err_pref = mmap.prefetch(LENGTH, 1).unwrap_err();
+            assert_eq!(err_pref.reason, err::HCF.reason);
+
+            mmap.unmap().unwrap();
         }
 
         #[test]
@@ -1589,6 +1689,7 @@ mod tests {
                     buffer_size: BUFFER_SIZE,
                     initial_available_buffers: INIT_BUFFERS,
                     sync_interval: None,
+                    sequential_access_hint: false,
                 };
 
                 let file = File::open(cfg).expect("open FF");
@@ -1622,6 +1723,7 @@ mod tests {
                     buffer_size: BUFFER_SIZE,
                     initial_available_buffers: INIT_BUFFERS,
                     sync_interval: None,
+                    sequential_access_hint: false,
                 };
                 let file = File::open(cfg).expect("open FF");
                 let mmap = WINMemMap::new(file.fd(), LENGTH, LENGTH).unwrap();

@@ -69,6 +69,22 @@ pub(in crate::memmap) trait MemMapInterface: Sized + Send + Sync {
     /// On POSIX systems, this operation is a safe no-op
     fn apply_memory_priority_hint() -> FrozenResult<()>;
 
+    /// Advises the kernel that the mapped range from `offset` for `length` bytes will be accessed
+    /// sequentially
+    ///
+    /// On POSIX systems, invokes `madvise(2)` w/ `MADV_SEQUENTIAL`
+    ///
+    /// On Windows, leverages `PrefetchVirtualMemory` where applicable; file handle caching is
+    /// governed by `FILE_FLAG_SEQUENTIAL_SCAN`
+    fn advise_sequential(&self, offset: usize, length: usize) -> FrozenResult<()>;
+
+    /// Prefetches the specified virtual memory range into physical memory (RAM) asynchronously
+    ///
+    /// On POSIX systems, invokes `madvise(2)` w/ `MADV_WILLNEED`
+    ///
+    /// On Windows, invokes `PrefetchVirtualMemory` across intersecting mapped views
+    fn prefetch(&self, offset: usize, length: usize) -> FrozenResult<()>;
+
     /// Syncs in-cache data updates on the storage device
     ///
     /// Flushes dirty pages from the memory mapping cache to storage writeback

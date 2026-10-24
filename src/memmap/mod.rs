@@ -16,6 +16,7 @@
 //!     max_len: 0x10_0000,
 //!     sync_interval: Some(Duration::from_millis(0x32)),
 //!     memory_priority_hint: false,
+//!     sequential_access_hint: false,
 //! };
 //!
 //! let memmap = MemMap::<u64>::new(cfg).unwrap();
@@ -175,6 +176,7 @@ pub(in crate::memmap) mod err {
 ///     max_len: 0x10_0000,
 ///     sync_interval: Some(Duration::from_millis(0x64)),
 ///     memory_priority_hint: false,
+///     sequential_access_hint: false,
 /// };
 ///
 /// assert_eq!(cfg.name, *b"tbfx");
@@ -229,6 +231,14 @@ pub struct MemMapCfg {
     /// When set to `true`, [`MemMap::new`], [`MemMap::open`], and [`MemMap::open_or_create`]
     /// invoke the hint on a best-effort basis during initialization
     pub memory_priority_hint: bool,
+
+    /// Optional hint to optimize sequential access patterns across mapped memory
+    ///
+    /// When set to `true`, the underlying file is opened with sequential access optimizations
+    /// (`FILE_FLAG_SEQUENTIAL_SCAN` on Windows, `POSIX_FADV_SEQUENTIAL` on Linux), and
+    /// [`MemMap::new`], [`MemMap::open`], and [`MemMap::grow`] invoke sequential access advice
+    /// on a best-effort basis
+    pub sequential_access_hint: bool,
 }
 
 impl MemMapCfg {
@@ -475,6 +485,7 @@ impl MemMapInner {
 ///     max_len: 0x10_0000,
 ///     sync_interval: Some(Duration::from_millis(0x64)),
 ///     memory_priority_hint: false,
+///     sequential_access_hint: false,
 /// };
 ///
 /// let memmap = MemMap::<u64>::new(cfg).unwrap();
@@ -612,6 +623,7 @@ where
             buffer_size: size,
             initial_available_buffers,
             sync_interval: None,
+            sequential_access_hint: cfg.sequential_access_hint,
         })
     }
 
@@ -623,6 +635,10 @@ where
     ) -> FrozenResult<Self> {
         if cfg.memory_priority_hint {
             let _ = PlatformMemMap::apply_memory_priority_hint();
+        }
+
+        if cfg.sequential_access_hint {
+            let _ = mmap.advise_sequential(0, mmap.length());
         }
 
         let length = mmap.length();
@@ -782,6 +798,7 @@ where
     ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
     ///     memory_priority_hint: false,
+    ///     sequential_access_hint: false,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
@@ -850,6 +867,7 @@ where
     ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
     ///     memory_priority_hint: false,
+    ///     sequential_access_hint: false,
     /// };
     ///
     /// let page_size = MemMap::<u64>::page_size().unwrap().as_usize();
@@ -924,6 +942,7 @@ where
     ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
     ///     memory_priority_hint: false,
+    ///     sequential_access_hint: false,
     /// };
     ///
     /// let page_size = MemMap::<u64>::page_size().unwrap().as_usize();
@@ -982,6 +1001,7 @@ where
     ///     max_len: 0x10_0000,
     ///     sync_interval: None,
     ///     memory_priority_hint: false,
+    ///     sequential_access_hint: false,
     /// };
     ///
     /// assert!(!MemMap::<u64>::exists(&cfg));
@@ -1037,6 +1057,7 @@ where
     ///     max_len: 0x10_0000,
     ///     sync_interval: None,
     ///     memory_priority_hint: false,
+    ///     sequential_access_hint: false,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1045,6 +1066,60 @@ where
     #[inline]
     pub fn apply_memory_priority_hint(&self) -> FrozenResult<()> {
         PlatformMemMap::apply_memory_priority_hint()
+    }
+
+    /// Advises the kernel that the entire active memory mapping will be accessed sequentially
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::memmap::{MemMap, MemMapCfg};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = MemMapCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().to_path_buf(),
+    ///     name: *b"seq1",
+    ///     version: 1,
+    ///     initial_pages: 1,
+    ///     max_len: 0x10_0000,
+    ///     sync_interval: None,
+    ///     memory_priority_hint: false,
+    ///     sequential_access_hint: false,
+    /// };
+    ///
+    /// let mmap = MemMap::<u64>::new(cfg).unwrap();
+    /// assert!(mmap.advise_sequential().is_ok());
+    /// ```
+    #[inline]
+    pub fn advise_sequential(&self) -> FrozenResult<()> {
+        let length = self.inner.length.load(atomic::Ordering::Acquire);
+        self.advise_sequential_range(0, length)
+    }
+
+    /// Advises the kernel that the mapped range from `offset` for `length` bytes will be accessed
+    /// sequentially
+    #[inline]
+    pub fn advise_sequential_range(&self, offset: usize, length: usize) -> FrozenResult<()> {
+        let mmap_guard = self.inner.mmap.read().unwrap_or_else(|e| e.into_inner());
+        let mmap = match mmap_guard.as_ref() {
+            Some(m) => m,
+            None => return err::default_error(err::INV).with_module(self.cfg.module_id),
+        };
+
+        mmap.advise_sequential(offset, length).with_module(self.cfg.module_id)
+    }
+
+    /// Prefetches the specified virtual memory range into physical memory (RAM) asynchronously
+    #[inline]
+    pub fn prefetch(&self, offset: usize, length: usize) -> FrozenResult<()> {
+        let mmap_guard = self.inner.mmap.read().unwrap_or_else(|e| e.into_inner());
+        let mmap = match mmap_guard.as_ref() {
+            Some(m) => m,
+            None => return err::default_error(err::INV).with_module(self.cfg.module_id),
+        };
+
+        mmap.prefetch(offset, length).with_module(self.cfg.module_id)
     }
 
     /// Returns the length of the memory mapping in bytes
@@ -1067,6 +1142,7 @@ where
     ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
     ///     memory_priority_hint: false,
+    ///     sequential_access_hint: false,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1119,6 +1195,7 @@ where
     ///     max_len: 0x10_0000,
     ///     sync_interval: None,
     ///     memory_priority_hint: false,
+    ///     sequential_access_hint: false,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1192,6 +1269,10 @@ where
 
         mmap.grow(file.fd(), curr_len, bytes_to_add).with_module(mid)?;
 
+        if self.cfg.sequential_access_hint {
+            let _ = mmap.advise_sequential(curr_len, bytes_to_add);
+        }
+
         slot_locks_guard.grow(additional_slots);
         self.inner.length.store(new_length, atomic::Ordering::Release);
 
@@ -1220,6 +1301,7 @@ where
     ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
     ///     memory_priority_hint: false,
+    ///     sequential_access_hint: false,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1252,6 +1334,7 @@ where
     ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
     ///     memory_priority_hint: false,
+    ///     sequential_access_hint: false,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1283,6 +1366,7 @@ where
     ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
     ///     memory_priority_hint: false,
+    ///     sequential_access_hint: false,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1320,6 +1404,7 @@ where
     ///     max_len: 0x10_0000,
     ///     sync_interval: None,
     ///     memory_priority_hint: false,
+    ///     sequential_access_hint: false,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1364,6 +1449,7 @@ where
     ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
     ///     memory_priority_hint: false,
+    ///     sequential_access_hint: false,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1447,6 +1533,7 @@ where
     ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
     ///     memory_priority_hint: false,
+    ///     sequential_access_hint: false,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1558,6 +1645,7 @@ where
     ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
     ///     memory_priority_hint: false,
+    ///     sequential_access_hint: false,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1650,6 +1738,7 @@ where
     ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
     ///     memory_priority_hint: false,
+    ///     sequential_access_hint: false,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1775,6 +1864,7 @@ where
     ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
     ///     memory_priority_hint: false,
+    ///     sequential_access_hint: false,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
@@ -1859,6 +1949,7 @@ where
     ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
     ///     memory_priority_hint: false,
+    ///     sequential_access_hint: false,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1962,6 +2053,7 @@ where
     ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
     ///     memory_priority_hint: false,
+    ///     sequential_access_hint: false,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -2006,6 +2098,7 @@ where
 ///     max_len: 0x10_0000,
 ///     sync_interval: Some(Duration::from_millis(0x64)),
 ///     memory_priority_hint: false,
+///     sequential_access_hint: false,
 /// };
 ///
 /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -2052,6 +2145,7 @@ where
     ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
     ///     memory_priority_hint: false,
+    ///     sequential_access_hint: false,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -2119,6 +2213,7 @@ where
     ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
     ///     memory_priority_hint: false,
+    ///     sequential_access_hint: false,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -2226,6 +2321,7 @@ where
     ///     max_len: 0x10_0000,
     ///     sync_interval: None,
     ///     memory_priority_hint: false,
+    ///     sequential_access_hint: false,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -2258,6 +2354,7 @@ where
     ///     max_len: 0x10_0000,
     ///     sync_interval: None,
     ///     memory_priority_hint: false,
+    ///     sequential_access_hint: false,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -2351,6 +2448,7 @@ mod tests {
             max_len: 0x10_0000,
             sync_interval: Some(Duration::from_millis(0x64)),
             memory_priority_hint: false,
+            sequential_access_hint: false,
         };
 
         (dir, cfg)
@@ -2489,6 +2587,7 @@ mod tests {
             max_len: 0x10_0000,
             sync_interval: Some(Duration::from_millis(0x64)),
             memory_priority_hint: false,
+            sequential_access_hint: false,
         };
 
         let err_new = MemMap::<u64>::new(cfg.clone()).unwrap_err();
@@ -2516,6 +2615,7 @@ mod tests {
             max_len: 0x10_0000,
             sync_interval: Some(Duration::from_millis(0x64)),
             memory_priority_hint: false,
+            sequential_access_hint: false,
         };
 
         let err_new = MemMap::<u64>::new(cfg.clone()).unwrap_err();
@@ -2539,6 +2639,7 @@ mod tests {
             max_len: 0x10_0000,
             sync_interval: Some(Duration::from_millis(0x64)),
             memory_priority_hint: false,
+            sequential_access_hint: false,
         };
 
         let err_new = MemMap::<u64>::new(cfg.clone()).unwrap_err();
@@ -2565,6 +2666,7 @@ mod tests {
                 max_len: 0x10_0000,
                 sync_interval: Some(Duration::from_millis(0x64)),
                 memory_priority_hint: false,
+                sequential_access_hint: false,
             };
 
             let err_new = MemMap::<u64>::new(cfg.clone()).unwrap_err();
@@ -2602,6 +2704,7 @@ mod tests {
             max_len: 0x10_0000,
             sync_interval: Some(Duration::from_millis(0x64)),
             memory_priority_hint: false,
+            sequential_access_hint: false,
         };
         assert_eq!(cfg.versioned_path(), dir.join("tbfx_0"));
 
@@ -2614,6 +2717,7 @@ mod tests {
             max_len: 0x10_0000,
             sync_interval: Some(Duration::from_millis(0x64)),
             memory_priority_hint: false,
+            sequential_access_hint: false,
         };
         assert_eq!(cfg.versioned_path(), dir.join("DATA_5"));
     }
@@ -2631,6 +2735,7 @@ mod tests {
             max_len: 0x10_0000,
             sync_interval: Some(Duration::from_millis(0x64)),
             memory_priority_hint: false,
+            sequential_access_hint: false,
         };
         assert_eq!(cfg_v1.versioned_path(), dir.path().join("tbfx_1"));
 
@@ -2643,6 +2748,7 @@ mod tests {
             max_len: 0x10_0000,
             sync_interval: Some(Duration::from_millis(0x64)),
             memory_priority_hint: false,
+            sequential_access_hint: false,
         };
         assert_eq!(cfg_v2.versioned_path(), dir.path().join("tbfx_2"));
 
@@ -2698,6 +2804,64 @@ mod tests {
             MemMap::<u64>::page_size().unwrap().as_usize() * INIT_PAGES
         );
         assert!(open_or_created.delete().is_ok());
+    }
+
+    #[test]
+    fn ok_sequential_access_hint_initialization() {
+        let (_dir, mut cfg) = tmp_cfg();
+        cfg.sequential_access_hint = true;
+
+        let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
+        assert_eq!(mmap.length(), MemMap::<u64>::page_size().unwrap().as_usize() * INIT_PAGES);
+        assert!(mmap.cfg().sequential_access_hint);
+        drop(mmap);
+
+        let opened = MemMap::<u64>::open(cfg.clone()).unwrap();
+        assert_eq!(opened.length(), MemMap::<u64>::page_size().unwrap().as_usize() * INIT_PAGES);
+        drop(opened);
+
+        let open_or_created = MemMap::<u64>::open_or_create(cfg).unwrap();
+        assert_eq!(
+            open_or_created.length(),
+            MemMap::<u64>::page_size().unwrap().as_usize() * INIT_PAGES
+        );
+        assert!(open_or_created.delete().is_ok());
+    }
+
+    #[test]
+    fn ok_advise_sequential_and_prefetch_api() {
+        let (_dir, cfg) = tmp_cfg();
+        let mmap = MemMap::<u64>::new(cfg).unwrap();
+
+        assert!(mmap.advise_sequential().is_ok());
+        assert!(mmap.advise_sequential_range(0, 0).is_ok());
+        assert!(mmap.prefetch(0, 0).is_ok());
+
+        let page_size = MemMap::<u64>::page_size().unwrap().as_usize();
+        assert!(mmap.advise_sequential_range(0, page_size).is_ok());
+        assert!(mmap.prefetch(0, page_size).is_ok());
+
+        let total_len = mmap.length();
+        let err_seq = mmap.advise_sequential_range(0, total_len + 1).unwrap_err();
+        assert_eq!(err_seq.reason, err::HCF.reason);
+
+        let err_pref = mmap.prefetch(total_len, 1).unwrap_err();
+        assert_eq!(err_pref.reason, err::HCF.reason);
+        assert!(mmap.delete().is_ok());
+    }
+
+    #[test]
+    fn ok_sequential_hint_preserved_across_growth() {
+        let (_dir, mut cfg) = tmp_cfg();
+        cfg.sequential_access_hint = true;
+
+        let mmap = MemMap::<u64>::new(cfg).unwrap();
+        let initial_len = mmap.length();
+        let page_size = MemMap::<u64>::page_size().unwrap().as_usize();
+
+        assert!(mmap.grow(1).is_ok());
+        assert_eq!(mmap.length(), initial_len + page_size);
+        assert!(mmap.delete().is_ok());
     }
 
     #[test]
