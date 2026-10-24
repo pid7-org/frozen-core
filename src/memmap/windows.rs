@@ -263,6 +263,76 @@ impl MemMapInterface for WINMemMap {
         }
     }
 
+    /// Returns the number of bytes currently resident in physical memory (RAM)
+    ///
+    /// ## Residency semantics
+    ///
+    /// Queries `K32QueryWorkingSetEx` to inspect the resident working set status of each page in
+    /// the mapped range, directly counting resident pages from the working set attributes without
+    /// allocating an intermediate vector of indices
+    fn resident_bytes(&self) -> FrozenResult<usize> {
+        if hints::unlikely(self.ptr.is_null() || self.length == 0) {
+            return Ok(0);
+        }
+
+        let page_size = Self::page_size()?.as_usize();
+        let num_pages = self.length.div_ceil(page_size);
+
+        let mut ws_info: Vec<PSAPI_WORKING_SET_EX_INFORMATION> = (0..num_pages)
+            .map(|i| PSAPI_WORKING_SET_EX_INFORMATION {
+                VirtualAddress: unsafe { self.ptr.add(i * page_size) as *mut core::ffi::c_void },
+                VirtualAttributes: PSAPI_WORKING_SET_EX_BLOCK { Flags: 0 },
+            })
+            .collect();
+
+        let cb = match u32::try_from(
+            ws_info.len() * core::mem::size_of::<PSAPI_WORKING_SET_EX_INFORMATION>(),
+        ) {
+            Ok(v) => v,
+            Err(_) => return raw_error(err::HCF, "working set buffer size exceeds u32 capacity"),
+        };
+
+        let mut retries = 0;
+        loop {
+            let ok = unsafe {
+                K32QueryWorkingSetEx(
+                    GetCurrentProcess(),
+                    ws_info.as_mut_ptr() as *mut core::ffi::c_void,
+                    cb,
+                )
+            };
+
+            if hints::likely(ok != 0) {
+                let resident_pages = ws_info
+                    .iter()
+                    .filter(|info| unsafe { info.VirtualAttributes.Flags } & 1 != 0)
+                    .count();
+
+                return Ok(resident_pages.saturating_mul(page_size));
+            }
+
+            let code = last_error();
+            let err_msg = err_msg(code);
+
+            match code {
+                ERROR_LOCK_VIOLATION | ERROR_SHARING_VIOLATION => {
+                    if retries < MAX_RETRIES {
+                        retries += 1;
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+
+                    return raw_error(err::UNK, err_msg);
+                }
+                ERROR_INVALID_PARAMETER | ERROR_INVALID_ADDRESS => {
+                    return raw_error(err::HCF, err_msg);
+                }
+                ERROR_NOT_ENOUGH_MEMORY | ERROR_OUTOFMEMORY => return raw_error(err::NMM, err_msg),
+                _ => return raw_error(err::UNK, err_msg),
+            }
+        }
+    }
+
     /// Evicts selected memory pages from physical memory via `VirtualUnlock`
     ///
     /// ## Eviction semantics
@@ -1179,6 +1249,26 @@ mod tests {
             let second = mmap.active_page_indices().unwrap();
             assert_eq!(first, second);
             mmap.unmap().unwrap();
+        }
+
+        #[test]
+        fn ok_resident_bytes_all_touched() {
+            let (_dir, file, total_len) = new_paged_tmp(3);
+            let page_size = WINMemMap::page_size().unwrap().as_usize();
+
+            unsafe {
+                let mmap = WINMemMap::new(file.fd(), total_len, total_len).unwrap();
+
+                for i in 0..3 {
+                    let ptr = mmap.as_mut_ptr::<u8>(i * page_size);
+                    *ptr = (i + 1) as u8;
+                }
+
+                let resident = mmap.resident_bytes().unwrap();
+                assert_eq!(resident, 3 * page_size);
+
+                mmap.unmap().unwrap();
+            }
         }
     }
 

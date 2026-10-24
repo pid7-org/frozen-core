@@ -47,6 +47,14 @@ pub(in crate::memmap) trait MemMapInterface: Sized + Send + Sync {
     #[allow(unused)]
     fn active_page_indices(&self) -> FrozenResult<Vec<usize>>;
 
+    /// Returns the number of bytes currently resident in physical memory (RAM)
+    ///
+    /// ## Residency semantics
+    ///
+    /// Inspects the resident set status of each page in the mapped range and returns the total
+    /// resident bytes (`resident_pages * page_size`)
+    fn resident_bytes(&self) -> FrozenResult<usize>;
+
     /// Evicts selected memory pages from physical memory
     ///
     /// ## Eviction semantics

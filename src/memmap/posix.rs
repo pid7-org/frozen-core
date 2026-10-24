@@ -181,6 +181,50 @@ impl MemMapInterface for POSIXMemMap {
         }
     }
 
+    /// Returns the number of bytes currently resident in physical memory (RAM)
+    ///
+    /// ## Residency semantics
+    ///
+    /// Queries `mincore(2)` to inspect the resident set status of each page in the mapped range,
+    /// directly counting resident pages from the residency bitmask without allocating an
+    /// intermediate vector of indices
+    fn resident_bytes(&self) -> FrozenResult<usize> {
+        if hints::unlikely(self.ptr.is_null() || self.length == 0) {
+            return Ok(0);
+        }
+
+        let page_size = Self::page_size()?.as_usize();
+        let num_pages = self.length.div_ceil(page_size);
+
+        let mut vec = vec![0u8; num_pages];
+        let mut retries = 0;
+
+        loop {
+            let res = unsafe { mincore(self.ptr as _, self.length, vec.as_mut_ptr() as *mut _) };
+
+            if hints::likely(res == 0) {
+                let resident_pages = vec.iter().filter(|&&b| (b & 1) != 0).count();
+                return Ok(resident_pages.saturating_mul(page_size));
+            }
+
+            let errno = last_errno();
+            let err_msg = err_msg(errno);
+
+            match errno {
+                EINTR | EBUSY | EAGAIN => {
+                    if retries < MAX_RETRIES {
+                        retries += 1;
+                        continue;
+                    }
+
+                    return raw_error(err::UNK, err_msg);
+                }
+                EINVAL | ENOMEM => return raw_error(err::HCF, err_msg),
+                _ => return raw_error(err::UNK, err_msg),
+            }
+        }
+    }
+
     /// Evicts selected memory pages from physical memory via `madvise(MADV_DONTNEED)`
     ///
     /// ## Eviction semantics
@@ -836,6 +880,26 @@ mod tests {
             let second = mmap.active_page_indices().unwrap();
             assert_eq!(first, second);
             mmap.unmap().unwrap();
+        }
+
+        #[test]
+        fn ok_resident_bytes_all_touched() {
+            let (_dir, file, total_len) = new_paged_tmp(3);
+            let page_size = POSIXMemMap::page_size().unwrap().as_usize();
+
+            unsafe {
+                let mmap = POSIXMemMap::new(file.fd(), total_len, total_len).unwrap();
+
+                for i in 0..3 {
+                    let ptr = mmap.as_mut_ptr::<u8>(i * page_size);
+                    *ptr = (i + 1) as u8;
+                }
+
+                let resident = mmap.resident_bytes().unwrap();
+                assert_eq!(resident, 3 * page_size);
+
+                mmap.unmap().unwrap();
+            }
         }
     }
 

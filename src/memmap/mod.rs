@@ -1153,6 +1153,52 @@ where
         self.inner.length.load(atomic::Ordering::Acquire)
     }
 
+    /// Returns the number of bytes of the memory mapping currently resident in physical memory
+    /// (RAM)
+    ///
+    /// ## Semantics
+    ///
+    /// Inspects the resident set status of each page in the mapped range and returns the total
+    /// resident bytes (`resident_pages * page_size`)
+    ///
+    /// Directly counts resident pages from the platform residency bitmask without allocating an
+    /// intermediate vector of indices
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::memmap::{MemMap, MemMapCfg};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = MemMapCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().to_path_buf(),
+    ///     name: *b"resb",
+    ///     version: 1,
+    ///     initial_pages: 1,
+    ///     max_len: 0x10_0000,
+    ///     sync_interval: None,
+    ///     memory_priority_hint: false,
+    ///     sequential_access_hint: false,
+    /// };
+    ///
+    /// let mmap = MemMap::<u64>::new(cfg).unwrap();
+    /// mmap.write(0, |v| *v = 0x2A).unwrap();
+    ///
+    /// let resident = mmap.resident_bytes().unwrap();
+    /// assert_eq!(resident, MemMap::<u64>::page_size().unwrap().as_usize());
+    /// ```
+    #[inline]
+    pub fn resident_bytes(&self) -> FrozenResult<usize> {
+        let mmap_guard = self.inner.mmap.read().unwrap_or_else(|e| e.into_inner());
+        let mmap = match mmap_guard.as_ref() {
+            Some(m) => m,
+            None => return err::default_error(err::INV).with_module(self.cfg.module_id),
+        };
+
+        mmap.resident_bytes().with_module(self.cfg.module_id)
+    }
+
     /// Dynamically grows the memory-mapped file by `pages` additional virtual memory pages
     ///
     /// ## Semantics
@@ -2847,6 +2893,20 @@ mod tests {
 
         let err_pref = mmap.prefetch(total_len, 1).unwrap_err();
         assert_eq!(err_pref.reason, err::HCF.reason);
+        assert!(mmap.delete().is_ok());
+    }
+
+    #[test]
+    fn ok_resident_bytes_api() {
+        let (_dir, cfg) = tmp_cfg();
+        let mmap = MemMap::<u64>::new(cfg).unwrap();
+        let page_size = MemMap::<u64>::page_size().unwrap().as_usize();
+
+        mmap.write(0, |v| *v = 0x1234).unwrap();
+        let resident = mmap.resident_bytes().unwrap();
+        assert!(resident >= page_size);
+        assert_eq!(resident % page_size, 0);
+        assert!(resident <= mmap.length());
         assert!(mmap.delete().is_ok());
     }
 
