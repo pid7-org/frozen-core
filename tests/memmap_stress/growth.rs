@@ -94,7 +94,7 @@ fn ok_concurrent_grow_racing_workers() {
 
         grower_handles.push(thread::spawn(move || {
             b.wait();
-            for _ in 0..target_pages {
+            while m.length() < target_pages * page_size {
                 let _ = m.grow(1);
             }
         }));

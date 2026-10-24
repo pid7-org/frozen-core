@@ -1020,6 +1020,8 @@ where
     ///
     /// - Halts all concurrent read and write operations across all slots for the duration of the
     ///   growth
+    /// - Serializes concurrent growth invocations under exclusive write lock, preventing
+    ///   placeholder replacement collisions
     /// - Halts background durability flushing and manual sync operations
     /// - If uncommitted dirty writes exist (`current_epoch > durable_epoch`), performs a durability
     ///   sync before modifying file boundaries
@@ -1089,6 +1091,18 @@ where
             None => return err::default_error(err::INV).with_module(mid),
         };
 
+        // Serialize all concurrent growth operations under exclusive write locks
+        //
+        // Preserves the strict total lock ordering (slot_locks -> mmap) to prevent deadlocks with
+        // readers/writers, and prevents race conditions where concurrent grow calls sample stale
+        // lengths or collide on Win32 placeholder replacement
+        let mut slot_locks_guard = self.inner.slot_locks.write().unwrap_or_else(|e| e.into_inner());
+        let mut mmap_guard = self.inner.mmap.write().unwrap_or_else(|e| e.into_inner());
+        let mmap = match mmap_guard.as_mut() {
+            Some(m) => m,
+            None => return err::default_error(err::INV).with_module(mid),
+        };
+
         let curr_len = self.inner.length.load(atomic::Ordering::Acquire);
         let new_length = match curr_len.checked_add(bytes_to_add) {
             Some(len) => len,
@@ -1104,30 +1118,21 @@ where
         }
 
         // pre-growth sync (only if needed (curr_epoch > durable_epoch))
-        self.inner.sync_internal()?;
+        // invokes sync_mmap_if_needed directly to avoid recursive locking on self.inner.mmap
+        self.inner.sync_mmap_if_needed(mmap, curr_len)?;
 
         file.grow(additional_slots).with_module(mid)?;
 
         // sync new file meta to disk for crash safety
         file.sync().with_module(mid)?;
 
-        {
-            let mut mmap_guard = self.inner.mmap.write().unwrap_or_else(|e| e.into_inner());
-            let mmap = match mmap_guard.as_mut() {
-                Some(m) => m,
-                None => return err::default_error(err::INV).with_module(mid),
-            };
+        mmap.grow(file.fd(), curr_len, bytes_to_add).with_module(mid)?;
 
-            mmap.grow(file.fd(), curr_len, bytes_to_add).with_module(mid)?;
-        }
+        slot_locks_guard.grow(additional_slots);
+        self.inner.length.store(new_length, atomic::Ordering::Release);
 
-        {
-            let mut slot_locks_guard =
-                self.inner.slot_locks.write().unwrap_or_else(|e| e.into_inner());
-
-            slot_locks_guard.grow(additional_slots);
-            self.inner.length.store(new_length, atomic::Ordering::Release);
-        }
+        drop(mmap_guard);
+        drop(slot_locks_guard);
 
         self.inner.completion.increment_current_epoch();
         Ok(())

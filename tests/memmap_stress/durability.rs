@@ -91,8 +91,8 @@ fn ok_durable_epoch_progress_with_concurrent_sync() {
 
             while !s.load(Ordering::Relaxed) {
                 let _ = m.sync();
-                let cur = m.current_epoch();
                 let dur = m.durable_epoch();
+                let cur = m.current_epoch();
 
                 assert!(dur <= cur);
                 thread::yield_now();
