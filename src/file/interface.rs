@@ -50,6 +50,21 @@ pub(in crate::file) trait FileInterface: Sized + Send + Sync {
     /// If the file does not exist, the operation must fail and return [`super::err::INV`]
     fn open(path: &Path) -> FrozenResult<Self>;
 
+    /// Atomically creates and opens a new file at `path` with sequential access optimization
+    fn create_sequential(path: &Path) -> FrozenResult<Self> {
+        Self::create(path)
+    }
+
+    /// Opens an existing file at `path` with sequential access optimization
+    fn open_sequential(path: &Path) -> FrozenResult<Self> {
+        Self::open(path)
+    }
+
+    /// Opens an existing file or creates it at `path` with sequential access optimization
+    fn new_sequential(path: &Path) -> FrozenResult<Self> {
+        Self::new(path)
+    }
+
     /// Opens an existing file or creates it if missing at `path`
     ///
     /// ## Semantics

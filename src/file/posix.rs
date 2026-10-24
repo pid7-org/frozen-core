@@ -87,10 +87,40 @@ impl FileInterface for POSIXFile {
         // pattern
         #[cfg(target_os = "linux")]
         {
-            let _res = f_advise_raw(file.fd());
+            let _res = f_advise_raw(file.fd(), false);
 
             // INFO: Read the function docs of [`f_advise_raw`] for detailed info on why the error is only propagated in
             // non-prod env's
+
+            #[cfg(debug_assertions)]
+            if let Err(mut e) = _res {
+                if let Err(close_err) = file.close() {
+                    e.add_suppressed(close_err);
+                }
+
+                return Err(e);
+            }
+        }
+
+        Ok(file)
+    }
+
+    /// Atomically create a new [`POSIXFile`] w/ sequential access optimization
+    fn create_sequential(path: &std::path::Path) -> FrozenResult<Self> {
+        let fd = open_raw(path, libc::O_CREAT | libc::O_EXCL | libc::O_RDWR)?;
+        let file = Self { fd: atomic::AtomicI32::new(fd) };
+
+        if let Err(mut e) = sync_parent_dir(path) {
+            if let Err(close_err) = file.close() {
+                e.add_suppressed(close_err);
+            }
+
+            return Err(e);
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let _res = f_advise_raw(file.fd(), true);
 
             #[cfg(debug_assertions)]
             if let Err(mut e) = _res {
@@ -114,10 +144,32 @@ impl FileInterface for POSIXFile {
         // pattern
         #[cfg(target_os = "linux")]
         {
-            let _res = f_advise_raw(file.fd());
+            let _res = f_advise_raw(file.fd(), false);
 
             // INFO: Read the function docs of [`f_advise_raw`] for detailed info on why the error is only propagated in
             // non-prod env's
+
+            #[cfg(debug_assertions)]
+            if let Err(mut e) = _res {
+                if let Err(close_err) = file.close() {
+                    e.add_suppressed(close_err);
+                }
+
+                return Err(e);
+            }
+        }
+
+        Ok(file)
+    }
+
+    /// Open an existing [`POSIXFile`] w/o `O_CREAT` w/ sequential access optimization
+    fn open_sequential(path: &std::path::Path) -> FrozenResult<Self> {
+        let fd = open_raw(path, open_flags())?;
+        let file = Self { fd: atomic::AtomicI32::new(fd) };
+
+        #[cfg(target_os = "linux")]
+        {
+            let _res = f_advise_raw(file.fd(), true);
 
             #[cfg(debug_assertions)]
             if let Err(mut e) = _res {
@@ -162,10 +214,40 @@ impl FileInterface for POSIXFile {
         // pattern
         #[cfg(target_os = "linux")]
         {
-            let _res = f_advise_raw(file.fd());
+            let _res = f_advise_raw(file.fd(), false);
 
             // INFO: Read the function docs of [`f_advise_raw`] for detailed info on why the error is only propagated in
             // non-prod env's
+
+            #[cfg(debug_assertions)]
+            if let Err(mut e) = _res {
+                if let Err(close_err) = file.close() {
+                    e.add_suppressed(close_err);
+                }
+
+                return Err(e);
+            }
+        }
+
+        Ok(file)
+    }
+
+    /// Create a new or open an existing [`POSIXFile`] w/ sequential access optimization
+    fn new_sequential(path: &std::path::Path) -> FrozenResult<Self> {
+        let fd = open_raw(path, prep_flags())?;
+        let file = Self { fd: atomic::AtomicI32::new(fd) };
+
+        if let Err(mut e) = sync_parent_dir(path) {
+            if let Err(close_err) = file.close() {
+                e.add_suppressed(close_err);
+            }
+
+            return Err(e);
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let _res = f_advise_raw(file.fd(), true);
 
             #[cfg(debug_assertions)]
             if let Err(mut e) = _res {
@@ -1426,13 +1508,13 @@ fn extract_parent_dir(path: &std::path::Path) -> std::path::PathBuf {
     }
 }
 
-/// Provide access pattern hint using `posix_fadvise(POSIX_FADV_RANDOM)`
+/// Provide access pattern hint using `posix_fadvise`
 ///
 /// ## Semantics
 ///
-/// This syscall provides a hint to the kernel that the file will be accessed in a random pattern
+/// If `sequential` is true, advises `POSIX_FADV_SEQUENTIAL`; otherwise advises `POSIX_FADV_RANDOM`
 ///
-/// The kernel may have disabled read-ahead heuristics for the file
+/// The kernel adjusts read-ahead heuristics for the file accordingly
 ///
 /// ## Best-effort behavior
 ///
@@ -1455,10 +1537,12 @@ fn extract_parent_dir(path: &std::path::Path) -> std::path::PathBuf {
 /// (non-prod) environments
 #[inline]
 #[cfg(target_os = "linux")]
-fn f_advise_raw(fd: FileId) -> FrozenResult<()> {
+fn f_advise_raw(fd: FileId, sequential: bool) -> FrozenResult<()> {
+    let advice = if sequential { libc::POSIX_FADV_SEQUENTIAL } else { libc::POSIX_FADV_RANDOM };
     let mut retries = 0;
+
     loop {
-        let res = unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_RANDOM) };
+        let res = unsafe { libc::posix_fadvise(fd, 0, 0, advice) };
         if res == 0 {
             return Ok(());
         }
@@ -2133,18 +2217,33 @@ mod tests {
 
         #[test]
         #[cfg(target_os = "linux")]
-        fn ok_f_advice_random() {
+        fn ok_f_advice_random_and_sequential() {
             let (_dir, path) = tmp_path();
             let file = POSIXFile::new(&path).unwrap();
-            f_advise_raw(file.fd()).unwrap();
+            f_advise_raw(file.fd(), false).unwrap();
+            f_advise_raw(file.fd(), true).unwrap();
             file.close().unwrap();
         }
 
         #[test]
         #[cfg(target_os = "linux")]
+        fn ok_sequential_file_constructors() {
+            let (_dir, path) = tmp_path();
+            let f1 = POSIXFile::create_sequential(&path).unwrap();
+            f1.close().unwrap();
+            let f2 = POSIXFile::open_sequential(&path).unwrap();
+            f2.close().unwrap();
+            let f3 = POSIXFile::new_sequential(&path).unwrap();
+            f3.close().unwrap();
+        }
+
+        #[test]
+        #[cfg(target_os = "linux")]
         fn err_f_advise_closed_fd() {
-            let err = f_advise_raw(CLOSED_FD).unwrap_err();
+            let err = f_advise_raw(CLOSED_FD, false).unwrap_err();
             assert_eq!(err.reason, err::HCF.reason);
+            let err_seq = f_advise_raw(CLOSED_FD, true).unwrap_err();
+            assert_eq!(err_seq.reason, err::HCF.reason);
         }
 
         #[test]

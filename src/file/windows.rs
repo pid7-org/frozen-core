@@ -14,11 +14,11 @@ use windows_sys::Win32::{
         CREATE_NEW, CreateFileW, DELETE, DeleteFileW, FILE_ALLOCATION_INFO, FILE_ATTRIBUTE_NORMAL,
         FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO,
         FILE_DISPOSITION_INFO_EX, FILE_END_OF_FILE_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_RANDOM_ACCESS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        FileAllocationInfo, FileDispositionInfo, FileDispositionInfoEx, FileEndOfFileInfo,
-        FlushFileBuffers, GetFileAttributesW, GetFileSizeEx, INVALID_FILE_ATTRIBUTES,
-        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, OPEN_ALWAYS, OPEN_EXISTING,
-        ReadFile, SetFileInformationByHandle, WriteFile,
+        FILE_FLAG_RANDOM_ACCESS, FILE_FLAG_SEQUENTIAL_SCAN, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FileAllocationInfo, FileDispositionInfo, FileDispositionInfoEx,
+        FileEndOfFileInfo, FlushFileBuffers, GetFileAttributesW, GetFileSizeEx,
+        INVALID_FILE_ATTRIBUTES, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+        OPEN_ALWAYS, OPEN_EXISTING, ReadFile, SetFileInformationByHandle, WriteFile,
     },
     System::IO::{OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0},
 };
@@ -146,7 +146,23 @@ impl FileInterface for WINFile {
     /// Exclusive access for our engine is enforced by `LockFileEx` in [`flock`](WINFile::flock),
     /// mirroring the POSIX advisory lock model exactly
     fn create(path: &std::path::Path) -> FrozenResult<Self> {
-        let handle = create_file_raw(path, CREATE_NEW)?;
+        let handle = create_file_raw(path, CREATE_NEW, FILE_FLAG_RANDOM_ACCESS)?;
+        let file = Self { handle: atomic::AtomicIsize::new(handle) };
+
+        if let Err(mut e) = sync_parent_dir(path) {
+            if let Err(close_err) = file.close() {
+                e.add_suppressed(close_err);
+            }
+
+            return Err(e);
+        }
+
+        Ok(file)
+    }
+
+    /// Atomically create a new [`WINFile`] w/ sequential access optimization
+    fn create_sequential(path: &std::path::Path) -> FrozenResult<Self> {
+        let handle = create_file_raw(path, CREATE_NEW, FILE_FLAG_SEQUENTIAL_SCAN)?;
         let file = Self { handle: atomic::AtomicIsize::new(handle) };
 
         if let Err(mut e) = sync_parent_dir(path) {
@@ -164,7 +180,13 @@ impl FileInterface for WINFile {
     /// Fails with [`err::INV`] if the file does not exist, while using the same share mode and
     /// random access flag as [`create`](WINFile::create) for consistency
     fn open(path: &std::path::Path) -> FrozenResult<Self> {
-        let handle = create_file_raw(path, OPEN_EXISTING)?;
+        let handle = create_file_raw(path, OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS)?;
+        Ok(Self { handle: atomic::AtomicIsize::new(handle) })
+    }
+
+    /// Open an existing [`WINFile`] w/ sequential access optimization
+    fn open_sequential(path: &std::path::Path) -> FrozenResult<Self> {
+        let handle = create_file_raw(path, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN)?;
         Ok(Self { handle: atomic::AtomicIsize::new(handle) })
     }
 
@@ -182,7 +204,23 @@ impl FileInterface for WINFile {
     /// non-journaling volumes
     /// (e.g. exFAT)
     fn new(path: &std::path::Path) -> FrozenResult<Self> {
-        let handle = create_file_raw(path, OPEN_ALWAYS)?;
+        let handle = create_file_raw(path, OPEN_ALWAYS, FILE_FLAG_RANDOM_ACCESS)?;
+        let file = Self { handle: atomic::AtomicIsize::new(handle) };
+
+        if let Err(mut e) = sync_parent_dir(path) {
+            if let Err(close_err) = file.close() {
+                e.add_suppressed(close_err);
+            }
+
+            return Err(e);
+        }
+
+        Ok(file)
+    }
+
+    /// Open an existing [`WINFile`] or create it if missing w/ sequential access optimization
+    fn new_sequential(path: &std::path::Path) -> FrozenResult<Self> {
+        let handle = create_file_raw(path, OPEN_ALWAYS, FILE_FLAG_SEQUENTIAL_SCAN)?;
         let file = Self { handle: atomic::AtomicIsize::new(handle) };
 
         if let Err(mut e) = sync_parent_dir(path) {
@@ -712,7 +750,7 @@ impl Drop for WINFile {
 /// handle table teardown and the lock release)
 ///
 /// We retry up to `MAX_RETRIES` times
-fn create_file_raw(path: &std::path::Path, disposition: u32) -> FrozenResult<FileId> {
+fn create_file_raw(path: &std::path::Path, disposition: u32, flags: u32) -> FrozenResult<FileId> {
     let wide = path_to_wide(path)?;
 
     let mut retries = 0; // only for ERROR_SHARING_VIOLATION transient races
@@ -724,7 +762,7 @@ fn create_file_raw(path: &std::path::Path, disposition: u32) -> FrozenResult<Fil
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 core::ptr::null(),
                 disposition,
-                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS,
+                FILE_ATTRIBUTE_NORMAL | flags,
                 core::ptr::null_mut(),
             )
         };

@@ -17,6 +17,7 @@
 //!     path: path.clone(),
 //!     initial_available_buffers: 4,
 //!     sync_interval: None,
+//!     sequential_access_hint: false,
 //! };
 //!
 //! let file = File::new(cfg.clone()).unwrap();
@@ -168,6 +169,7 @@ pub type FileId = isize;
 ///     buffer_size: 0x100,
 ///     initial_available_buffers: 0x10,
 ///     sync_interval: Some(Duration::from_millis(0x64)),
+///     sequential_access_hint: false,
 /// };
 ///
 /// assert_eq!(cfg.buffer_size, 0x100);
@@ -206,6 +208,12 @@ pub struct FileCfg {
     /// interval; and if `None`, background sync is disabled and durability advances via manual sync
     /// or forced tickets
     pub sync_interval: Option<std::time::Duration>,
+
+    /// Optional hint to configure sequential access optimizations on the backing file
+    ///
+    /// When set to `true`, Windows creates the file handle with `FILE_FLAG_SEQUENTIAL_SCAN`
+    /// instead of `FILE_FLAG_RANDOM_ACCESS`, and Linux applies `POSIX_FADV_SEQUENTIAL`
+    pub sequential_access_hint: bool,
 }
 
 #[derive(Debug)]
@@ -389,6 +397,7 @@ impl File {
     ///     buffer_size: 64,
     ///     initial_available_buffers: 4,
     ///     sync_interval: None,
+    ///     sequential_access_hint: false,
     /// };
     ///
     /// let file = File::new(cfg.clone()).unwrap();
@@ -408,7 +417,11 @@ impl File {
             None => return err::default_error(err::INV).with_module(mid),
         };
 
-        let file = PlatformFile::create(&cfg.path).with_module(mid)?;
+        let file = if cfg.sequential_access_hint {
+            PlatformFile::create_sequential(&cfg.path).with_module(mid)?
+        } else {
+            PlatformFile::create(&cfg.path).with_module(mid)?
+        };
         if let Err(mut e) = file.flock() {
             if let Err(unlink_err) = file.unlink(&cfg.path) {
                 e.add_suppressed(unlink_err);
@@ -459,6 +472,7 @@ impl File {
     ///     buffer_size: 64,
     ///     initial_available_buffers: 4,
     ///     sync_interval: None,
+    ///     sequential_access_hint: false,
     /// };
     ///
     /// {
@@ -481,7 +495,11 @@ impl File {
             None => return err::default_error(err::INV).with_module(mid),
         };
 
-        let file = PlatformFile::open(&cfg.path).with_module(mid)?;
+        let file = if cfg.sequential_access_hint {
+            PlatformFile::open_sequential(&cfg.path).with_module(mid)?
+        } else {
+            PlatformFile::open(&cfg.path).with_module(mid)?
+        };
 
         if let Err(mut e) = file.flock() {
             if let Err(close_err) = file.close() {
@@ -538,6 +556,7 @@ impl File {
     ///     buffer_size: 64,
     ///     initial_available_buffers: 2,
     ///     sync_interval: None,
+    ///     sequential_access_hint: false,
     /// };
     ///
     /// // First invocation creates and initializes the file
@@ -562,7 +581,11 @@ impl File {
             None => return err::default_error(err::INV).with_module(mid),
         };
 
-        let file = PlatformFile::new(&cfg.path).with_module(mid)?;
+        let file = if cfg.sequential_access_hint {
+            PlatformFile::new_sequential(&cfg.path).with_module(mid)?
+        } else {
+            PlatformFile::new(&cfg.path).with_module(mid)?
+        };
         if let Err(mut e) = file.flock() {
             if let Err(close_err) = file.close() {
                 e.add_suppressed(close_err);
@@ -643,6 +666,7 @@ impl File {
     ///     buffer_size: 16,
     ///     initial_available_buffers: 2,
     ///     sync_interval: None,
+    ///     sequential_access_hint: false,
     /// };
     ///
     /// let file = File::new(cfg).unwrap();
@@ -708,6 +732,7 @@ impl File {
     ///     buffer_size: 16,
     ///     initial_available_buffers: 2,
     ///     sync_interval: None,
+    ///     sequential_access_hint: false,
     /// };
     ///
     /// let file = File::new(cfg).unwrap();
@@ -768,6 +793,7 @@ impl File {
     ///     buffer_size: 32,
     ///     initial_available_buffers: 2,
     ///     sync_interval: None,
+    ///     sequential_access_hint: false,
     /// };
     ///
     /// let file = File::new(cfg).unwrap();
@@ -817,6 +843,7 @@ impl File {
     ///     buffer_size: 16,
     ///     initial_available_buffers: 2,
     ///     sync_interval: None,
+    ///     sequential_access_hint: false,
     /// };
     ///
     /// let file = File::new(cfg).unwrap();
@@ -849,6 +876,7 @@ impl File {
     ///     buffer_size: 64,
     ///     initial_available_buffers: 4,
     ///     sync_interval: None,
+    ///     sequential_access_hint: false,
     /// };
     ///
     /// let file = File::new(cfg).unwrap();
@@ -896,6 +924,7 @@ impl File {
     ///     buffer_size: 32,
     ///     initial_available_buffers: 8,
     ///     sync_interval: None,
+    ///     sequential_access_hint: false,
     /// };
     ///
     /// let file = File::new(cfg).unwrap();
@@ -927,6 +956,7 @@ impl File {
     ///     buffer_size: 64,
     ///     initial_available_buffers: 2,
     ///     sync_interval: None,
+    ///     sequential_access_hint: false,
     /// };
     ///
     /// let file = File::new(cfg).unwrap();
@@ -952,6 +982,7 @@ impl File {
     ///     buffer_size: 128,
     ///     initial_available_buffers: 4,
     ///     sync_interval: None,
+    ///     sequential_access_hint: false,
     /// };
     ///
     /// let file = File::new(cfg).unwrap();
@@ -976,6 +1007,7 @@ impl File {
     ///     buffer_size: 16,
     ///     initial_available_buffers: 2,
     ///     sync_interval: None,
+    ///     sequential_access_hint: false,
     /// };
     ///
     /// let file = File::new(cfg).unwrap();
@@ -1003,6 +1035,7 @@ impl File {
     ///     buffer_size: 16,
     ///     initial_available_buffers: 2,
     ///     sync_interval: None,
+    ///     sequential_access_hint: false,
     /// };
     ///
     /// let file = File::new(cfg).unwrap();
@@ -1031,6 +1064,7 @@ impl File {
     ///     buffer_size: 16,
     ///     initial_available_buffers: 2,
     ///     sync_interval: None,
+    ///     sequential_access_hint: false,
     /// };
     ///
     /// let file = File::new(cfg).unwrap();
@@ -1060,6 +1094,7 @@ impl File {
     ///     buffer_size: 16,
     ///     initial_available_buffers: 2,
     ///     sync_interval: None,
+    ///     sequential_access_hint: false,
     /// };
     ///
     /// let file = File::new(cfg).unwrap();
@@ -1095,6 +1130,7 @@ impl File {
     ///     buffer_size: 16,
     ///     initial_available_buffers: 2,
     ///     sync_interval: None,
+    ///     sequential_access_hint: false,
     /// };
     ///
     /// let file = File::new(cfg).unwrap();
@@ -1139,6 +1175,7 @@ impl File {
     ///     buffer_size: 16,
     ///     initial_available_buffers: 2,
     ///     sync_interval: None,
+    ///     sequential_access_hint: false,
     /// };
     ///
     /// let file = File::new(cfg).unwrap();
@@ -1204,6 +1241,7 @@ mod tests {
             buffer_size: BUFFER_SIZE,
             initial_available_buffers: INIT_BUFFERS,
             sync_interval: None,
+            sequential_access_hint: false,
         };
 
         (dir, cfg)
@@ -1246,6 +1284,23 @@ mod tests {
             cfg.initial_available_buffers = 0;
             let err = File::new(cfg).unwrap_err();
             assert_eq!(err.reason, err::INV.reason);
+        }
+
+        #[test]
+        fn ok_new_sequential_access_hint() {
+            let (_dir, mut cfg) = tmp_path();
+            cfg.sequential_access_hint = true;
+            let file = File::new(cfg.clone()).unwrap();
+            assert_eq!(file.length(), BUFFER_SIZE * INIT_BUFFERS);
+            assert!(file.cfg().sequential_access_hint);
+            drop(file);
+
+            let opened = File::open(cfg.clone()).unwrap();
+            assert_eq!(opened.length(), BUFFER_SIZE * INIT_BUFFERS);
+            drop(opened);
+
+            let open_or_created = File::open_or_create(cfg).unwrap();
+            assert_eq!(open_or_created.length(), BUFFER_SIZE * INIT_BUFFERS);
         }
 
         #[test]
@@ -2201,6 +2256,7 @@ mod tests {
                 buffer_size: BUFFER_SIZE,
                 initial_available_buffers: INIT_BUFFERS,
                 sync_interval: None,
+                sequential_access_hint: false,
             };
 
             let file = File::new(cfg).unwrap();
@@ -2502,6 +2558,7 @@ mod tests {
                 buffer_size: BUFFER_SIZE,
                 initial_available_buffers: INIT_BUFFERS,
                 sync_interval: None,
+                sequential_access_hint: false,
             };
             let cfg2 = FileCfg {
                 module_id: 0x22,
@@ -2509,6 +2566,7 @@ mod tests {
                 buffer_size: BUFFER_SIZE,
                 initial_available_buffers: INIT_BUFFERS,
                 sync_interval: None,
+                sequential_access_hint: false,
             };
 
             let file1 = File::new(cfg1.clone()).unwrap();
