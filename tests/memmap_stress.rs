@@ -12,3 +12,6 @@ mod concurrency;
 mod durability;
 #[path = "memmap_stress/growth.rs"]
 mod growth;
+#[cfg(windows)]
+#[path = "memmap_stress/windows_priority.rs"]
+mod windows_priority;
