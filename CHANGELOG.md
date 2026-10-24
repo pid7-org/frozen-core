@@ -1,5 +1,27 @@
 # Changelog
 
+## `0.0.38`
+
+- `file`
+  - Supported sequential access hints during file handle creation via
+    `FileCfg::sequential_access_hint` (#110)
+- `memmap`
+  - Restored strict macOS aarch64 MMU page size validation requiring `PageSize::K16` (#104)
+  - Replaced manual page size configuration with internal platform derivation and page-based
+    allocation via `MemMapCfg::initial_pages` (#105)
+  - Configured directory path and 4-byte name identifier in `MemMapCfg`, and added
+    `MemMap::exists()` (#106)
+  - Implemented zero-unmap in-place growth via virtual address space over-reservation configured
+    by `MemMapCfg::max_len` (#107)
+  - Flushed individual mapped views on Windows during sync (#107)
+  - Serialized concurrent growth operations to eliminate race conditions (#108)
+  - Added `MemMap::lower_memory_priority()` and `MemMapCfg::memory_priority_hint` to lower process
+    memory priority on Windows under memory pressure (#109)
+  - Supported sequential access optimizations and prefetching via `advise_sequential()`,
+    `advise_sequential_range()`, and `prefetch()` (#110)
+  - Impl of `MemMap::resident_bytes()` to query resident memory in RAM via `mincore` on POSIX and
+    `QueryWorkingSetEx` on Windows (#111)
+
 ## `0.0.37`
 
 - `memmap`
