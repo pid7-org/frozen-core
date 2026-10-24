@@ -247,6 +247,14 @@ impl MemMapInterface for POSIXMemMap {
         Ok(())
     }
 
+    /// Lowers process memory priority to optimize page reclamation under pressure
+    ///
+    /// On POSIX systems, this operation is a safe no-op
+    #[inline]
+    fn apply_memory_priority_hint() -> FrozenResult<()> {
+        Ok(())
+    }
+
     /// Syncs in-cache data updates on the storage device
     ///
     /// ## Durability

@@ -31,6 +31,7 @@ pub fn create_test_cfg(
         initial_pages,
         max_len,
         sync_interval: None,
+        memory_priority_hint: false,
     };
 
     (dir, cfg)
@@ -51,6 +52,7 @@ pub fn create_sync_test_cfg(
         initial_pages,
         max_len,
         sync_interval: Some(interval),
+        memory_priority_hint: false,
     };
 
     (dir, cfg)

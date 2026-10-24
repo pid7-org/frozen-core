@@ -15,6 +15,7 @@
 //!     initial_pages: 1,
 //!     max_len: 0x10_0000,
 //!     sync_interval: Some(Duration::from_millis(0x32)),
+//!     memory_priority_hint: false,
 //! };
 //!
 //! let memmap = MemMap::<u64>::new(cfg).unwrap();
@@ -27,6 +28,19 @@
 //! assert_eq!(memmap.read(0, |v| *v).unwrap(), 0xDEAD_C0DE_CAFE_BABE);
 //! assert!(memmap.delete().is_ok());
 //! ```
+//!
+//! ### Why not implement custom LRU page eviction?
+//!
+//! A custom LRU requires tracking page accesses, maintaining metadata, and periodically deciding
+//! which pages to evict; this adds CPU overhead, memory overhead, synchronization complexity, and
+//! potentially incorrect eviction decisions
+//!
+//! The kernel already tracks page activity and manages physical memory globally across processes;
+//! it can reclaim inactive file-backed pages when memory is needed and reload them on demand
+//!
+//! Decision: Let the kernel handle reclamation by default; apply Windows' process memory-priority
+//! hint where available; avoid duplicating kernel functionality unless profiling demonstrates a
+//! concrete need
 
 use crate::{
     ack::{AckTicket, Completion, SyncTrigger, TEpoch},
@@ -160,6 +174,7 @@ pub(in crate::memmap) mod err {
 ///     initial_pages: 1,
 ///     max_len: 0x10_0000,
 ///     sync_interval: Some(Duration::from_millis(0x64)),
+///     memory_priority_hint: false,
 /// };
 ///
 /// assert_eq!(cfg.name, *b"tbfx");
@@ -207,6 +222,13 @@ pub struct MemMapCfg {
     /// at this interval; and if `None`, background sync is disabled and durability advances via
     /// manual sync or forced tickets
     pub sync_interval: Option<std::time::Duration>,
+
+    /// Optional hint to lower process memory priority on Windows to optimize page reclamation
+    /// under memory pressure
+    ///
+    /// When set to `true`, [`MemMap::new`], [`MemMap::open`], and [`MemMap::open_or_create`]
+    /// invoke the hint on a best-effort basis during initialization
+    pub memory_priority_hint: bool,
 }
 
 impl MemMapCfg {
@@ -452,6 +474,7 @@ impl MemMapInner {
 ///     initial_pages: 1,
 ///     max_len: 0x10_0000,
 ///     sync_interval: Some(Duration::from_millis(0x64)),
+///     memory_priority_hint: false,
 /// };
 ///
 /// let memmap = MemMap::<u64>::new(cfg).unwrap();
@@ -598,6 +621,10 @@ where
         file: File,
         page_size: PageSize,
     ) -> FrozenResult<Self> {
+        if cfg.memory_priority_hint {
+            let _ = PlatformMemMap::apply_memory_priority_hint();
+        }
+
         let length = mmap.length();
         let completion = Arc::new(Completion::default());
         let sync_interval = cfg.sync_interval;
@@ -754,6 +781,7 @@ where
     ///     initial_pages: 1,
     ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
+    ///     memory_priority_hint: false,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
@@ -821,6 +849,7 @@ where
     ///     initial_pages: 1,
     ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
+    ///     memory_priority_hint: false,
     /// };
     ///
     /// let page_size = MemMap::<u64>::page_size().unwrap().as_usize();
@@ -894,6 +923,7 @@ where
     ///     initial_pages: 1,
     ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
+    ///     memory_priority_hint: false,
     /// };
     ///
     /// let page_size = MemMap::<u64>::page_size().unwrap().as_usize();
@@ -951,6 +981,7 @@ where
     ///     initial_pages: 1,
     ///     max_len: 0x10_0000,
     ///     sync_interval: None,
+    ///     memory_priority_hint: false,
     /// };
     ///
     /// assert!(!MemMap::<u64>::exists(&cfg));
@@ -985,6 +1016,37 @@ where
         PlatformMemMap::page_size()
     }
 
+    /// Lowers process memory priority to optimize page reclamation under pressure
+    ///
+    /// On Windows, sets `ProcessMemoryPriority` to `MEMORY_PRIORITY_LOW` (0x02)
+    ///
+    /// On POSIX systems, this operation is a safe no-op
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::memmap::{MemMap, MemMapCfg};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = MemMapCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().to_path_buf(),
+    ///     name: *b"prio",
+    ///     version: 1,
+    ///     initial_pages: 1,
+    ///     max_len: 0x10_0000,
+    ///     sync_interval: None,
+    ///     memory_priority_hint: false,
+    /// };
+    ///
+    /// let mmap = MemMap::<u64>::new(cfg).unwrap();
+    /// assert!(mmap.apply_memory_priority_hint().is_ok());
+    /// ```
+    #[inline]
+    pub fn apply_memory_priority_hint(&self) -> FrozenResult<()> {
+        PlatformMemMap::apply_memory_priority_hint()
+    }
+
     /// Returns the length of the memory mapping in bytes
     ///
     /// Corresponds to `initial_pages * page_size` plus any expansion from [`grow`](MemMap::grow)
@@ -1004,6 +1066,7 @@ where
     ///     initial_pages: 1,
     ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
+    ///     memory_priority_hint: false,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1055,6 +1118,7 @@ where
     ///     initial_pages: 1,
     ///     max_len: 0x10_0000,
     ///     sync_interval: None,
+    ///     memory_priority_hint: false,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1155,6 +1219,7 @@ where
     ///     initial_pages: 1,
     ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
+    ///     memory_priority_hint: false,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1186,6 +1251,7 @@ where
     ///     initial_pages: 1,
     ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
+    ///     memory_priority_hint: false,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1216,6 +1282,7 @@ where
     ///     initial_pages: 1,
     ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
+    ///     memory_priority_hint: false,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1252,6 +1319,7 @@ where
     ///     initial_pages: 1,
     ///     max_len: 0x10_0000,
     ///     sync_interval: None,
+    ///     memory_priority_hint: false,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1295,6 +1363,7 @@ where
     ///     initial_pages: 1,
     ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
+    ///     memory_priority_hint: false,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1377,6 +1446,7 @@ where
     ///     initial_pages: 1,
     ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
+    ///     memory_priority_hint: false,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1487,6 +1557,7 @@ where
     ///     initial_pages: 1,
     ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
+    ///     memory_priority_hint: false,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1578,6 +1649,7 @@ where
     ///     initial_pages: 1,
     ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
+    ///     memory_priority_hint: false,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1702,6 +1774,7 @@ where
     ///     initial_pages: 1,
     ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
+    ///     memory_priority_hint: false,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
@@ -1785,6 +1858,7 @@ where
     ///     initial_pages: 1,
     ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
+    ///     memory_priority_hint: false,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1887,6 +1961,7 @@ where
     ///     initial_pages: 1,
     ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
+    ///     memory_priority_hint: false,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1930,6 +2005,7 @@ where
 ///     initial_pages: 1,
 ///     max_len: 0x10_0000,
 ///     sync_interval: Some(Duration::from_millis(0x64)),
+///     memory_priority_hint: false,
 /// };
 ///
 /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -1975,6 +2051,7 @@ where
     ///     initial_pages: 1,
     ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
+    ///     memory_priority_hint: false,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -2041,6 +2118,7 @@ where
     ///     initial_pages: 1,
     ///     max_len: 0x10_0000,
     ///     sync_interval: Some(Duration::from_millis(0x64)),
+    ///     memory_priority_hint: false,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -2147,6 +2225,7 @@ where
     ///     initial_pages: 1,
     ///     max_len: 0x10_0000,
     ///     sync_interval: None,
+    ///     memory_priority_hint: false,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -2178,6 +2257,7 @@ where
     ///     initial_pages: 1,
     ///     max_len: 0x10_0000,
     ///     sync_interval: None,
+    ///     memory_priority_hint: false,
     /// };
     ///
     /// let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -2270,6 +2350,7 @@ mod tests {
             initial_pages: INIT_PAGES,
             max_len: 0x10_0000,
             sync_interval: Some(Duration::from_millis(0x64)),
+            memory_priority_hint: false,
         };
 
         (dir, cfg)
@@ -2407,6 +2488,7 @@ mod tests {
             initial_pages: INIT_PAGES,
             max_len: 0x10_0000,
             sync_interval: Some(Duration::from_millis(0x64)),
+            memory_priority_hint: false,
         };
 
         let err_new = MemMap::<u64>::new(cfg.clone()).unwrap_err();
@@ -2433,6 +2515,7 @@ mod tests {
             initial_pages: INIT_PAGES,
             max_len: 0x10_0000,
             sync_interval: Some(Duration::from_millis(0x64)),
+            memory_priority_hint: false,
         };
 
         let err_new = MemMap::<u64>::new(cfg.clone()).unwrap_err();
@@ -2455,6 +2538,7 @@ mod tests {
             initial_pages: INIT_PAGES,
             max_len: 0x10_0000,
             sync_interval: Some(Duration::from_millis(0x64)),
+            memory_priority_hint: false,
         };
 
         let err_new = MemMap::<u64>::new(cfg.clone()).unwrap_err();
@@ -2480,6 +2564,7 @@ mod tests {
                 initial_pages: INIT_PAGES,
                 max_len: 0x10_0000,
                 sync_interval: Some(Duration::from_millis(0x64)),
+                memory_priority_hint: false,
             };
 
             let err_new = MemMap::<u64>::new(cfg.clone()).unwrap_err();
@@ -2516,6 +2601,7 @@ mod tests {
             initial_pages: 1,
             max_len: 0x10_0000,
             sync_interval: Some(Duration::from_millis(0x64)),
+            memory_priority_hint: false,
         };
         assert_eq!(cfg.versioned_path(), dir.join("tbfx_0"));
 
@@ -2527,6 +2613,7 @@ mod tests {
             initial_pages: 1,
             max_len: 0x10_0000,
             sync_interval: Some(Duration::from_millis(0x64)),
+            memory_priority_hint: false,
         };
         assert_eq!(cfg.versioned_path(), dir.join("DATA_5"));
     }
@@ -2543,6 +2630,7 @@ mod tests {
             initial_pages: 1,
             max_len: 0x10_0000,
             sync_interval: Some(Duration::from_millis(0x64)),
+            memory_priority_hint: false,
         };
         assert_eq!(cfg_v1.versioned_path(), dir.path().join("tbfx_1"));
 
@@ -2554,6 +2642,7 @@ mod tests {
             initial_pages: 1,
             max_len: 0x10_0000,
             sync_interval: Some(Duration::from_millis(0x64)),
+            memory_priority_hint: false,
         };
         assert_eq!(cfg_v2.versioned_path(), dir.path().join("tbfx_2"));
 
@@ -2581,6 +2670,34 @@ mod tests {
         assert!(mmap_v2.delete().is_ok());
         assert!(!MemMap::<ValidT>::exists(&cfg_v2));
         assert!(!cfg_v2.versioned_path().exists());
+    }
+
+    #[test]
+    fn ok_apply_memory_priority_hint() {
+        let (_dir, cfg) = tmp_cfg();
+        let mmap = MemMap::<u64>::new(cfg).unwrap();
+        assert!(mmap.apply_memory_priority_hint().is_ok());
+    }
+
+    #[test]
+    fn ok_memory_priority_hint_initialization() {
+        let (_dir, mut cfg) = tmp_cfg();
+        cfg.memory_priority_hint = true;
+
+        let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
+        assert_eq!(mmap.length(), MemMap::<u64>::page_size().unwrap().as_usize() * INIT_PAGES);
+        drop(mmap);
+
+        let opened = MemMap::<u64>::open(cfg.clone()).unwrap();
+        assert_eq!(opened.length(), MemMap::<u64>::page_size().unwrap().as_usize() * INIT_PAGES);
+        drop(opened);
+
+        let open_or_created = MemMap::<u64>::open_or_create(cfg).unwrap();
+        assert_eq!(
+            open_or_created.length(),
+            MemMap::<u64>::page_size().unwrap().as_usize() * INIT_PAGES
+        );
+        assert!(open_or_created.delete().is_ok());
     }
 
     #[test]

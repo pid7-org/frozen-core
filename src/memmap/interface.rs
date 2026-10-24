@@ -62,6 +62,13 @@ pub(in crate::memmap) trait MemMapInterface: Sized + Send + Sync {
     #[allow(unused)]
     fn evict_pages(&self, indices: &[usize]) -> FrozenResult<()>;
 
+    /// Lowers process memory priority to optimize page reclamation under pressure
+    ///
+    /// On Windows, sets `ProcessMemoryPriority` to `MEMORY_PRIORITY_LOW` (0x02)
+    ///
+    /// On POSIX systems, this operation is a safe no-op
+    fn apply_memory_priority_hint() -> FrozenResult<()>;
+
     /// Syncs in-cache data updates on the storage device
     ///
     /// Flushes dirty pages from the memory mapping cache to storage writeback

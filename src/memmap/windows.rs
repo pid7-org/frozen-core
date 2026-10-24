@@ -24,7 +24,10 @@ use windows_sys::Win32::{
             K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_BLOCK, PSAPI_WORKING_SET_EX_INFORMATION,
         },
         SystemInformation::{GetSystemInfo, SYSTEM_INFO},
-        Threading::GetCurrentProcess,
+        Threading::{
+            GetCurrentProcess, MEMORY_PRIORITY_INFORMATION, MEMORY_PRIORITY_LOW,
+            ProcessMemoryPriority, SetProcessInformation,
+        },
     },
 };
 
@@ -322,6 +325,15 @@ impl MemMapInterface for WINMemMap {
         }
 
         Ok(())
+    }
+
+    /// Lowers process memory priority to optimize page reclamation under pressure
+    ///
+    /// Sets `ProcessMemoryPriority` to `MEMORY_PRIORITY_LOW` (0x02) via Win32
+    /// `SetProcessInformation`
+    #[inline]
+    fn apply_memory_priority_hint() -> FrozenResult<()> {
+        set_memory_priority_raw()
     }
 
     /// Syncs in-cache data updates on the storage device
@@ -754,6 +766,103 @@ fn discard_raw(ptr: *mut core::ffi::c_void, length: usize) -> FrozenResult<()> {
     }
 }
 
+/// Lower calling process memory priority to optimize page reclamation under pressure
+///
+/// ## Why not implement custom LRU page eviction?
+///
+/// A custom LRU requires tracking page accesses, maintaining metadata, and periodically deciding
+/// which pages to evict; this adds CPU overhead, memory overhead, synchronization complexity, and
+/// potentially incorrect eviction decisions
+///
+/// The kernel already tracks page activity and manages physical memory globally across processes;
+/// it can reclaim inactive file-backed pages when memory is needed and reload them on demand
+///
+/// Decision: Let the kernel handle reclamation by default; apply Windows' process memory-priority
+/// hint where available; avoid duplicating kernel functionality unless profiling demonstrates a
+/// concrete need
+fn set_memory_priority_raw() -> FrozenResult<()> {
+    let priority_info = MEMORY_PRIORITY_INFORMATION { MemoryPriority: MEMORY_PRIORITY_LOW };
+
+    let ok = unsafe {
+        SetProcessInformation(
+            GetCurrentProcess(),
+            ProcessMemoryPriority,
+            &priority_info as *const _ as *const core::ffi::c_void,
+            core::mem::size_of::<MEMORY_PRIORITY_INFORMATION>() as u32,
+        )
+    };
+
+    if hints::likely(ok != 0) {
+        return Ok(());
+    }
+
+    let code = last_error();
+    let msg = err_msg(code);
+
+    match code {
+        ERROR_ACCESS_DENIED => raw_error(err::PRM, msg),
+        ERROR_INVALID_PARAMETER => raw_error(err::HCF, msg),
+        _ => raw_error(err::UNK, msg),
+    }
+}
+
+/// Query active memory priority for calling process via `GetProcessInformation`
+#[cfg(test)]
+fn get_memory_priority_raw() -> FrozenResult<u32> {
+    use windows_sys::Win32::System::Threading::GetProcessInformation;
+
+    let mut priority_info = MEMORY_PRIORITY_INFORMATION { MemoryPriority: 0 };
+
+    let ok = unsafe {
+        GetProcessInformation(
+            GetCurrentProcess(),
+            ProcessMemoryPriority,
+            &mut priority_info as *mut _ as *mut core::ffi::c_void,
+            core::mem::size_of::<MEMORY_PRIORITY_INFORMATION>() as u32,
+        )
+    };
+
+    if hints::likely(ok != 0) {
+        return Ok(priority_info.MemoryPriority);
+    }
+
+    let code = last_error();
+    let msg = err_msg(code);
+
+    match code {
+        ERROR_ACCESS_DENIED => raw_error(err::PRM, msg),
+        ERROR_INVALID_PARAMETER => raw_error(err::HCF, msg),
+        _ => raw_error(err::UNK, msg),
+    }
+}
+
+#[cfg(test)]
+fn set_memory_priority_explicit_raw(priority: u32) -> FrozenResult<()> {
+    let priority_info = MEMORY_PRIORITY_INFORMATION { MemoryPriority: priority };
+
+    let ok = unsafe {
+        SetProcessInformation(
+            GetCurrentProcess(),
+            ProcessMemoryPriority,
+            &priority_info as *const _ as *const core::ffi::c_void,
+            core::mem::size_of::<MEMORY_PRIORITY_INFORMATION>() as u32,
+        )
+    };
+
+    if hints::likely(ok != 0) {
+        return Ok(());
+    }
+
+    let code = last_error();
+    let msg = err_msg(code);
+
+    match code {
+        ERROR_ACCESS_DENIED => raw_error(err::PRM, msg),
+        ERROR_INVALID_PARAMETER => raw_error(err::HCF, msg),
+        _ => raw_error(err::UNK, msg),
+    }
+}
+
 /// Fetch the last thread-local error code for Windows
 #[inline]
 fn last_error() -> u32 {
@@ -807,6 +916,48 @@ mod tests {
         fn ok_err_msg() {
             let msg = err_msg(windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND);
             assert!(!msg.is_empty(), "ERROR_FILE_NOT_FOUND must produce message");
+        }
+    }
+
+    mod priority {
+        use super::*;
+        use windows_sys::Win32::System::Threading::MEMORY_PRIORITY_NORMAL;
+
+        #[test]
+        fn ok_query_active_memory_priority() {
+            let priority = get_memory_priority_raw().expect("query memory priority");
+            assert!(priority > 0, "active memory priority should be non-zero");
+        }
+
+        #[test]
+        fn ok_apply_memory_priority_hint() {
+            WINMemMap::apply_memory_priority_hint().expect("apply memory priority hint");
+            let active = get_memory_priority_raw().expect("query active memory priority");
+            assert_eq!(
+                active, MEMORY_PRIORITY_LOW,
+                "active priority must equal MEMORY_PRIORITY_LOW after hint"
+            );
+        }
+
+        #[test]
+        fn ok_memory_priority_state_transition() {
+            set_memory_priority_explicit_raw(MEMORY_PRIORITY_NORMAL)
+                .expect("reset priority to normal");
+            let before = get_memory_priority_raw().expect("query priority before hint");
+            assert_eq!(before, MEMORY_PRIORITY_NORMAL);
+
+            WINMemMap::apply_memory_priority_hint().expect("apply memory priority hint");
+            let after = get_memory_priority_raw().expect("query priority after hint");
+            assert_eq!(after, MEMORY_PRIORITY_LOW, "priority must transition from normal to low");
+        }
+
+        #[test]
+        fn ok_memory_priority_hint_idempotent() {
+            for _ in 0..0x0A {
+                WINMemMap::apply_memory_priority_hint().expect("apply memory priority hint");
+                let active = get_memory_priority_raw().expect("query memory priority");
+                assert_eq!(active, MEMORY_PRIORITY_LOW);
+            }
         }
     }
 
