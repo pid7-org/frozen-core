@@ -10,8 +10,8 @@ Custom implementations and core utilities for [pid7-org](https://github.com/pid7
 > [!NOTE]
 > `frozen-core` contains next to naught AI-generated code
 >
-> Therefore, any catastrophic bugs or fatal crashes encountered are results of pure and unadulterated
-> skill issues
+> Therefore, any catastrophic bugs or fatal crashes encountered are results of pure and
+> unadulterated skill issues
 
 ## Feature Flags
 
@@ -28,7 +28,7 @@ Add following to your `Cargo.toml`,
 
 ```toml
 [dependencies]
-frozen-core = { version = "0.0.38", default-features = true }
+frozen-core = { version = "0.0.39", default-features = true }
 ```
 
 > [!IMPORTANT]
@@ -44,7 +44,8 @@ frozen-core = { version = "0.0.38", default-features = true }
 >
 > External use is discouraged, but not prohibited, given __you assume all the risks__
 
-This project is licensed under the Apache-2.0 and MIT License, see the [LICENSE-APACHE](LICENSE-APACHE) and
-[LICENSE-MIT](LICENSE-MIT) file for more details
+This project is licensed under the Apache-2.0 and MIT License, see the
+[LICENSE-APACHE](LICENSE-APACHE) and [LICENSE-MIT](LICENSE-MIT) file for more details
 
-Contributions are welcome; please feel free to submit a PR or open an issue if you have any feedback or suggestions
+Contributions are welcome; please feel free to submit a PR or open an issue if you have any feedback
+or suggestions

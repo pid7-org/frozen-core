@@ -1,5 +1,12 @@
 # Changelog
 
+## `0.0.39`
+
+- `memmap`
+  - Exposed range-based and page eviction APIs via `MemMap::evict()`, `MemMap::evict_range()`, and
+    `MemMap::evict_pages()` using `madvise`/`posix_fadvise` on POSIX and `DiscardVirtualMemory` on
+    Windows (#112)
+
 ## `0.0.38`
 
 - `file`
