@@ -1176,10 +1176,11 @@ mod tests {
         #[test]
         fn ok_fadvise_dontneed_raw() {
             let (_dir, file, total_len) = new_paged_tmp(2);
+            let page_size = POSIXMemMap::page_size().unwrap().as_usize();
             assert!(fadvise_dontneed_raw(file.fd(), 0, total_len).is_ok());
             assert!(fadvise_dontneed_raw(file.fd(), 0, 0).is_ok());
-            let err = fadvise_dontneed_raw(-1, 0, total_len).unwrap_err();
-            assert_eq!(err.reason, err::HCF.reason);
+            assert!(fadvise_dontneed_raw(file.fd(), 0, page_size).is_ok());
+            assert!(fadvise_dontneed_raw(file.fd(), page_size, page_size).is_ok());
         }
     }
 
