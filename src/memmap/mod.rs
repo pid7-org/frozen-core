@@ -1199,6 +1199,157 @@ where
         mmap.resident_bytes().with_module(self.cfg.module_id)
     }
 
+    /// Evicts memory pages within the specified virtual byte range from physical memory
+    ///
+    /// ## Semantics
+    ///
+    /// Synchronizes pending dirty modifications to storage via [`sync`](MemMap::sync) prior to
+    /// eviction to guarantee durability;
+    ///
+    /// Advises the kernel to drop process page table entries (PTEs) across the specified range,
+    /// and trims clean file pages from the operating system page cache where supported
+    /// (`posix_fadvise(POSIX_FADV_DONTNEED)` on Linux);
+    ///
+    /// The specified byte range is aligned to page boundaries; if `length == 0`, this operation is
+    /// a safe no-op
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::memmap::{MemMap, MemMapCfg};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = MemMapCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().to_path_buf(),
+    ///     name: *b"evct",
+    ///     version: 1,
+    ///     initial_pages: 2,
+    ///     max_len: 0x10_0000,
+    ///     sync_interval: None,
+    ///     memory_priority_hint: false,
+    ///     sequential_access_hint: false,
+    /// };
+    ///
+    /// let mmap = MemMap::<u64>::new(cfg).unwrap();
+    /// mmap.write(0, |v| *v = 0x2A).unwrap();
+    /// mmap.evict_range(0, MemMap::<u64>::page_size().unwrap().as_usize()).unwrap();
+    /// ```
+    pub fn evict_range(&self, offset: usize, length: usize) -> FrozenResult<()> {
+        if hints::unlikely(length == 0) {
+            return Ok(());
+        }
+
+        let total_len = self.inner.length.load(atomic::Ordering::Acquire);
+        if offset.checked_add(length).is_none_or(|end| end > total_len) {
+            return err::raw_error(err::HCF, "range out of bounds for memory mapping")
+                .with_module(self.cfg.module_id);
+        }
+
+        self.sync()?;
+        if let Some(file) = self.file.as_ref() {
+            let _ = file.sync();
+        }
+
+        let mmap_guard = self.inner.mmap.read().unwrap_or_else(|e| e.into_inner());
+        let mmap = match mmap_guard.as_ref() {
+            Some(m) => m,
+            None => return err::default_error(err::INV).with_module(self.cfg.module_id),
+        };
+
+        mmap.evict_range(offset, length).with_module(self.cfg.module_id)?;
+
+        #[cfg(target_os = "linux")]
+        if let Some(file) = self.file.as_ref() {
+            let page_size = self.inner.page_size.as_usize();
+            let start_offset = offset - (offset % page_size);
+            let end_offset = (offset + length).div_ceil(page_size) * page_size;
+            let target_len = (total_len - start_offset).min(end_offset - start_offset);
+            posix::fadvise_dontneed_raw(file.fd(), start_offset, target_len)
+                .with_module(self.cfg.module_id)?;
+        }
+
+        Ok(())
+    }
+
+    /// Evicts all mapped pages across the active memory mapping from physical memory
+    ///
+    /// ## Semantics
+    ///
+    /// Synchronizes pending dirty modifications to storage via [`sync`](MemMap::sync) prior to
+    /// eviction to guarantee durability;
+    ///
+    /// Trims memory back to storage for the entire active range `[0, self.length())`
+    #[inline]
+    pub fn evict(&self) -> FrozenResult<()> {
+        let length = self.inner.length.load(atomic::Ordering::Acquire);
+        self.evict_range(0, length)
+    }
+
+    /// Evicts selected memory pages from physical memory
+    ///
+    /// ## Semantics
+    ///
+    /// Synchronizes pending dirty modifications to storage via [`sync`](MemMap::sync) prior to
+    /// eviction to guarantee durability;
+    ///
+    /// Advises the kernel to release process page table entries and trim clean pages from the
+    /// operating system page cache for the specified page indices;
+    ///
+    /// Contiguous page indices are automatically coalesced to minimize system call overhead;
+    /// duplicate indices are deduplicated; if `indices` is empty, this operation is a safe no-op
+    pub fn evict_pages(&self, indices: &[usize]) -> FrozenResult<()> {
+        if hints::unlikely(indices.is_empty()) {
+            return Ok(());
+        }
+
+        self.sync()?;
+        if let Some(file) = self.file.as_ref() {
+            let _ = file.sync();
+        }
+
+        let mmap_guard = self.inner.mmap.read().unwrap_or_else(|e| e.into_inner());
+        let mmap = match mmap_guard.as_ref() {
+            Some(m) => m,
+            None => return err::default_error(err::INV).with_module(self.cfg.module_id),
+        };
+
+        mmap.evict_pages(indices).with_module(self.cfg.module_id)?;
+
+        #[cfg(target_os = "linux")]
+        if let Some(file) = self.file.as_ref() {
+            let page_size = self.inner.page_size.as_usize();
+            let total_len = self.inner.length.load(atomic::Ordering::Acquire);
+            let num_pages = total_len.div_ceil(page_size);
+
+            let mut sorted = indices.to_vec();
+            sorted.sort_unstable();
+            sorted.dedup();
+
+            let mut i = 0;
+            while i < sorted.len() {
+                let start_idx = sorted[i];
+                if start_idx >= num_pages {
+                    break;
+                }
+                let mut end_idx = start_idx;
+                while i + 1 < sorted.len() && sorted[i + 1] == end_idx + 1 {
+                    i += 1;
+                    end_idx = sorted[i];
+                }
+
+                let run_count = end_idx - start_idx + 1;
+                let offset = start_idx * page_size;
+                let len = (total_len - offset).min(run_count * page_size);
+                posix::fadvise_dontneed_raw(file.fd(), offset, len)
+                    .with_module(self.cfg.module_id)?;
+                i += 1;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Dynamically grows the memory-mapped file by `pages` additional virtual memory pages
     ///
     /// ## Semantics
@@ -2907,6 +3058,68 @@ mod tests {
         assert!(resident >= page_size);
         assert_eq!(resident % page_size, 0);
         assert!(resident <= mmap.length());
+        assert!(mmap.delete().is_ok());
+    }
+
+    #[test]
+    fn ok_evict_range_api() {
+        let (_dir, mut cfg) = tmp_cfg();
+        cfg.initial_pages = 2;
+        let mmap = MemMap::<u64>::new(cfg).unwrap();
+        let page_size = MemMap::<u64>::page_size().unwrap().as_usize();
+        let slots_per_page = page_size / std::mem::size_of::<u64>();
+
+        assert!(mmap.evict_range(0, 0).is_ok());
+
+        mmap.write(0, |v| *v = 0x1111).unwrap();
+        mmap.write(slots_per_page, |v| *v = 0x2222).unwrap();
+
+        // Evict second page only
+        assert!(mmap.evict_range(page_size, page_size).is_ok());
+
+        // Verify values remain intact upon faulting back in
+        assert_eq!(mmap.read(0, |v| *v).unwrap(), 0x1111);
+        assert_eq!(mmap.read(slots_per_page, |v| *v).unwrap(), 0x2222);
+
+        // Out of bounds error check
+        let total_len = mmap.length();
+        let err = mmap.evict_range(0, total_len + 1).unwrap_err();
+        assert_eq!(err.reason, err::HCF.reason);
+
+        assert!(mmap.delete().is_ok());
+    }
+
+    #[test]
+    fn ok_evict_api() {
+        let (_dir, cfg) = tmp_cfg();
+        let mmap = MemMap::<u64>::new(cfg).unwrap();
+
+        mmap.write(0, |v| *v = 0xDEAD_BEEF).unwrap();
+        assert!(mmap.evict().is_ok());
+        assert_eq!(mmap.read(0, |v| *v).unwrap(), 0xDEAD_BEEF);
+        assert!(mmap.delete().is_ok());
+    }
+
+    #[test]
+    fn ok_evict_pages_api() {
+        let (_dir, mut cfg) = tmp_cfg();
+        cfg.initial_pages = 2;
+        let mmap = MemMap::<u64>::new(cfg).unwrap();
+        let page_size = MemMap::<u64>::page_size().unwrap().as_usize();
+        let slots_per_page = page_size / std::mem::size_of::<u64>();
+
+        assert!(mmap.evict_pages(&[]).is_ok());
+
+        mmap.write(0, |v| *v = 0xAAAA).unwrap();
+        mmap.write(slots_per_page, |v| *v = 0xBBBB).unwrap();
+
+        assert!(mmap.evict_pages(&[1]).is_ok());
+        assert_eq!(mmap.read(0, |v| *v).unwrap(), 0xAAAA);
+        assert_eq!(mmap.read(slots_per_page, |v| *v).unwrap(), 0xBBBB);
+
+        let err = mmap.evict_pages(&[2]).unwrap_err();
+        assert_eq!(err.reason, err::HCF.reason);
+
         assert!(mmap.delete().is_ok());
     }
 

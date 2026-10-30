@@ -291,6 +291,29 @@ impl MemMapInterface for POSIXMemMap {
         Ok(())
     }
 
+    /// Evicts memory pages within the specified virtual byte range from physical memory
+    fn evict_range(&self, offset: usize, length: usize) -> FrozenResult<()> {
+        if hints::unlikely(length == 0) {
+            return Ok(());
+        }
+
+        if hints::unlikely(self.ptr.is_null() || self.length == 0) {
+            return raw_error(err::HCF, "cannot evict range on unmapped or zero-length mapping");
+        }
+
+        if offset.checked_add(length).is_none_or(|end| end > self.length) {
+            return raw_error(err::HCF, "range out of bounds for memory mapping");
+        }
+
+        let page_size = Self::page_size()?.as_usize();
+        let start_offset = offset - (offset % page_size);
+        let end_offset = (offset + length).div_ceil(page_size) * page_size;
+        let target_len = (self.length - start_offset).min(end_offset - start_offset);
+        let target_ptr = unsafe { self.ptr.add(start_offset) as *mut c_void };
+
+        madvise_raw(target_ptr, target_len)
+    }
+
     /// Lowers process memory priority to optimize page reclamation under pressure
     ///
     /// On POSIX systems, this operation is a safe no-op
@@ -675,6 +698,55 @@ fn madvise_raw(ptr: *mut c_void, length: size_t) -> FrozenResult<()> {
     madvise_raw_with_advice(ptr, length, MADV_DONTNEED)
 }
 
+/// Evicts clean pages in the specified byte range from the OS page cache via `posix_fadvise`
+#[allow(unused)]
+#[inline]
+pub(super) fn fadvise_dontneed_raw(fd: FileId, offset: usize, length: usize) -> FrozenResult<()> {
+    #[cfg(target_os = "linux")]
+    {
+        if hints::unlikely(length == 0) {
+            return Ok(());
+        }
+
+        let mut retries = 0;
+        loop {
+            let res = unsafe {
+                libc::posix_fadvise(
+                    fd,
+                    offset as libc::off_t,
+                    length as libc::off_t,
+                    libc::POSIX_FADV_DONTNEED,
+                )
+            };
+
+            if hints::likely(res == 0) {
+                return Ok(());
+            }
+
+            match res {
+                libc::EINTR | libc::EAGAIN | libc::EBUSY => {
+                    if retries < MAX_RETRIES {
+                        retries += 1;
+                        continue;
+                    }
+                    return Ok(());
+                }
+                libc::EBADF => {
+                    let err_msg = err_msg(res);
+                    return raw_error(err::HCF, err_msg);
+                }
+                _ => return Ok(()),
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (fd, offset, length);
+        Ok(())
+    }
+}
+
 /// Fetch the last thread-local `errno` value for the current target OS
 #[inline]
 fn last_errno() -> i32 {
@@ -1049,6 +1121,65 @@ mod tests {
 
                 mmap.unmap().unwrap();
             }
+        }
+
+        #[test]
+        fn ok_evict_range_aligned_and_unaligned() {
+            let (_dir, file, total_len) = new_paged_tmp(4);
+            let page_size = POSIXMemMap::page_size().unwrap().as_usize();
+
+            unsafe {
+                let mmap = POSIXMemMap::new(file.fd(), total_len, total_len).unwrap();
+                for i in 0..4 {
+                    let ptr = mmap.as_mut_ptr::<u8>(i * page_size);
+                    *ptr = (i + 1) as u8;
+                }
+                mmap.sync(total_len).unwrap();
+
+                // Evict page 1 and page 2 via page-aligned range
+                assert!(mmap.evict_range(page_size, page_size * 2).is_ok());
+
+                // Evict with unaligned offset and length spanning remaining pages
+                assert!(mmap.evict_range(1, page_size - 1).is_ok());
+
+                mmap.unmap().unwrap();
+            }
+        }
+
+        #[test]
+        fn ok_evict_range_zero_length() {
+            let (_dir, file, total_len) = new_paged_tmp(2);
+
+            let mmap = POSIXMemMap::new(file.fd(), total_len, total_len).unwrap();
+            assert!(mmap.evict_range(0, 0).is_ok());
+            assert!(mmap.evict_range(total_len, 0).is_ok());
+            mmap.unmap().unwrap();
+        }
+
+        #[test]
+        fn err_evict_range_out_of_bounds() {
+            let (_dir, file, total_len) = new_paged_tmp(2);
+
+            let mmap = POSIXMemMap::new(file.fd(), total_len, total_len).unwrap();
+            let err = mmap.evict_range(0, total_len + 1).unwrap_err();
+            assert_eq!(err.reason, err::HCF.reason);
+
+            let err_offset = mmap.evict_range(total_len + 1, 1).unwrap_err();
+            assert_eq!(err_offset.reason, err::HCF.reason);
+
+            let err_overflow = mmap.evict_range(usize::MAX - 0x0A, 0x14).unwrap_err();
+            assert_eq!(err_overflow.reason, err::HCF.reason);
+
+            mmap.unmap().unwrap();
+        }
+
+        #[test]
+        fn ok_fadvise_dontneed_raw() {
+            let (_dir, file, total_len) = new_paged_tmp(2);
+            assert!(fadvise_dontneed_raw(file.fd(), 0, total_len).is_ok());
+            assert!(fadvise_dontneed_raw(file.fd(), 0, 0).is_ok());
+            let err = fadvise_dontneed_raw(-1, 0, total_len).unwrap_err();
+            assert_eq!(err.reason, err::HCF.reason);
         }
     }
 

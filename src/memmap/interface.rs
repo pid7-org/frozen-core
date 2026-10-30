@@ -70,6 +70,17 @@ pub(in crate::memmap) trait MemMapInterface: Sized + Send + Sync {
     #[allow(unused)]
     fn evict_pages(&self, indices: &[usize]) -> FrozenResult<()>;
 
+    /// Evicts memory pages within the specified virtual byte range from physical memory
+    ///
+    /// ## Eviction semantics
+    ///
+    /// Advises or requests the kernel to release process page table / working set entries and free
+    /// physical memory associated with the virtual memory range `[offset, offset + length)`
+    ///
+    /// The specified byte range is aligned to page boundaries; if `length == 0`, this operation is
+    /// a safe no-op
+    fn evict_range(&self, offset: usize, length: usize) -> FrozenResult<()>;
+
     /// Lowers process memory priority to optimize page reclamation under pressure
     ///
     /// On Windows, sets `ProcessMemoryPriority` to `MEMORY_PRIORITY_LOW` (0x02)

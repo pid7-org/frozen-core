@@ -398,6 +398,47 @@ impl MemMapInterface for WINMemMap {
         Ok(())
     }
 
+    /// Evicts memory pages within the specified virtual byte range from physical memory
+    fn evict_range(&self, offset: usize, length: usize) -> FrozenResult<()> {
+        if hints::unlikely(length == 0) {
+            return Ok(());
+        }
+
+        if hints::unlikely(self.ptr.is_null() || self.length == 0) {
+            return raw_error(err::HCF, "cannot evict range on unmapped or zero-length mapping");
+        }
+
+        if offset.checked_add(length).is_none_or(|end| end > self.length) {
+            return raw_error(err::HCF, "range out of bounds for memory mapping");
+        }
+
+        let page_size = Self::page_size()?.as_usize();
+        let start_offset = offset - (offset % page_size);
+        let end_offset = (offset + length).div_ceil(page_size) * page_size;
+        let target_len = (self.length - start_offset).min(end_offset - start_offset);
+        let req_end = start_offset + target_len;
+
+        let mut curr_view_offset = 0;
+        for &(view_ptr, view_len) in &self.views {
+            let view_start = curr_view_offset;
+            let view_end = curr_view_offset + view_len;
+
+            if req_end > view_start && start_offset < view_end {
+                let overlap_start = start_offset.max(view_start);
+                let overlap_end = req_end.min(view_end);
+                let rel_offset = overlap_start - view_start;
+                let rel_len = overlap_end - overlap_start;
+
+                let target_ptr = unsafe { view_ptr.add(rel_offset) as *mut core::ffi::c_void };
+                discard_raw(target_ptr, rel_len)?;
+            }
+
+            curr_view_offset = view_end;
+        }
+
+        Ok(())
+    }
+
     /// Lowers process memory priority to optimize page reclamation under pressure
     ///
     /// Sets `ProcessMemoryPriority` to `MEMORY_PRIORITY_LOW` (0x02) via Win32
@@ -1401,6 +1442,56 @@ mod tests {
 
                 mmap.unmap().unwrap();
             }
+        }
+
+        #[test]
+        fn ok_evict_range_aligned_and_unaligned() {
+            let (_dir, file, total_len) = new_paged_tmp(4);
+            let page_size = WINMemMap::page_size().unwrap().as_usize();
+
+            unsafe {
+                let mmap = WINMemMap::new(file.fd(), total_len, total_len).unwrap();
+                for i in 0..4 {
+                    let ptr = mmap.as_mut_ptr::<u8>(i * page_size);
+                    *ptr = (i + 1) as u8;
+                }
+                mmap.sync(total_len).unwrap();
+
+                // Evict page 1 and page 2 via page-aligned range
+                assert!(mmap.evict_range(page_size, page_size * 2).is_ok());
+
+                // Evict with unaligned offset and length spanning remaining pages
+                assert!(mmap.evict_range(1, page_size - 1).is_ok());
+
+                mmap.unmap().unwrap();
+            }
+        }
+
+        #[test]
+        fn ok_evict_range_zero_length() {
+            let (_dir, file, total_len) = new_paged_tmp(2);
+
+            let mmap = WINMemMap::new(file.fd(), total_len, total_len).unwrap();
+            assert!(mmap.evict_range(0, 0).is_ok());
+            assert!(mmap.evict_range(total_len, 0).is_ok());
+            mmap.unmap().unwrap();
+        }
+
+        #[test]
+        fn err_evict_range_out_of_bounds() {
+            let (_dir, file, total_len) = new_paged_tmp(2);
+
+            let mmap = WINMemMap::new(file.fd(), total_len, total_len).unwrap();
+            let err = mmap.evict_range(0, total_len + 1).unwrap_err();
+            assert_eq!(err.reason, err::HCF.reason);
+
+            let err_offset = mmap.evict_range(total_len + 1, 1).unwrap_err();
+            assert_eq!(err_offset.reason, err::HCF.reason);
+
+            let err_overflow = mmap.evict_range(usize::MAX - 0x0A, 0x14).unwrap_err();
+            assert_eq!(err_overflow.reason, err::HCF.reason);
+
+            mmap.unmap().unwrap();
         }
     }
 
