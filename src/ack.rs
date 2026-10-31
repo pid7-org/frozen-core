@@ -30,6 +30,23 @@ pub type TEpoch = u64;
 /// Custom interface for requesting or executing synchronization trigger
 pub trait SyncTrigger: Send + Sync {
     /// Trigger synchronization up to the current epoch
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::{ack::SyncTrigger, error::FrozenResult};
+    ///
+    /// struct CustomSync;
+    ///
+    /// impl SyncTrigger for CustomSync {
+    ///     fn trigger_sync(&self) -> FrozenResult<()> {
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// let trigger = CustomSync;
+    /// assert!(trigger.trigger_sync().is_ok());
+    /// ```
     fn trigger_sync(&self) -> FrozenResult<()>;
 }
 
@@ -226,12 +243,56 @@ impl Completion {
     }
 
     /// Register a [`SyncTrigger`] implementation for triggering syncs
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::{
+    ///     ack::{Completion, SyncTrigger},
+    ///     error::FrozenResult,
+    /// };
+    /// use std::sync::Arc;
+    ///
+    /// struct DummySync;
+    /// impl SyncTrigger for DummySync {
+    ///     fn trigger_sync(&self) -> FrozenResult<()> {
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// let completion = Completion::default();
+    /// let trigger: Arc<dyn SyncTrigger> = Arc::new(DummySync);
+    /// completion.set_sync_trigger(Arc::downgrade(&trigger));
+    /// assert!(completion.trigger_sync().is_ok());
+    /// ```
     pub fn set_sync_trigger(&self, trigger: sync::Weak<dyn SyncTrigger>) {
         let mut lock = self.sync_trigger.write().unwrap_or_else(|e| e.into_inner());
         *lock = Some(trigger);
     }
 
     /// Trigger synchronization using the registered [`SyncTrigger`]
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::{
+    ///     ack::{Completion, SyncTrigger},
+    ///     error::FrozenResult,
+    /// };
+    /// use std::sync::Arc;
+    ///
+    /// struct FlushSync;
+    /// impl SyncTrigger for FlushSync {
+    ///     fn trigger_sync(&self) -> FrozenResult<()> {
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// let completion = Completion::default();
+    /// let trigger: Arc<dyn SyncTrigger> = Arc::new(FlushSync);
+    /// completion.set_sync_trigger(Arc::downgrade(&trigger));
+    /// assert!(completion.trigger_sync().is_ok());
+    /// ```
     pub fn trigger_sync(&self) -> FrozenResult<()> {
         let trigger = {
             let lock = self.sync_trigger.read().unwrap_or_else(|e| e.into_inner());
@@ -252,6 +313,17 @@ impl Completion {
 
     /// Blocks the current thread until the specified `epoch` becomes durable or an error is
     /// reported
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::ack::Completion;
+    ///
+    /// let completion = Completion::default();
+    /// completion.mark_epoch_as_durable(0x05);
+    ///
+    /// assert_eq!(completion.wait_for_epoch(0x05).unwrap(), 0x05);
+    /// ```
     pub fn wait_for_epoch(&self, epoch: TEpoch) -> FrozenResult<TEpoch> {
         if self.read_durable_epoch() >= epoch {
             return Ok(epoch);
@@ -419,6 +491,18 @@ impl AckTicket {
     }
 
     /// Reference to the underlying shared [`Completion`]
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::ack::{AckTicket, Completion};
+    /// use std::sync::Arc;
+    ///
+    /// let completion = Arc::new(Completion::default());
+    /// let ticket = AckTicket::new(0x01, completion.clone());
+    ///
+    /// assert_eq!(ticket.completion().read_current_epoch(), 0x00);
+    /// ```
     #[inline]
     pub fn completion(&self) -> &sync::Arc<Completion> {
         &self.completion
