@@ -237,7 +237,8 @@ pub struct MemMapCfg {
     /// When set to `true`, the underlying file is opened with sequential access optimizations
     /// (`FILE_FLAG_SEQUENTIAL_SCAN` on Windows, `POSIX_FADV_SEQUENTIAL` on Linux), and
     /// [`MemMap::new`], [`MemMap::open`], and [`MemMap::grow`] invoke sequential access advice
-    /// on a best-effort basis
+    /// on a best-effort basis; when set to `false`, non-sequential access advice (`MADV_RANDOM`
+    /// on Linux) is applied to suppress speculative readahead and fault-around clustering
     pub sequential_access_hint: bool,
 }
 
@@ -639,6 +640,8 @@ where
 
         if cfg.sequential_access_hint {
             let _ = mmap.advise_sequential(0, mmap.length());
+        } else {
+            let _ = mmap.advise_random(0, mmap.length());
         }
 
         let length = mmap.length();
@@ -1110,6 +1113,53 @@ where
         mmap.advise_sequential(offset, length).with_module(self.cfg.module_id)
     }
 
+    /// Advises the kernel that the entire mapped range will be accessed with a random pattern,
+    /// disabling speculative readahead and fault-around clustering
+    ///
+    /// On POSIX systems, invokes `madvise(2)` w/ `MADV_RANDOM`
+    ///
+    /// On Windows, this operation is a safe no-op
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::memmap::{MemMap, MemMapCfg};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = MemMapCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().to_path_buf(),
+    ///     name: *b"rnd1",
+    ///     version: 1,
+    ///     initial_pages: 1,
+    ///     max_len: 0x10_0000,
+    ///     sync_interval: None,
+    ///     memory_priority_hint: false,
+    ///     sequential_access_hint: false,
+    /// };
+    ///
+    /// let mmap = MemMap::<u64>::new(cfg).unwrap();
+    /// assert!(mmap.advise_random().is_ok());
+    /// ```
+    #[inline]
+    pub fn advise_random(&self) -> FrozenResult<()> {
+        let length = self.inner.length.load(atomic::Ordering::Acquire);
+        self.advise_random_range(0, length)
+    }
+
+    /// Advises the kernel that the mapped range from `offset` for `length` bytes will be accessed
+    /// with a random pattern
+    #[inline]
+    pub fn advise_random_range(&self, offset: usize, length: usize) -> FrozenResult<()> {
+        let mmap_guard = self.inner.mmap.read().unwrap_or_else(|e| e.into_inner());
+        let mmap = match mmap_guard.as_ref() {
+            Some(m) => m,
+            None => return err::default_error(err::INV).with_module(self.cfg.module_id),
+        };
+
+        mmap.advise_random(offset, length).with_module(self.cfg.module_id)
+    }
+
     /// Prefetches the specified virtual memory range into physical memory (RAM) asynchronously
     #[inline]
     pub fn prefetch(&self, offset: usize, length: usize) -> FrozenResult<()> {
@@ -1468,6 +1518,8 @@ where
 
         if self.cfg.sequential_access_hint {
             let _ = mmap.advise_sequential(curr_len, bytes_to_add);
+        } else {
+            let _ = mmap.advise_random(curr_len, bytes_to_add);
         }
 
         slot_locks_guard.grow(additional_slots);
@@ -3048,6 +3100,61 @@ mod tests {
     }
 
     #[test]
+    fn ok_advise_random_api() {
+        let (_dir, cfg) = tmp_cfg();
+        let mmap = MemMap::<u64>::new(cfg).unwrap();
+
+        assert!(mmap.advise_random().is_ok());
+        assert!(mmap.advise_random_range(0, 0).is_ok());
+
+        let page_size = MemMap::<u64>::page_size().unwrap().as_usize();
+        assert!(mmap.advise_random_range(0, page_size).is_ok());
+
+        let total_len = mmap.length();
+        let err_rnd = mmap.advise_random_range(0, total_len + 1).unwrap_err();
+        assert_eq!(err_rnd.reason, err::HCF.reason);
+        assert!(mmap.delete().is_ok());
+    }
+
+    #[test]
+    fn ok_random_access_hint_initialization() {
+        let (_dir, mut cfg) = tmp_cfg();
+        cfg.sequential_access_hint = false;
+
+        let mmap = MemMap::<u64>::new(cfg.clone()).unwrap();
+        assert_eq!(mmap.length(), MemMap::<u64>::page_size().unwrap().as_usize() * INIT_PAGES);
+        assert!(!mmap.cfg().sequential_access_hint);
+        drop(mmap);
+
+        let opened = MemMap::<u64>::open(cfg.clone()).unwrap();
+        assert_eq!(opened.length(), MemMap::<u64>::page_size().unwrap().as_usize() * INIT_PAGES);
+        drop(opened);
+
+        let open_or_created = MemMap::<u64>::open_or_create(cfg).unwrap();
+        assert_eq!(
+            open_or_created.length(),
+            MemMap::<u64>::page_size().unwrap().as_usize() * INIT_PAGES
+        );
+        assert!(open_or_created.delete().is_ok());
+    }
+
+    #[test]
+    fn ok_random_access_single_page_fault_residency() {
+        let (_dir, mut cfg) = tmp_cfg();
+        cfg.sequential_access_hint = false;
+        cfg.initial_pages = 0x10;
+
+        let mmap = MemMap::<u64>::new(cfg).unwrap();
+        let page_size = MemMap::<u64>::page_size().unwrap().as_usize();
+
+        assert_eq!(mmap.read(0, |v| *v).unwrap(), 0);
+
+        let resident = mmap.resident_bytes().unwrap();
+        assert_eq!(resident, page_size);
+        assert!(mmap.delete().is_ok());
+    }
+
+    #[test]
     fn ok_resident_bytes_api() {
         let (_dir, cfg) = tmp_cfg();
         let mmap = MemMap::<u64>::new(cfg).unwrap();
@@ -3127,6 +3234,20 @@ mod tests {
     fn ok_sequential_hint_preserved_across_growth() {
         let (_dir, mut cfg) = tmp_cfg();
         cfg.sequential_access_hint = true;
+
+        let mmap = MemMap::<u64>::new(cfg).unwrap();
+        let initial_len = mmap.length();
+        let page_size = MemMap::<u64>::page_size().unwrap().as_usize();
+
+        assert!(mmap.grow(1).is_ok());
+        assert_eq!(mmap.length(), initial_len + page_size);
+        assert!(mmap.delete().is_ok());
+    }
+
+    #[test]
+    fn ok_random_hint_preserved_across_growth() {
+        let (_dir, mut cfg) = tmp_cfg();
+        cfg.sequential_access_hint = false;
 
         let mmap = MemMap::<u64>::new(cfg).unwrap();
         let initial_len = mmap.length();

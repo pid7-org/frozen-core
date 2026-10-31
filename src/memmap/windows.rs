@@ -465,6 +465,22 @@ impl MemMapInterface for WINMemMap {
         self.prefetch(offset, length)
     }
 
+    /// Advises the kernel that the mapped memory range from `offset` for `length` bytes will be
+    /// accessed with a random pattern
+    ///
+    /// On Windows, this operation is a safe no-op validating bounds
+    fn advise_random(&self, offset: usize, length: usize) -> FrozenResult<()> {
+        if hints::unlikely(length == 0 || self.ptr.is_null()) {
+            return Ok(());
+        }
+
+        if offset.checked_add(length).is_none_or(|end| end > self.length) {
+            return raw_error(err::HCF, "range out of bounds for memory mapping");
+        }
+
+        Ok(())
+    }
+
     /// Prefetches the specified virtual memory range into physical memory (RAM) asynchronously
     fn prefetch(&self, offset: usize, length: usize) -> FrozenResult<()> {
         if hints::unlikely(length == 0 || self.ptr.is_null()) {
@@ -1545,6 +1561,21 @@ mod tests {
             assert_eq!(err_seq.reason, err::HCF.reason);
             let err_pref = mmap.prefetch(LENGTH, 1).unwrap_err();
             assert_eq!(err_pref.reason, err::HCF.reason);
+
+            mmap.unmap().unwrap();
+        }
+
+        #[test]
+        fn ok_advise_random() {
+            let (_dir, file) = new_tmp();
+            let mmap = WINMemMap::new(file.fd(), LENGTH, LENGTH).unwrap();
+
+            assert!(mmap.advise_random(0, 0).is_ok());
+            assert!(mmap.advise_random(0, LENGTH).is_ok());
+            assert!(mmap.advise_random(0, BUFFER_SIZE).is_ok());
+
+            let err_rnd = mmap.advise_random(0, LENGTH + 1).unwrap_err();
+            assert_eq!(err_rnd.reason, err::HCF.reason);
 
             mmap.unmap().unwrap();
         }

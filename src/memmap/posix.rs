@@ -9,9 +9,9 @@ use crate::{error::FrozenResult, hints};
 use core::ptr;
 use libc::{
     _SC_PAGESIZE, EACCES, EAGAIN, EBADF, EBUSY, EINTR, EINVAL, EIO, ENODEV, ENOMEM, EOVERFLOW,
-    EPERM, ETXTBSY, MADV_DONTNEED, MADV_SEQUENTIAL, MADV_WILLNEED, MAP_ANON, MAP_FAILED, MAP_FIXED,
-    MAP_NORESERVE, MAP_PRIVATE, MAP_SHARED, MS_SYNC, PROT_NONE, PROT_READ, PROT_WRITE, c_int,
-    c_void, madvise, mincore, mmap, msync, munmap, off_t, size_t, sysconf,
+    EPERM, ETXTBSY, MADV_DONTNEED, MADV_RANDOM, MADV_SEQUENTIAL, MADV_WILLNEED, MAP_ANON,
+    MAP_FAILED, MAP_FIXED, MAP_NORESERVE, MAP_PRIVATE, MAP_SHARED, MS_SYNC, PROT_NONE, PROT_READ,
+    PROT_WRITE, c_int, c_void, madvise, mincore, mmap, msync, munmap, off_t, size_t, sysconf,
 };
 
 /// File descriptor type for POSIX systems
@@ -340,6 +340,26 @@ impl MemMapInterface for POSIXMemMap {
         let target_ptr = unsafe { self.ptr.add(start_offset) as *mut c_void };
 
         madvise_raw_with_advice(target_ptr, target_len, MADV_SEQUENTIAL)
+    }
+
+    /// Advises the kernel that the mapped memory range from `offset` for `length` bytes will be
+    /// accessed with a random pattern, suppressing readahead and fault-around clustering
+    fn advise_random(&self, offset: usize, length: usize) -> FrozenResult<()> {
+        if hints::unlikely(length == 0 || self.ptr.is_null()) {
+            return Ok(());
+        }
+
+        if offset.checked_add(length).is_none_or(|end| end > self.length) {
+            return raw_error(err::HCF, "range out of bounds for memory mapping");
+        }
+
+        let page_size = Self::page_size()?.as_usize();
+        let start_offset = offset - (offset % page_size);
+        let end_offset = (offset + length).div_ceil(page_size) * page_size;
+        let target_len = (self.length - start_offset).min(end_offset - start_offset);
+        let target_ptr = unsafe { self.ptr.add(start_offset) as *mut c_void };
+
+        madvise_raw_with_advice(target_ptr, target_len, MADV_RANDOM)
     }
 
     /// Prefetches the specified virtual memory range into physical memory (RAM) asynchronously
@@ -973,6 +993,26 @@ mod tests {
                 mmap.unmap().unwrap();
             }
         }
+
+        #[test]
+        fn ok_advise_random_eliminates_readahead_clustering() {
+            let (_dir, file, total_len) = new_paged_tmp(0x10);
+            let page_size = POSIXMemMap::page_size().unwrap().as_usize();
+
+            unsafe {
+                let mmap = POSIXMemMap::new(file.fd(), total_len, total_len).unwrap();
+                mmap.advise_random(0, total_len).unwrap();
+
+                let p0 = mmap.as_ptr::<u8>(0);
+                let _val = core::ptr::read_volatile(p0);
+
+                let active = mmap.active_page_indices().unwrap();
+                assert_eq!(active, vec![0]);
+                assert_eq!(mmap.resident_bytes().unwrap(), page_size);
+
+                mmap.unmap().unwrap();
+            }
+        }
     }
 
     mod eviction {
@@ -1234,6 +1274,21 @@ mod tests {
             assert_eq!(err_seq.reason, err::HCF.reason);
             let err_pref = mmap.prefetch(LENGTH, 1).unwrap_err();
             assert_eq!(err_pref.reason, err::HCF.reason);
+
+            mmap.unmap().unwrap();
+        }
+
+        #[test]
+        fn ok_advise_random() {
+            let (_dir, file) = new_tmp();
+            let mmap = POSIXMemMap::new(file.fd(), LENGTH, LENGTH).unwrap();
+
+            assert!(mmap.advise_random(0, 0).is_ok());
+            assert!(mmap.advise_random(0, LENGTH).is_ok());
+            assert!(mmap.advise_random(0, BUFFER_SIZE).is_ok());
+
+            let err_rnd = mmap.advise_random(0, LENGTH + 1).unwrap_err();
+            assert_eq!(err_rnd.reason, err::HCF.reason);
 
             mmap.unmap().unwrap();
         }

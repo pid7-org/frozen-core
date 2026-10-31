@@ -97,6 +97,14 @@ pub(in crate::memmap) trait MemMapInterface: Sized + Send + Sync {
     /// governed by `FILE_FLAG_SEQUENTIAL_SCAN`
     fn advise_sequential(&self, offset: usize, length: usize) -> FrozenResult<()>;
 
+    /// Advises the kernel that the mapped range from `offset` for `length` bytes will be accessed
+    /// with a random pattern, suppressing speculative readahead and fault-around clustering
+    ///
+    /// On POSIX systems, invokes `madvise(2)` w/ `MADV_RANDOM`
+    ///
+    /// On Windows, this operation is a safe no-op
+    fn advise_random(&self, offset: usize, length: usize) -> FrozenResult<()>;
+
     /// Prefetches the specified virtual memory range into physical memory (RAM) asynchronously
     ///
     /// On POSIX systems, invokes `madvise(2)` w/ `MADV_WILLNEED`
