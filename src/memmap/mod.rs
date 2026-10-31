@@ -382,7 +382,7 @@ struct SlotReadGuard<'a>(&'a atomic::AtomicU32);
 impl Drop for SlotReadGuard<'_> {
     #[inline(always)]
     fn drop(&mut self) {
-        self.0.fetch_sub(1, atomic::Ordering::Release);
+        let _ = self.0.fetch_sub(1, atomic::Ordering::Release);
     }
 }
 
@@ -684,8 +684,8 @@ where
             is_parked: atomic::AtomicBool::new(false),
         });
 
-        let weak_inner: std::sync::Weak<dyn SyncTrigger> =
-            Arc::downgrade(&inner) as std::sync::Weak<dyn SyncTrigger>;
+        let weak = Arc::downgrade(&inner);
+        let weak_inner: std::sync::Weak<dyn SyncTrigger> = weak;
         completion.set_sync_trigger(weak_inner);
 
         let bg_thread = if let Some(interval) = sync_interval {
@@ -1661,7 +1661,7 @@ where
         drop(mmap_guard);
         drop(slot_locks_guard);
 
-        self.inner.completion.increment_current_epoch();
+        let _ = self.inner.completion.increment_current_epoch();
         Ok(())
     }
 
@@ -4817,11 +4817,11 @@ mod tests {
             let mmap = MemMap::<u64>::new(cfg).unwrap();
             mmap.write(0, |v| *v = 0xAA_BBu64).unwrap();
 
-            let base_ptr_before = mmap.read(0, |v| v as *const u64).unwrap();
+            let base_ptr_before = mmap.read(0, core::ptr::from_ref).unwrap();
 
             mmap.grow(2).unwrap();
 
-            let base_ptr_after = mmap.read(0, |v| v as *const u64).unwrap();
+            let base_ptr_after = mmap.read(0, core::ptr::from_ref).unwrap();
             assert_eq!(base_ptr_before, base_ptr_after);
             assert_eq!(mmap.read(0, |v| *v).unwrap(), 0xAA_BBu64);
 

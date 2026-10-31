@@ -457,14 +457,7 @@ fn mmap_raw(fd: i32, length: size_t, max_len: size_t) -> FrozenResult<TPtr> {
     let mut retries = 0;
     let base_ptr = loop {
         let ptr = unsafe {
-            mmap(
-                ptr::null_mut(),
-                max_len,
-                PROT_NONE,
-                MAP_PRIVATE | MAP_ANON | MAP_NORESERVE,
-                -1,
-                0 as off_t,
-            )
+            mmap(ptr::null_mut(), max_len, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0)
         };
 
         if ptr == MAP_FAILED {
@@ -503,7 +496,7 @@ fn mmap_raw(fd: i32, length: size_t, max_len: size_t) -> FrozenResult<TPtr> {
                 PROT_WRITE | PROT_READ,
                 MAP_SHARED | MAP_FIXED,
                 fd,
-                0 as off_t,
+                0,
             )
         };
 

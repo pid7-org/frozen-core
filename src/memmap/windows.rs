@@ -650,7 +650,7 @@ fn mmap_raw(
             let code = last_error();
             let err_msg = err_msg(code);
 
-            unsafe { VirtualFreeEx(h_process, base_addr, 0, MEM_RELEASE) };
+            let _ = unsafe { VirtualFreeEx(h_process, base_addr, 0, MEM_RELEASE) };
             return raw_error(err::UNK, err_msg);
         }
     }
@@ -675,23 +675,23 @@ fn mmap_raw(
                         continue;
                     }
 
-                    unsafe { VirtualFreeEx(h_process, base_addr, 0, MEM_RELEASE) };
+                    let _ = unsafe { VirtualFreeEx(h_process, base_addr, 0, MEM_RELEASE) };
                     return raw_error(err::UNK, err_msg);
                 }
                 ERROR_ACCESS_DENIED => {
-                    unsafe { VirtualFreeEx(h_process, base_addr, 0, MEM_RELEASE) };
+                    let _ = unsafe { VirtualFreeEx(h_process, base_addr, 0, MEM_RELEASE) };
                     return raw_error(err::PRM, err_msg);
                 }
                 ERROR_INVALID_HANDLE | ERROR_INVALID_PARAMETER | ERROR_FILE_INVALID => {
-                    unsafe { VirtualFreeEx(h_process, base_addr, 0, MEM_RELEASE) };
+                    let _ = unsafe { VirtualFreeEx(h_process, base_addr, 0, MEM_RELEASE) };
                     return raw_error(err::HCF, err_msg);
                 }
                 ERROR_NOT_ENOUGH_MEMORY | ERROR_OUTOFMEMORY | ERROR_COMMITMENT_LIMIT => {
-                    unsafe { VirtualFreeEx(h_process, base_addr, 0, MEM_RELEASE) };
+                    let _ = unsafe { VirtualFreeEx(h_process, base_addr, 0, MEM_RELEASE) };
                     return raw_error(err::NMM, err_msg);
                 }
                 _ => {
-                    unsafe { VirtualFreeEx(h_process, base_addr, 0, MEM_RELEASE) };
+                    let _ = unsafe { VirtualFreeEx(h_process, base_addr, 0, MEM_RELEASE) };
                     return raw_error(err::UNK, err_msg);
                 }
             }
@@ -711,12 +711,12 @@ fn mmap_raw(
             )
         };
 
-        unsafe { CloseHandle(h_map) };
+        let _ = unsafe { CloseHandle(h_map) };
         if hints::unlikely(view.Value.is_null()) {
             let code = last_error();
             let err_msg = err_msg(code);
 
-            unsafe { VirtualFreeEx(h_process, base_addr, 0, MEM_RELEASE) };
+            let _ = unsafe { VirtualFreeEx(h_process, base_addr, 0, MEM_RELEASE) };
 
             return match code {
                 ERROR_NOT_ENOUGH_MEMORY | ERROR_OUTOFMEMORY | ERROR_COMMITMENT_LIMIT => {
@@ -821,7 +821,7 @@ fn mmap_grow_raw(
             )
         };
 
-        unsafe { CloseHandle(h_map) };
+        let _ = unsafe { CloseHandle(h_map) };
 
         if hints::unlikely(view.Value.is_null()) {
             let code = last_error();
@@ -968,7 +968,7 @@ fn set_memory_priority_raw() -> FrozenResult<()> {
         SetProcessInformation(
             GetCurrentProcess(),
             ProcessMemoryPriority,
-            &priority_info as *const _ as *const core::ffi::c_void,
+            core::ptr::from_ref(&priority_info).cast(),
             core::mem::size_of::<MEMORY_PRIORITY_INFORMATION>() as u32,
         )
     };
@@ -1021,7 +1021,7 @@ fn get_memory_priority_raw() -> FrozenResult<u32> {
         GetProcessInformation(
             GetCurrentProcess(),
             ProcessMemoryPriority,
-            &mut priority_info as *mut _ as *mut core::ffi::c_void,
+            core::ptr::from_mut(&mut priority_info).cast(),
             core::mem::size_of::<MEMORY_PRIORITY_INFORMATION>() as u32,
         )
     };
@@ -1048,7 +1048,7 @@ fn set_memory_priority_explicit_raw(priority: u32) -> FrozenResult<()> {
         SetProcessInformation(
             GetCurrentProcess(),
             ProcessMemoryPriority,
-            &priority_info as *const _ as *const core::ffi::c_void,
+            core::ptr::from_ref(&priority_info).cast(),
             core::mem::size_of::<MEMORY_PRIORITY_INFORMATION>() as u32,
         )
     };
