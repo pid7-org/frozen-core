@@ -244,6 +244,27 @@ pub struct MemMapCfg {
 
 impl MemMapCfg {
     /// Computes the versioned file path formatted as `{dir}/{name}_{version}`
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::memmap::MemMapCfg;
+    /// use std::path::PathBuf;
+    ///
+    /// let cfg = MemMapCfg {
+    ///     module_id: 0x01,
+    ///     path: PathBuf::from("/tmp"),
+    ///     name: *b"data",
+    ///     version: 0x02,
+    ///     initial_pages: 0x01,
+    ///     max_len: 0x10_0000,
+    ///     sync_interval: None,
+    ///     memory_priority_hint: false,
+    ///     sequential_access_hint: false,
+    /// };
+    ///
+    /// assert_eq!(cfg.versioned_path(), PathBuf::from("/tmp/data_2"));
+    /// ```
     #[inline]
     pub fn versioned_path(&self) -> std::path::PathBuf {
         let name = core::str::from_utf8(&self.name).unwrap_or_default();
@@ -1102,6 +1123,28 @@ where
 
     /// Advises the kernel that the mapped range from `offset` for `length` bytes will be accessed
     /// sequentially
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::memmap::{MemMap, MemMapCfg};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = MemMapCfg {
+    ///     module_id: 0x01,
+    ///     path: dir.path().to_path_buf(),
+    ///     name: *b"sqr1",
+    ///     version: 0x01,
+    ///     initial_pages: 0x01,
+    ///     max_len: 0x10_0000,
+    ///     sync_interval: None,
+    ///     memory_priority_hint: false,
+    ///     sequential_access_hint: false,
+    /// };
+    ///
+    /// let mmap = MemMap::<u64>::new(cfg).unwrap();
+    /// assert!(mmap.advise_sequential_range(0, 0x1000).is_ok());
+    /// ```
     #[inline]
     pub fn advise_sequential_range(&self, offset: usize, length: usize) -> FrozenResult<()> {
         let mmap_guard = self.inner.mmap.read().unwrap_or_else(|e| e.into_inner());
@@ -1149,6 +1192,28 @@ where
 
     /// Advises the kernel that the mapped range from `offset` for `length` bytes will be accessed
     /// with a random pattern
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::memmap::{MemMap, MemMapCfg};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = MemMapCfg {
+    ///     module_id: 0x01,
+    ///     path: dir.path().to_path_buf(),
+    ///     name: *b"rnr1",
+    ///     version: 0x01,
+    ///     initial_pages: 0x01,
+    ///     max_len: 0x10_0000,
+    ///     sync_interval: None,
+    ///     memory_priority_hint: false,
+    ///     sequential_access_hint: false,
+    /// };
+    ///
+    /// let mmap = MemMap::<u64>::new(cfg).unwrap();
+    /// assert!(mmap.advise_random_range(0, 0x1000).is_ok());
+    /// ```
     #[inline]
     pub fn advise_random_range(&self, offset: usize, length: usize) -> FrozenResult<()> {
         let mmap_guard = self.inner.mmap.read().unwrap_or_else(|e| e.into_inner());
@@ -1161,6 +1226,28 @@ where
     }
 
     /// Prefetches the specified virtual memory range into physical memory (RAM) asynchronously
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::memmap::{MemMap, MemMapCfg};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = MemMapCfg {
+    ///     module_id: 0x01,
+    ///     path: dir.path().to_path_buf(),
+    ///     name: *b"prf1",
+    ///     version: 0x01,
+    ///     initial_pages: 0x01,
+    ///     max_len: 0x10_0000,
+    ///     sync_interval: None,
+    ///     memory_priority_hint: false,
+    ///     sequential_access_hint: false,
+    /// };
+    ///
+    /// let mmap = MemMap::<u64>::new(cfg).unwrap();
+    /// assert!(mmap.prefetch(0, 0x1000).is_ok());
+    /// ```
     #[inline]
     pub fn prefetch(&self, offset: usize, length: usize) -> FrozenResult<()> {
         let mmap_guard = self.inner.mmap.read().unwrap_or_else(|e| e.into_inner());
@@ -1330,6 +1417,29 @@ where
     /// eviction to guarantee durability;
     ///
     /// Trims memory back to storage for the entire active range `[0, self.length())`
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::memmap::{MemMap, MemMapCfg};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = MemMapCfg {
+    ///     module_id: 0x01,
+    ///     path: dir.path().to_path_buf(),
+    ///     name: *b"evc1",
+    ///     version: 0x01,
+    ///     initial_pages: 0x01,
+    ///     max_len: 0x10_0000,
+    ///     sync_interval: None,
+    ///     memory_priority_hint: false,
+    ///     sequential_access_hint: false,
+    /// };
+    ///
+    /// let mmap = MemMap::<u64>::new(cfg).unwrap();
+    /// mmap.write(0, |v| *v = 0x2A).unwrap();
+    /// assert!(mmap.evict().is_ok());
+    /// ```
     #[inline]
     pub fn evict(&self) -> FrozenResult<()> {
         let length = self.inner.length.load(atomic::Ordering::Acquire);
@@ -1348,6 +1458,29 @@ where
     ///
     /// Contiguous page indices are automatically coalesced to minimize system call overhead;
     /// duplicate indices are deduplicated; if `indices` is empty, this operation is a safe no-op
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::memmap::{MemMap, MemMapCfg};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = MemMapCfg {
+    ///     module_id: 0x01,
+    ///     path: dir.path().to_path_buf(),
+    ///     name: *b"evcp",
+    ///     version: 0x01,
+    ///     initial_pages: 0x02,
+    ///     max_len: 0x10_0000,
+    ///     sync_interval: None,
+    ///     memory_priority_hint: false,
+    ///     sequential_access_hint: false,
+    /// };
+    ///
+    /// let mmap = MemMap::<u64>::new(cfg).unwrap();
+    /// mmap.write(0, |v| *v = 0x2A).unwrap();
+    /// assert!(mmap.evict_pages(&[0]).is_ok());
+    /// ```
     pub fn evict_pages(&self, indices: &[usize]) -> FrozenResult<()> {
         if hints::unlikely(indices.is_empty()) {
             return Ok(());

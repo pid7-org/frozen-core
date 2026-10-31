@@ -41,18 +41,48 @@ pub enum PageSize {
 
 impl PageSize {
     /// Returns the page size in bytes as `usize`
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::memmap::PageSize;
+    ///
+    /// assert_eq!(PageSize::K4.as_usize(), 0x1000);
+    /// assert_eq!(PageSize::K16.as_usize(), 0x4000);
+    /// assert_eq!(PageSize::K64.as_usize(), 0x10000);
+    /// ```
     #[inline]
     pub const fn as_usize(self) -> usize {
         self as usize
     }
 
     /// Returns the page size in bytes as `u32`
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::memmap::PageSize;
+    ///
+    /// assert_eq!(PageSize::K4.as_u32(), 0x1000);
+    /// assert_eq!(PageSize::K16.as_u32(), 0x4000);
+    /// assert_eq!(PageSize::K64.as_u32(), 0x10000);
+    /// ```
     #[inline]
     pub const fn as_u32(self) -> u32 {
         self as usize as u32
     }
 
     /// Returns `true` since all valid hardware page sizes are powers of two
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::memmap::PageSize;
+    ///
+    /// assert!(PageSize::K4.is_power_of_two());
+    /// assert!(PageSize::K16.is_power_of_two());
+    /// assert!(PageSize::K64.is_power_of_two());
+    /// ```
     #[inline]
     pub const fn is_power_of_two(self) -> bool {
         true
@@ -68,6 +98,18 @@ impl PageSize {
     ///   `PageSize::K4` (4096 bytes) on Intel (`x86_64`)
     /// - **Linux**: `PageSize::K4` (4096 bytes) on `x86`/`x86_64`;
     ///   `PageSize::K4`, `PageSize::K16`, or `PageSize::K64` on `aarch64`
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::memmap::PageSize;
+    ///
+    /// #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    /// assert!(PageSize::K16.validate_platform().is_ok());
+    ///
+    /// #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    /// assert!(PageSize::K4.validate_platform().is_ok());
+    /// ```
     pub fn validate_platform(self) -> FrozenResult<Self> {
         Self::validate_target_platform(self, std::env::consts::OS, std::env::consts::ARCH)
     }
