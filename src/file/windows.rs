@@ -940,7 +940,7 @@ fn set_eof_raw(handle: HANDLE, new_len: i64) -> FrozenResult<()> {
         SetFileInformationByHandle(
             handle,
             FileEndOfFileInfo,
-            &info as *const _ as *const core::ffi::c_void,
+            core::ptr::from_ref(&info).cast(),
             core::mem::size_of::<FILE_END_OF_FILE_INFO>() as u32,
         )
     };
@@ -991,7 +991,7 @@ fn set_alloc_raw(handle: HANDLE, new_len: i64) -> FrozenResult<()> {
         SetFileInformationByHandle(
             handle,
             FileAllocationInfo,
-            &info as *const _ as *const core::ffi::c_void,
+            core::ptr::from_ref(&info).cast(),
             core::mem::size_of::<FILE_ALLOCATION_INFO>() as u32,
         )
     };
@@ -1042,7 +1042,7 @@ fn set_disposition_raw(handle: HANDLE) -> FrozenResult<()> {
         SetFileInformationByHandle(
             handle,
             FileDispositionInfoEx,
-            &info_ex as *const _ as *const core::ffi::c_void,
+            core::ptr::from_ref(&info_ex).cast(),
             core::mem::size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
         )
     };
@@ -1060,7 +1060,7 @@ fn set_disposition_raw(handle: HANDLE) -> FrozenResult<()> {
             SetFileInformationByHandle(
                 handle,
                 FileDispositionInfo,
-                &info as *const _ as *const core::ffi::c_void,
+                core::ptr::from_ref(&info).cast(),
                 core::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
             )
         };

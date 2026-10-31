@@ -6,8 +6,8 @@ use libc::{
     EACCES, EAGAIN, EBADF, EBUSY, EEXIST, EFAULT, EINTR, EINVAL, EIO, EISDIR, ELOOP, ENAMETOOLONG,
     ENOENT, ENOLCK, ENOSPC, ENOTDIR, EOPNOTSUPP, EPERM, EROFS, ESPIPE, EWOULDBLOCK, F_OK, LOCK_EX,
     LOCK_NB, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_RDONLY, O_RDWR, S_IRUSR, S_IWUSR, access,
-    c_int, c_uint, c_void, close, flock, fstat, ftruncate, off_t, open, pread, pwrite, size_t,
-    stat, unlink,
+    c_int, c_uint, c_void, close, flock, fstat, ftruncate, off_t, open, pread, pwrite, stat,
+    unlink,
 };
 use std::sync::atomic;
 
@@ -561,12 +561,7 @@ impl FileInterface for POSIXFile {
             };
 
             let res = unsafe {
-                pread(
-                    fd,
-                    buf[read..].as_mut_ptr() as *mut c_void,
-                    (buf.len() - read) as size_t,
-                    chunk_offset,
-                )
+                pread(fd, buf[read..].as_mut_ptr() as *mut c_void, buf.len() - read, chunk_offset)
             };
 
             // unexpected EOF
@@ -632,7 +627,7 @@ impl FileInterface for POSIXFile {
                 pwrite(
                     fd,
                     buf[written..].as_ptr() as *const c_void,
-                    (buf.len() - written) as size_t,
+                    buf.len() - written,
                     chunk_offset,
                 )
             };
@@ -739,7 +734,7 @@ fn open_raw(path: &std::path::Path, flags: c_int) -> FrozenResult<FileId> {
     let cpath = path_to_cstring(path)?;
 
     // write + read permissions
-    let perm = (S_IRUSR | S_IWUSR) as c_uint;
+    let perm = c_uint::from(S_IRUSR | S_IWUSR);
 
     #[cfg(target_os = "linux")]
     let (mut flags, mut tried_noatime) = (flags, false);

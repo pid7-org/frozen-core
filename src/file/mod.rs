@@ -307,8 +307,8 @@ impl File {
             shutdown: atomic::AtomicBool::new(false),
         });
 
-        let weak_inner: std::sync::Weak<dyn SyncTrigger> =
-            Arc::downgrade(&inner) as std::sync::Weak<dyn SyncTrigger>;
+        let weak = Arc::downgrade(&inner);
+        let weak_inner: std::sync::Weak<dyn SyncTrigger> = weak;
         completion.set_sync_trigger(weak_inner);
 
         let bg_thread = if let Some(interval) = sync_interval {
@@ -823,8 +823,8 @@ impl File {
         let curr_len = self.inner.current_length.load(atomic::Ordering::Acquire);
         file.grow(curr_len, len_to_add).with_module(mid)?;
 
-        self.inner.current_length.fetch_add(len_to_add, atomic::Ordering::Release);
-        self.inner.completion.increment_current_epoch();
+        let _ = self.inner.current_length.fetch_add(len_to_add, atomic::Ordering::Release);
+        let _ = self.inner.completion.increment_current_epoch();
 
         Ok(())
     }
