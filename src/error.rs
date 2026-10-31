@@ -110,18 +110,51 @@ impl FrozenError {
     }
 
     /// Attach a secondary error that occurred during best-effort cleanup or rollback
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::error::{ErrCode, FrozenError};
+    ///
+    /// let mut primary = FrozenError::unbound(0x01, ErrCode::new(0x02, "write"), "disk full");
+    /// let secondary = FrozenError::unbound(0x01, ErrCode::new(0x03, "cleanup"), "unlink failed");
+    /// primary.add_suppressed(secondary);
+    ///
+    /// assert_eq!(primary.suppressed().len(), 0x01);
+    /// ```
     pub fn add_suppressed(&mut self, err: FrozenError) {
         let list = self.suppressed.get_or_insert_with(|| Box::new(Vec::new()));
         list.push(err);
     }
 
     /// Builder-style helper to attach a suppressed error
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::error::{ErrCode, FrozenError};
+    ///
+    /// let suppressed = FrozenError::unbound(0x01, ErrCode::new(0x03, "sync"), "flush failed");
+    /// let primary = FrozenError::unbound(0x01, ErrCode::new(0x02, "write"), "disk full")
+    ///     .with_suppressed(suppressed);
+    ///
+    /// assert_eq!(primary.suppressed().len(), 0x01);
+    /// ```
     pub fn with_suppressed(mut self, err: FrozenError) -> Self {
         self.add_suppressed(err);
         self
     }
 
     /// Returns a slice of suppressed errors attached to this error
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::error::{ErrCode, FrozenError};
+    ///
+    /// let err = FrozenError::unbound(0x01, ErrCode::new(0x02, "io"), "read error");
+    /// assert!(err.suppressed().is_empty());
+    /// ```
     #[inline]
     pub fn suppressed(&self) -> &[FrozenError] {
         match &self.suppressed {
@@ -354,6 +387,17 @@ impl ErrCode {
 /// ```
 pub trait BindModule<T> {
     /// Attaches `module_id` to the inner [`FrozenError`] if `self` is `Err`
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::error::{BindModule, ErrCode, FrozenError, FrozenResult};
+    ///
+    /// let err = FrozenError::unbound(0x08, ErrCode::new(0x10, "io"), "fail");
+    /// let res: FrozenResult<()> = Err(err);
+    /// let bound = res.with_module(0x02);
+    /// assert_eq!(bound.unwrap_err().module, 0x02);
+    /// ```
     fn with_module(self, module_id: u8) -> FrozenResult<T>;
 }
 
