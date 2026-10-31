@@ -310,7 +310,7 @@ impl std::fmt::Display for FrozenError {
             let _ = write!(formatted, "{}", TreeHelper(self));
 
             if formatted.ends_with('\n') {
-                formatted.pop();
+                let _ = formatted.pop();
             }
 
             write!(f, "{formatted}")
