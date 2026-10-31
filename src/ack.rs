@@ -129,7 +129,7 @@ impl Completion {
     /// ```
     #[inline]
     pub fn mark_epoch_as_durable(&self, epoch: TEpoch) {
-        self.durable_epoch.fetch_max(epoch, atomic::Ordering::Release);
+        let _ = self.durable_epoch.fetch_max(epoch, atomic::Ordering::Release);
     }
 
     /// Fetch the acknowledgement error (if any)
@@ -598,7 +598,7 @@ mod tests {
             synced: atomic::AtomicBool::new(false),
         });
 
-        let weak = Arc::downgrade(&trigger) as sync::Weak<dyn SyncTrigger>;
+        let weak = Arc::downgrade(&trigger);
         completion.set_sync_trigger(weak);
 
         let epoch = completion.increment_current_epoch();
