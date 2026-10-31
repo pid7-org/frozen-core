@@ -1,5 +1,18 @@
 # Changelog
 
+## `0.0.40`
+
+- `ack`
+  - Added doctests covering synchronization barriers and ticket methods
+- `error`
+  - Added doctests covering suppressed error hierarchies and dynamic module binding
+- `memmap`
+  - Applied `MADV_RANDOM` when `sequential_access_hint` is disabled to suppress speculative
+    readahead and clustering (#113)
+  - Exposed `MemMap::advise_random()` and `MemMap::advise_random_range()` for explicit random
+    access advice (#113)
+  - Added doctests covering configuration, memory advice, page eviction, and page size queries
+
 ## `0.0.39`
 
 - `memmap`
