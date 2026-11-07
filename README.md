@@ -28,7 +28,7 @@ Add following to your `Cargo.toml`,
 
 ```toml
 [dependencies]
-frozen-core = { version = "0.0.40", default-features = true }
+frozen-core = { version = "0.0.41", default-features = true }
 ```
 
 > [!IMPORTANT]

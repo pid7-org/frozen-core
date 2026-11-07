@@ -1,5 +1,16 @@
 # Changelog
 
+## `0.0.41`
+
+- `core`
+  - Bumped Minimum Supported Rust Version (MSRV) to `1.89.0` across workspace, CI, and hooks
+  - Replaced manual modulo alignment checks with `.is_multiple_of()` across `memmap` and `file`
+- `isa`
+  - Added `AVX512F` and `AVX512BW` variants to `ISAExtension` on `x86_64` (#114)
+  - Implemented XCR0 OS state saving verification (`(xcr0 & 0xE6) == 0xE6`) and CPUID leaf 0x07
+    feature bit resolution (`AVX-512F` bit 0x10, `AVX-512BW` bit 0x1E) (#114)
+  - Added monotonic ordering, feature detection cross-validation, and execution smoke tests (#114)
+
 ## `0.0.40`
 
 - `ack`

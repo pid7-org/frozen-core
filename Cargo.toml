@@ -1,6 +1,6 @@
 [package]
 edition = "2024"
-version = "0.0.40"
+version = "0.0.41"
 name = "frozen-core"
 readme = "README.md"
 rust-version = "1.89.0"
