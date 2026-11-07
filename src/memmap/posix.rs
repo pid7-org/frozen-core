@@ -671,7 +671,7 @@ fn madvise_raw_with_advice(ptr: *mut c_void, length: size_t, advice: c_int) -> F
     }
 
     let page_size = POSIXMemMap::page_size()?.as_usize();
-    if hints::unlikely(ptr as usize % page_size != 0) {
+    if hints::unlikely(!(ptr as usize).is_multiple_of(page_size)) {
         return raw_error(err::HCF, "address is not page-aligned");
     }
 

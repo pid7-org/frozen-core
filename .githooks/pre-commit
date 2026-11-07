@@ -10,10 +10,10 @@ TARGETS=(
   "aarch64-apple-darwin"
 )
 
-# Extract MSRV from Cargo.toml (fallback to 1.86.0)
+# Extract MSRV from Cargo.toml (fallback to 1.89.0)
 MSRV=$(grep -m 1 '^rust-version' Cargo.toml | cut -d '"' -f 2)
 if [ -z "$MSRV" ]; then
-  MSRV="1.86.0"
+  MSRV="1.89.0"
 fi
 
 echo "Running pre-commit checks..."
@@ -34,17 +34,18 @@ for target in "${TARGETS[@]}"; do
   cargo clippy --all-features --release --target "$target" -- -D warnings
 done
 
-if command -v rustup >/dev/null 2>&1 && rustup toolchain list | grep -q "$MSRV"; then
-  echo "==> Running MSRV ($MSRV) verification checks..."
-  echo "    Checking MSRV fmt..."
-  cargo +"$MSRV" fmt --check
-  echo "    Checking MSRV clippy..."
-  cargo +"$MSRV" clippy --all-features --release -- -D warnings
-  echo "    Checking MSRV (lib, tests, benches)..."
-  cargo +"$MSRV" check --release --all-features
-  cargo +"$MSRV" check --tests --benches --release --all-features
-else
-  echo "==> Warning: Rust toolchain $MSRV not found; skipping MSRV checks."
+if ! command -v rustup >/dev/null 2>&1 || ! rustup toolchain list | grep -q "$MSRV"; then
+  echo "==> Error: Rust toolchain $MSRV not found; install with 'rustup toolchain install $MSRV' to run MSRV checks" >&2
+  exit 1
 fi
+
+echo "==> Running MSRV ($MSRV) verification checks..."
+echo "    Checking MSRV fmt..."
+cargo +"$MSRV" fmt --check
+echo "    Checking MSRV clippy..."
+cargo +"$MSRV" clippy --all-features --release -- -D warnings
+echo "    Checking MSRV (lib, tests, benches)..."
+cargo +"$MSRV" check --release --all-features
+cargo +"$MSRV" check --tests --benches --release --all-features
 
 echo "All pre-commit checks passed!"

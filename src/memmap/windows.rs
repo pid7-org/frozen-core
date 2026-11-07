@@ -870,7 +870,7 @@ fn msync_raw(ptr: TPtr, length: usize) -> FrozenResult<()> {
     }
 
     let page_size = WINMemMap::page_size()?.as_usize();
-    if hints::unlikely(ptr as usize % page_size != 0) {
+    if hints::unlikely(!(ptr as usize).is_multiple_of(page_size)) {
         return raw_error(err::HCF, "address is not page-aligned");
     }
 
@@ -909,7 +909,7 @@ fn discard_raw(ptr: *mut core::ffi::c_void, length: usize) -> FrozenResult<()> {
     }
 
     let page_size = WINMemMap::page_size()?.as_usize();
-    if hints::unlikely(ptr as usize % page_size != 0) {
+    if hints::unlikely(!(ptr as usize).is_multiple_of(page_size)) {
         return raw_error(err::HCF, "address is not page-aligned");
     }
 

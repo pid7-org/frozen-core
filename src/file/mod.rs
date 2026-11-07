@@ -520,7 +520,7 @@ impl File {
             }
         };
 
-        if curr_len < init_len || curr_len % cfg.buffer_size != 0 {
+        if curr_len < init_len || !curr_len.is_multiple_of(cfg.buffer_size) {
             let mut e = err::make_error(err::CPT);
             if let Err(close_err) = file.close() {
                 e.add_suppressed(close_err);
@@ -624,7 +624,7 @@ impl File {
 
             Self::from_platform_file(cfg, file, init_len)
         } else {
-            if curr_len < init_len || curr_len % cfg.buffer_size != 0 {
+            if curr_len < init_len || !curr_len.is_multiple_of(cfg.buffer_size) {
                 let mut e = err::make_error(err::CPT);
                 if let Err(close_err) = file.close() {
                     e.add_suppressed(close_err);
@@ -685,7 +685,7 @@ impl File {
             return Ok(());
         }
 
-        if buf.len() % self.cfg.buffer_size != 0 {
+        if !buf.len().is_multiple_of(self.cfg.buffer_size) {
             return err::default_error(err::INV).with_module(mid);
         }
 
@@ -751,7 +751,7 @@ impl File {
             return Ok(AckTicket::new(current, self.inner.completion.clone()));
         }
 
-        if buf.len() % self.cfg.buffer_size != 0 {
+        if !buf.len().is_multiple_of(self.cfg.buffer_size) {
             return err::default_error(err::INV).with_module(mid);
         }
 
@@ -935,7 +935,7 @@ impl File {
         let curr_len = self.length();
         let buffer_size = self.cfg.buffer_size;
 
-        if crate::hints::unlikely(curr_len % buffer_size != 0) {
+        if crate::hints::unlikely(!curr_len.is_multiple_of(buffer_size)) {
             return err::default_error(err::CPT).with_module(self.cfg.module_id);
         }
 

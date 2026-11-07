@@ -32,7 +32,7 @@ frozen-core = { version = "0.0.40", default-features = true }
 ```
 
 > [!IMPORTANT]
-> Minimum Supported Rust Version (MSRV) is `1.86.0`
+> Minimum Supported Rust Version (MSRV) is `1.89.0`
 
 > [!TIP]
 > All the features are enabled by default; to disable, set `default-features` to `false`

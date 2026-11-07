@@ -75,11 +75,6 @@ pub fn detect_best_isa_extension() -> ISAExtension {
 #[inline(always)]
 #[cfg(target_arch = "x86_64")]
 pub fn detect_best_isa_extension() -> ISAExtension {
-    // NOTE:
-    //
-    // `__cpuid` was marked unsafe prior to Rust 1.87
-    //
-    // An `unsafe` block is required to maintain compatibility with our MSRV (1.86.0)
     #[allow(unused_unsafe)]
     let cpuid1 = unsafe { x86_64::__cpuid(1) };
 
@@ -92,11 +87,6 @@ pub fn detect_best_isa_extension() -> ISAExtension {
         let xmm_ymm_enabled = (xcr0 & 0b110) == 0b110;
 
         if xmm_ymm_enabled {
-            // NOTE:
-            //
-            // `__cpuid_count` was marked unsafe prior to Rust 1.87
-            //
-            // An `unsafe` block is required to maintain compatibility with our MSRV (1.86.0)
             #[allow(unused_unsafe)]
             let cpuid7 = unsafe { x86_64::__cpuid_count(7, 0) };
 
@@ -324,6 +314,32 @@ mod tests {
                 assert_eq!(out, [0x12C; 8]);
             }
 
+            #[target_feature(enable = "avx512f")]
+            unsafe fn exec_avx512f() {
+                let a = core::arch::x86_64::_mm512_set1_epi32(0x64);
+                let b = core::arch::x86_64::_mm512_set1_epi32(0xC8);
+                let c = core::arch::x86_64::_mm512_add_epi32(a, b);
+
+                let mut out = [0i32; 0x10];
+                unsafe {
+                    core::arch::x86_64::_mm512_storeu_si512(out.as_mut_ptr() as *mut _, c);
+                }
+                assert_eq!(out, [0x12C; 0x10]);
+            }
+
+            #[target_feature(enable = "avx512bw,avx512f")]
+            unsafe fn exec_avx512bw() {
+                let a = core::arch::x86_64::_mm512_set1_epi8(0x07);
+                let b = core::arch::x86_64::_mm512_set1_epi8(0x03);
+                let c = core::arch::x86_64::_mm512_add_epi8(a, b);
+
+                let mut out = [0i8; 0x40];
+                unsafe {
+                    core::arch::x86_64::_mm512_storeu_si512(out.as_mut_ptr() as *mut _, c);
+                }
+                assert_eq!(out, [0x0A; 0x40]);
+            }
+
             unsafe {
                 if detected >= ISAExtension::SSE2 {
                     exec_sse2();
@@ -339,6 +355,14 @@ mod tests {
 
                 if detected >= ISAExtension::AVX2 {
                     exec_avx2();
+                }
+
+                if detected >= ISAExtension::AVX512F {
+                    exec_avx512f();
+                }
+
+                if detected >= ISAExtension::AVX512BW {
+                    exec_avx512bw();
                 }
             }
         }

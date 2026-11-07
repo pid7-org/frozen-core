@@ -552,7 +552,7 @@ where
             return err::default_error(err::ZRO).with_module(mid);
         }
 
-        if size % 8 != 0 {
+        if !size.is_multiple_of(8) {
             return err::default_error(err::SZE).with_module(mid);
         }
 
@@ -567,7 +567,7 @@ where
             return err::default_error(err::INV).with_module(mid);
         }
 
-        if page_size.as_usize() % size != 0 {
+        if !page_size.as_usize().is_multiple_of(size) {
             return err::raw_error(
                 err::INV,
                 format!("page size {page_size} must be divisible by size_of::<T>() ({size})"),
@@ -591,7 +591,7 @@ where
             return err::default_error(err::INV).with_module(mid);
         }
 
-        if cfg.max_len % page_size.as_usize() != 0 {
+        if !cfg.max_len.is_multiple_of(page_size.as_usize()) {
             return err::raw_error(
                 err::INV,
                 format!("max_len {} must be a multiple of page size {page_size}", cfg.max_len),
@@ -772,10 +772,10 @@ where
                     let mut mmap_guard = inner.mmap.write().unwrap_or_else(|e| e.into_inner());
                     let mut err = err::make_raw_error(err::FXE, spawn_err);
 
-                    if let Some(m) = mmap_guard.take() {
-                        if let Err(unmap_err) = m.unmap() {
-                            err.add_suppressed(unmap_err);
-                        }
+                    if let Some(m) = mmap_guard.take()
+                        && let Err(unmap_err) = m.unmap()
+                    {
+                        err.add_suppressed(unmap_err);
                     }
 
                     return Err(err.with_module(cfg.module_id));
@@ -1940,7 +1940,7 @@ where
             return err::default_error(err::ZRO).with_module(mid);
         }
 
-        if hints::unlikely(target_size % slot_size != 0) {
+        if hints::unlikely(!target_size.is_multiple_of(slot_size)) {
             return err::default_error(err::SZE).with_module(mid);
         }
 
@@ -1981,7 +1981,7 @@ where
         };
 
         let ptr = unsafe { mmap.as_ptr::<Target>(offset) };
-        if hints::unlikely((ptr as usize) % core::mem::align_of::<Target>() != 0) {
+        if hints::unlikely(!(ptr as usize).is_multiple_of(core::mem::align_of::<Target>())) {
             return err::default_error(err::ALN).with_module(mid);
         }
 
@@ -2148,7 +2148,7 @@ where
             return err::default_error(err::ZRO).with_module(mid);
         }
 
-        if hints::unlikely(target_size % slot_size != 0) {
+        if hints::unlikely(!target_size.is_multiple_of(slot_size)) {
             return err::default_error(err::SZE).with_module(mid);
         }
 
@@ -2189,7 +2189,7 @@ where
         };
 
         let ptr = unsafe { mmap.as_mut_ptr::<Target>(offset) };
-        if hints::unlikely((ptr as usize) % core::mem::align_of::<Target>() != 0) {
+        if hints::unlikely(!(ptr as usize).is_multiple_of(core::mem::align_of::<Target>())) {
             return err::default_error(err::ALN).with_module(mid);
         }
 
@@ -2546,14 +2546,14 @@ where
             return Err(err);
         }
 
-        if let Some((last_idx, _, _)) = self.ops.last() {
-            if index <= *last_idx {
-                return err::raw_error(
-                    err::HCF,
-                    "tx writes must be strictly ordered, with no more then single ops on given index",
-                )
-                .with_module(mid);
-            }
+        if let Some((last_idx, _, _)) = self.ops.last()
+            && index <= *last_idx
+        {
+            return err::raw_error(
+                err::HCF,
+                "tx writes must be strictly ordered, with no more then single ops on given index",
+            )
+            .with_module(mid);
         }
 
         let size = core::mem::size_of::<T>();
