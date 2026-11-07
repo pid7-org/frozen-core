@@ -19,6 +19,12 @@ pub enum ISAExtension {
 
     /// AVX2
     AVX2,
+
+    /// AVX-512F
+    AVX512F,
+
+    /// AVX-512BW
+    AVX512BW,
 }
 
 /// Available ISA extensions on `aarch64` systems
@@ -94,6 +100,18 @@ pub fn detect_best_isa_extension() -> ISAExtension {
             #[allow(unused_unsafe)]
             let cpuid7 = unsafe { x86_64::__cpuid_count(7, 0) };
 
+            let avx512_enabled = (xcr0 & 0xE6) == 0xE6;
+            if avx512_enabled {
+                let avx512f_bw = (1 << 0x10) | (1 << 0x1E);
+                if (cpuid7.ebx & avx512f_bw) == avx512f_bw {
+                    return ISAExtension::AVX512BW;
+                }
+
+                if (cpuid7.ebx & (1 << 0x10)) != 0 {
+                    return ISAExtension::AVX512F;
+                }
+            }
+
             if (cpuid7.ebx & (1 << 5)) != 0 {
                 return ISAExtension::AVX2;
             }
@@ -141,6 +159,8 @@ mod tests {
             assert!(ISAExtension::SSE2 < ISAExtension::SSSE3);
             assert!(ISAExtension::SSSE3 < ISAExtension::SSE4_2);
             assert!(ISAExtension::SSE4_2 < ISAExtension::AVX2);
+            assert!(ISAExtension::AVX2 < ISAExtension::AVX512F);
+            assert!(ISAExtension::AVX512F < ISAExtension::AVX512BW);
         }
 
         #[test]
@@ -214,6 +234,19 @@ mod tests {
             assert!(std::is_x86_feature_detected!("sse2"));
 
             match detected {
+                ISAExtension::AVX512BW => {
+                    assert!(std::is_x86_feature_detected!("avx512bw"));
+                    assert!(std::is_x86_feature_detected!("avx512f"));
+                    assert!(std::is_x86_feature_detected!("avx2"));
+                    assert!(std::is_x86_feature_detected!("sse4.2"));
+                    assert!(std::is_x86_feature_detected!("ssse3"));
+                }
+                ISAExtension::AVX512F => {
+                    assert!(std::is_x86_feature_detected!("avx512f"));
+                    assert!(std::is_x86_feature_detected!("avx2"));
+                    assert!(std::is_x86_feature_detected!("sse4.2"));
+                    assert!(std::is_x86_feature_detected!("ssse3"));
+                }
                 ISAExtension::AVX2 => {
                     assert!(std::is_x86_feature_detected!("avx2"));
                     assert!(std::is_x86_feature_detected!("sse4.2"));
