@@ -273,6 +273,10 @@ impl MemMapCfg {
 }
 
 const WRITER_BIT: u32 = 0x8000_0000;
+const SEQ_SHIFT: u32 = 0x10;
+const SEQ_INC: u32 = 1 << SEQ_SHIFT;
+const READER_MASK: u32 = 0x0000_FFFF;
+const SEQ_MASK: u32 = 0x7FFF_0000;
 const L1_CONTENTION: usize = 0x10;
 const L2_CONTENTION: usize = 0x20;
 
@@ -311,14 +315,36 @@ impl SlotLocks {
     }
 
     #[inline(always)]
+    fn load_sequence(&self, start: usize, n: usize) -> Option<u64> {
+        if hints::likely(n == 1) {
+            let val = self.locks[start].load(atomic::Ordering::Acquire);
+            if hints::unlikely(val & WRITER_BIT != 0) {
+                return None;
+            }
+            return Some((val & SEQ_MASK) as u64);
+        }
+
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for i in 0..n {
+            let val = self.locks[start + i].load(atomic::Ordering::Acquire);
+            if hints::unlikely(val & WRITER_BIT != 0) {
+                return None;
+            }
+            h ^= (val & SEQ_MASK) as u64;
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+        Some(h)
+    }
+
+    #[inline(always)]
     fn read_lock(&self, index: usize) -> SlotReadGuard<'_> {
         let val = &self.locks[index];
-        let mut spins = 0;
+        let mut spins = 0x00;
 
         loop {
             let state = val.load(atomic::Ordering::Relaxed);
 
-            if hints::likely(state & WRITER_BIT == 0)
+            if hints::likely(state & WRITER_BIT == 0 && (state & READER_MASK) < READER_MASK)
                 && val
                     .compare_exchange_weak(
                         state,
@@ -347,19 +373,22 @@ impl SlotLocks {
     #[inline(always)]
     fn write_lock(&self, index: usize) -> SlotWriteGuard<'_> {
         let val = &self.locks[index];
-        let mut spins = 0;
+        let mut spins = 0x00;
 
         loop {
-            if val
-                .compare_exchange_weak(
-                    0,
-                    WRITER_BIT,
-                    atomic::Ordering::Acquire,
-                    atomic::Ordering::Relaxed,
-                )
-                .is_ok()
+            let state = val.load(atomic::Ordering::Relaxed);
+
+            if hints::likely(state & WRITER_BIT == 0 && state & READER_MASK == 0)
+                && val
+                    .compare_exchange_weak(
+                        state,
+                        state | WRITER_BIT,
+                        atomic::Ordering::Acquire,
+                        atomic::Ordering::Relaxed,
+                    )
+                    .is_ok()
             {
-                return SlotWriteGuard(val);
+                return SlotWriteGuard { lock: val, seq: state & SEQ_MASK };
             }
 
             if hints::likely(spins < L1_CONTENTION) {
@@ -387,12 +416,16 @@ impl Drop for SlotReadGuard<'_> {
 }
 
 /// RAII write guard for a slot lock
-struct SlotWriteGuard<'a>(&'a atomic::AtomicU32);
+struct SlotWriteGuard<'a> {
+    lock: &'a atomic::AtomicU32,
+    seq: u32,
+}
 
 impl Drop for SlotWriteGuard<'_> {
     #[inline(always)]
     fn drop(&mut self) {
-        self.0.store(0, atomic::Ordering::Release);
+        let next_seq = (self.seq.wrapping_add(SEQ_INC)) & SEQ_MASK;
+        self.lock.store(next_seq, atomic::Ordering::Release);
     }
 }
 
@@ -401,6 +434,7 @@ impl Drop for SlotWriteGuard<'_> {
 struct MemMapInner {
     cfg: MemMapCfg,
     page_size: PageSize,
+    base_ptr: atomic::AtomicPtr<u8>,
     mmap: RwLock<Option<PlatformMemMap>>,
     slot_locks: RwLock<SlotLocks>,
     length: atomic::AtomicUsize,
@@ -671,9 +705,11 @@ where
         let total_slots = length / core::mem::size_of::<T>();
         let slot_locks = SlotLocks::new(total_slots);
 
+        let base_ptr = unsafe { mmap.as_ptr::<u8>(0) as *mut u8 };
         let inner = Arc::new(MemMapInner {
             cfg: cfg.clone(),
             page_size,
+            base_ptr: atomic::AtomicPtr::new(base_ptr),
             mmap: RwLock::new(Some(mmap)),
             slot_locks: RwLock::new(slot_locks),
             length: atomic::AtomicUsize::new(length),
@@ -1995,6 +2031,240 @@ where
         Ok(res)
     }
 
+    /// Optimistically reads `N` consecutive slots without acquiring reader spinlocks
+    ///
+    /// Requires `size_of::<Target>() == N * size_of::<T>()` and compatible alignment;
+    /// readers sample slot sequence numbers before and after invoking callback `f`, automatically
+    /// detecting concurrent writer modifications and retrying with backoff
+    ///
+    /// ## Performance
+    ///
+    /// - Readers execute scalar `load(Ordering::Acquire)` operations on sequence words;
+    /// - Zero atomic Read-Modify-Write (RMW) writes on shared cache lines;
+    /// - Zero temporary heap allocations;
+    /// - Shared cache lines remain in MESI Shared (S) state across distinct physical CPU cores
+    ///
+    /// ## Constraints
+    ///
+    /// - `size_of::<Target>()` must not be zero ([`err::ZRO`]);
+    /// - `size_of::<Target>()` must be an exact multiple of `size_of::<T>()` ([`err::SZE`]);
+    /// - `align_of::<Target>()` must not exceed `align_of::<T>()` ([`err::ALN`]);
+    /// - Slot index and byte offset calculations must not overflow `usize` ([`err::INV`]);
+    /// - Target slot range `start..start + N` must not exceed mapping bounds ([`err::HCF`])
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::memmap::{MemMap, MemMapCfg};
+    /// use std::time::Duration;
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = MemMapCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().to_path_buf(),
+    ///     name: *b"optm",
+    ///     version: 1,
+    ///     initial_pages: 1,
+    ///     max_len: 0x10_0000,
+    ///     sync_interval: Some(Duration::from_millis(0x64)),
+    ///     memory_priority_hint: false,
+    ///     sequential_access_hint: false,
+    /// };
+    ///
+    /// let mmap = MemMap::<u64>::new(cfg).unwrap();
+    /// mmap.write(0, |v| *v = 0xAA).unwrap();
+    ///
+    /// let val = mmap.read_optimistic(0, |v: &u64| *v).unwrap();
+    /// assert_eq!(val, 0xAA);
+    /// ```
+    #[inline(always)]
+    pub fn read_optimistic<Target, R, F>(&self, start: usize, mut f: F) -> FrozenResult<R>
+    where
+        F: FnMut(&Target) -> R,
+    {
+        let mid = self.cfg.module_id;
+        let slot_size = core::mem::size_of::<T>();
+        let target_size = core::mem::size_of::<Target>();
+
+        if hints::unlikely(target_size == 0) {
+            return err::default_error(err::ZRO).with_module(mid);
+        }
+
+        if hints::unlikely(!target_size.is_multiple_of(slot_size)) {
+            return err::default_error(err::SZE).with_module(mid);
+        }
+
+        if hints::unlikely(core::mem::align_of::<Target>() > core::mem::align_of::<T>()) {
+            return err::default_error(err::ALN).with_module(mid);
+        }
+
+        let n = target_size / slot_size;
+        let end_slot = match start.checked_add(n) {
+            Some(end) => end,
+            None => return err::default_error(err::INV).with_module(mid),
+        };
+
+        let offset = match start.checked_mul(slot_size) {
+            Some(off) => off,
+            None => return err::default_error(err::INV).with_module(mid),
+        };
+
+        let end_offset = match end_slot.checked_mul(slot_size) {
+            Some(end) => end,
+            None => return err::default_error(err::INV).with_module(mid),
+        };
+
+        let slot_locks_guard = self.inner.slot_locks.read().unwrap_or_else(|e| e.into_inner());
+        if hints::unlikely(end_offset > self.length()) {
+            return err::default_error(err::HCF).with_module(mid);
+        }
+
+        let base_ptr = self.inner.base_ptr.load(atomic::Ordering::Relaxed);
+        if hints::unlikely(base_ptr.is_null()) {
+            return err::default_error(err::INV).with_module(mid);
+        }
+
+        let ptr = unsafe { base_ptr.add(offset) as *const Target };
+        if hints::unlikely(!(ptr as usize).is_multiple_of(core::mem::align_of::<Target>())) {
+            return err::default_error(err::ALN).with_module(mid);
+        }
+
+        let mut spins = 0x00;
+        loop {
+            if let Some(seq_before) = slot_locks_guard.load_sequence(start, n) {
+                let target_ref = unsafe { &*ptr };
+                let res = f(target_ref);
+
+                if let Some(seq_after) = slot_locks_guard.load_sequence(start, n)
+                    && hints::likely(seq_before == seq_after)
+                {
+                    return Ok(res);
+                }
+            }
+
+            spins += 1;
+            if hints::likely(spins < L1_CONTENTION) {
+                std::hint::spin_loop();
+            } else if spins < L2_CONTENTION {
+                std::thread::yield_now();
+            } else {
+                let ns = 0x30 << (spins - L2_CONTENTION).min(0x0A);
+                std::thread::sleep(std::time::Duration::from_nanos(ns));
+            }
+        }
+    }
+
+    /// Optimistically reads a single slot `index` without acquiring per-slot reader spinlocks
+    ///
+    /// Convenience wrapper delegating to [`read_optimistic`](MemMap::read_optimistic)
+    #[inline(always)]
+    pub fn read_optimistic_slot<R, F>(&self, index: usize, f: F) -> FrozenResult<R>
+    where
+        F: FnMut(&T) -> R,
+    {
+        self.read_optimistic::<T, R, F>(index, f)
+    }
+
+    /// Returns a raw pointer to slot `0` in mapped memory
+    ///
+    /// # Safety
+    ///
+    /// - Pointer dereferences must not outlive the underlying [`MemMap`] mapping;
+    /// - Callers must guard against unsynchronized concurrent writes or data races
+    #[inline(always)]
+    pub unsafe fn as_ptr(&self) -> *const T {
+        self.inner.base_ptr.load(atomic::Ordering::Relaxed) as *const T
+    }
+
+    /// Returns a typed pointer to target type at slot `start`
+    ///
+    /// Validates zero-size, slot alignment, integer overflow, and mapping bounds
+    ///
+    /// # Safety
+    ///
+    /// - Pointer dereferences must not outlive the underlying [`MemMap`] mapping;
+    /// - Callers must guard against unsynchronized concurrent writes or data races
+    #[inline(always)]
+    pub unsafe fn as_ptr_at<Target>(&self, start: usize) -> FrozenResult<*const Target> {
+        let mid = self.cfg.module_id;
+        let slot_size = core::mem::size_of::<T>();
+        let target_size = core::mem::size_of::<Target>();
+
+        if hints::unlikely(target_size == 0) {
+            return err::default_error(err::ZRO).with_module(mid);
+        }
+
+        if hints::unlikely(!target_size.is_multiple_of(slot_size)) {
+            return err::default_error(err::SZE).with_module(mid);
+        }
+
+        if hints::unlikely(core::mem::align_of::<Target>() > core::mem::align_of::<T>()) {
+            return err::default_error(err::ALN).with_module(mid);
+        }
+
+        let n = target_size / slot_size;
+        let end_slot = match start.checked_add(n) {
+            Some(end) => end,
+            None => return err::default_error(err::INV).with_module(mid),
+        };
+
+        let offset = match start.checked_mul(slot_size) {
+            Some(off) => off,
+            None => return err::default_error(err::INV).with_module(mid),
+        };
+
+        let end_offset = match end_slot.checked_mul(slot_size) {
+            Some(end) => end,
+            None => return err::default_error(err::INV).with_module(mid),
+        };
+
+        if hints::unlikely(end_offset > self.length()) {
+            return err::default_error(err::HCF).with_module(mid);
+        }
+
+        let base_ptr = self.inner.base_ptr.load(atomic::Ordering::Relaxed);
+        if hints::unlikely(base_ptr.is_null()) {
+            return err::default_error(err::INV).with_module(mid);
+        }
+
+        let ptr = unsafe { base_ptr.add(offset) as *const Target };
+        if hints::unlikely(!(ptr as usize).is_multiple_of(core::mem::align_of::<Target>())) {
+            return err::default_error(err::ALN).with_module(mid);
+        }
+
+        Ok(ptr)
+    }
+
+    /// Returns a slice `&[T]` referencing active mapped slots
+    ///
+    /// # Safety
+    ///
+    /// Callers must ensure no concurrent unsynchronized writes occur during slice lifetime
+    #[inline(always)]
+    pub unsafe fn as_slice(&self) -> &[T] {
+        let ptr = unsafe { self.as_ptr() };
+        let slots = self.length() / core::mem::size_of::<T>();
+        if hints::unlikely(ptr.is_null() || slots == 0) {
+            return &[];
+        }
+        unsafe { core::slice::from_raw_parts(ptr, slots) }
+    }
+
+    /// Returns a byte slice `&[u8]` referencing active mapped bytes
+    ///
+    /// # Safety
+    ///
+    /// Callers must ensure no concurrent unsynchronized writes occur during slice lifetime
+    #[inline(always)]
+    pub unsafe fn as_byte_slice(&self) -> &[u8] {
+        let ptr = self.inner.base_ptr.load(atomic::Ordering::Relaxed);
+        let len = self.length();
+        if hints::unlikely(ptr.is_null() || len == 0) {
+            return &[];
+        }
+        unsafe { core::slice::from_raw_parts(ptr, len) }
+    }
+
     /// Locks slot `index` for writing and invokes `f` with a mutable reference to `T`
     ///
     /// Returns a tuple `(AckTicket, R)` containing the durability acknowledgement ticket
@@ -2269,6 +2539,7 @@ where
             let _ = handle.join();
         }
 
+        self.inner.base_ptr.store(core::ptr::null_mut(), atomic::Ordering::Release);
         let mut guard = self.inner.mmap.write().unwrap_or_else(|e| e.into_inner());
         let unmap_res =
             if let Some(mmap) = guard.take() { mmap.unmap().with_module(mid) } else { Ok(()) };
@@ -3777,6 +4048,191 @@ mod tests {
             let (ticket2, _) = mmap.write(1, |v| *v = 0x8888).unwrap();
             assert_eq!(mmap.read(1, |v| *v).unwrap(), 0x8888);
             assert_eq!(ticket2.epoch(), 4);
+        }
+    }
+
+    mod read_optimistic {
+        use super::*;
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[repr(C)]
+        struct TestNode {
+            id: u64,
+            flags: u64,
+            keys: [u64; 2],
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[repr(C)]
+        struct TestBadSizeTarget([u8; 0x0C]);
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[repr(C, align(16))]
+        struct TestOveralignedTarget {
+            _a: u64,
+            _b: u64,
+        }
+
+        #[test]
+        fn ok_read_optimistic_single_and_multi_slot() {
+            let (_dir, cfg) = tmp_cfg();
+            let mmap = MemMap::<u64>::new(cfg).unwrap();
+
+            mmap.write(0, |v| *v = 0x1111).unwrap();
+            mmap.write(1, |v| *v = 0x2222).unwrap();
+            mmap.write(2, |v| *v = 0x3333).unwrap();
+            mmap.write(3, |v| *v = 0x4444).unwrap();
+
+            let single = mmap.read_optimistic_slot(0, |val| *val).unwrap();
+            assert_eq!(single, 0x1111);
+
+            let single_opt = mmap.read_optimistic(0, |val: &u64| *val).unwrap();
+            assert_eq!(single_opt, 0x1111);
+
+            let node = mmap.read_optimistic(0, |n: &TestNode| *n).unwrap();
+            assert_eq!(node, TestNode { id: 0x1111, flags: 0x2222, keys: [0x3333, 0x4444] });
+
+            let keys = mmap.read_optimistic(2, |k: &[u64; 2]| *k).unwrap();
+            assert_eq!(keys, [0x3333, 0x4444]);
+        }
+
+        #[test]
+        fn err_read_optimistic_invariants() {
+            let (_dir, cfg) = tmp_cfg();
+            let mmap = MemMap::<u64>::new(cfg).unwrap();
+
+            let err_zro = mmap.read_optimistic::<(), _, _>(0, |_| ()).unwrap_err();
+            assert_eq!(err_zro.reason, err::ZRO.reason);
+
+            let err_sze = mmap.read_optimistic::<TestBadSizeTarget, _, _>(0, |_| ()).unwrap_err();
+            assert_eq!(err_sze.reason, err::SZE.reason);
+
+            let err_aln =
+                mmap.read_optimistic::<TestOveralignedTarget, _, _>(0, |_| ()).unwrap_err();
+            assert_eq!(err_aln.reason, err::ALN.reason);
+
+            let err_inv = mmap.read_optimistic::<u64, _, _>(usize::MAX, |_| ()).unwrap_err();
+            assert_eq!(err_inv.reason, err::INV.reason);
+
+            let err_inv_add =
+                mmap.read_optimistic::<TestNode, _, _>(usize::MAX - 1, |_| ()).unwrap_err();
+            assert_eq!(err_inv_add.reason, err::INV.reason);
+
+            let slots = mmap.length() / core::mem::size_of::<u64>();
+            let err_hcf_start = mmap.read_optimistic::<u64, _, _>(slots, |_| ()).unwrap_err();
+            assert_eq!(err_hcf_start.reason, err::HCF.reason);
+
+            let err_hcf_end =
+                mmap.read_optimistic::<TestNode, _, _>(slots - 2, |_| ()).unwrap_err();
+            assert_eq!(err_hcf_end.reason, err::HCF.reason);
+        }
+
+        #[test]
+        fn ok_read_optimistic_concurrent_readers() {
+            let (_dir, cfg) = tmp_cfg();
+            let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
+
+            mmap.write(0, |v| *v = 0xCAFE).unwrap();
+            mmap.write(1, |v| *v = 0xBABE).unwrap();
+            mmap.write(2, |v| *v = 0x1234).unwrap();
+            mmap.write(3, |v| *v = 0x5678).unwrap();
+
+            let barrier = Arc::new(std::sync::Barrier::new(4));
+            let mut handles = Vec::new();
+
+            for _ in 0..4 {
+                let mmap_clone = Arc::clone(&mmap);
+                let barrier_clone = Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    barrier_clone.wait();
+                    for _ in 0..0x1F4 {
+                        let id = mmap_clone.read_optimistic(0, |n: &TestNode| n.id).unwrap();
+                        assert_eq!(id, 0xCAFE);
+                        let k1 = mmap_clone.read_optimistic(0, |n: &TestNode| n.keys[1]).unwrap();
+                        assert_eq!(k1, 0x5678);
+                    }
+                }));
+            }
+
+            for h in handles {
+                h.join().unwrap();
+            }
+        }
+
+        #[test]
+        fn ok_read_optimistic_concurrent_writers_retry() {
+            let (_dir, cfg) = tmp_cfg();
+            let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
+
+            let barrier = Arc::new(std::sync::Barrier::new(5));
+            let mut handles = Vec::new();
+
+            {
+                let mmap_clone = Arc::clone(&mmap);
+                let barrier_clone = Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    barrier_clone.wait();
+                    for i in 0..0x1F4 {
+                        let v = i as u64;
+                        let _ = mmap_clone
+                            .write_exact(0, |pair: &mut [u64; 2]| {
+                                pair[0] = v;
+                                pair[1] = v;
+                            })
+                            .unwrap();
+                    }
+                }));
+            }
+
+            for _ in 0..4 {
+                let mmap_clone = Arc::clone(&mmap);
+                let barrier_clone = Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    barrier_clone.wait();
+                    for _ in 0..0x1F4 {
+                        mmap_clone
+                            .read_optimistic(0, |pair: &[u64; 2]| {
+                                assert_eq!(pair[0], pair[1]);
+                            })
+                            .unwrap();
+                    }
+                }));
+            }
+
+            for h in handles {
+                h.join().unwrap();
+            }
+        }
+
+        #[test]
+        fn ok_raw_pointer_and_slice_access() {
+            let (_dir, cfg) = tmp_cfg();
+            let mmap = MemMap::<u64>::new(cfg).unwrap();
+
+            mmap.write(0, |v| *v = 0xAA).unwrap();
+            mmap.write(1, |v| *v = 0xBB).unwrap();
+
+            unsafe {
+                let ptr0 = mmap.as_ptr();
+                assert_eq!(*ptr0, 0xAA);
+                assert_eq!(*ptr0.add(1), 0xBB);
+
+                let ptr_at = mmap.as_ptr_at::<[u64; 2]>(0).unwrap();
+                assert_eq!(*ptr_at, [0xAA, 0xBB]);
+
+                let slice = mmap.as_slice();
+                assert_eq!(slice[0], 0xAA);
+                assert_eq!(slice[1], 0xBB);
+
+                let byte_slice = mmap.as_byte_slice();
+                assert_eq!(byte_slice.len(), mmap.length());
+
+                let err_zro = mmap.as_ptr_at::<()>(0).unwrap_err();
+                assert_eq!(err_zro.reason, err::ZRO.reason);
+
+                let err_hcf = mmap.as_ptr_at::<u64>(mmap.length()).unwrap_err();
+                assert_eq!(err_hcf.reason, err::HCF.reason);
+            }
         }
     }
 

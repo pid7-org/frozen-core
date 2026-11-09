@@ -274,3 +274,83 @@ fn ok_read_write_grow_interleaving() {
     mmap.write(new_slot, |v| *v = 0xCAFE_BABE).expect("write into grown page failed");
     assert_eq!(mmap.read(new_slot, |v| *v).expect("read failed"), 0xCAFE_BABE);
 }
+
+#[test]
+fn ok_read_optimistic_high_contention_readers() {
+    let page_size = common::get_page_size();
+    let (_dir, cfg) = common::create_test_cfg(*b"rohc", 1, page_size * 2);
+    let mmap = Arc::new(MemMap::<u64>::new(cfg).expect("mmap creation failed"));
+
+    mmap.write(0x10, |v| *v = 0xABCD_EF01_2345_6789).expect("write failed");
+
+    let num_threads = 8;
+    let reads_per_thread = 0x3E8;
+    let barrier = Arc::new(Barrier::new(num_threads + 1));
+
+    let mut handles = Vec::with_capacity(num_threads);
+    for _ in 0..num_threads {
+        let m = Arc::clone(&mmap);
+        let b = Arc::clone(&barrier);
+
+        handles.push(thread::spawn(move || {
+            b.wait();
+            for _ in 0..reads_per_thread {
+                let v = m.read_optimistic_slot(0x10, |val| *val).expect("read_optimistic failed");
+                assert_eq!(v, 0xABCD_EF01_2345_6789);
+            }
+        }));
+    }
+
+    barrier.wait();
+    for h in handles {
+        h.join().expect("reader thread join failed");
+    }
+}
+
+#[test]
+fn ok_read_optimistic_interleaved_writer_isolation() {
+    let page_size = common::get_page_size();
+    let (_dir, cfg) = common::create_test_cfg(*b"rowi", 1, page_size * 2);
+    let mmap = Arc::new(MemMap::<u64>::new(cfg).expect("mmap creation failed"));
+
+    let num_readers = 4;
+    let num_writes = 0x1F4;
+    let barrier = Arc::new(Barrier::new(num_readers + 2));
+
+    let m_write = Arc::clone(&mmap);
+    let b_write = Arc::clone(&barrier);
+    let writer_handle = thread::spawn(move || {
+        b_write.wait();
+        for i in 0..num_writes {
+            let v = i as u64;
+            m_write
+                .write_exact(0, |pair: &mut [u64; 2]| {
+                    pair[0] = v;
+                    pair[1] = v;
+                })
+                .expect("write_exact failed");
+        }
+    });
+
+    let mut reader_handles = Vec::with_capacity(num_readers);
+    for _ in 0..num_readers {
+        let m = Arc::clone(&mmap);
+        let b = Arc::clone(&barrier);
+
+        reader_handles.push(thread::spawn(move || {
+            b.wait();
+            for _ in 0..num_writes {
+                m.read_optimistic(0, |pair: &[u64; 2]| {
+                    assert_eq!(pair[0], pair[1]);
+                })
+                .expect("read_optimistic failed");
+            }
+        }));
+    }
+
+    barrier.wait();
+    writer_handle.join().expect("writer join failed");
+    for h in reader_handles {
+        h.join().expect("reader join failed");
+    }
+}
