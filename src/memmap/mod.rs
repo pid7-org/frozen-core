@@ -63,6 +63,12 @@ mod posix;
 #[cfg(target_os = "windows")]
 mod windows;
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use posix::{alloc_lock_table, free_lock_table};
+
+#[cfg(target_os = "windows")]
+use windows::{alloc_lock_table, free_lock_table};
+
 pub(in crate::memmap) use interface::MemMapInterface;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -282,63 +288,87 @@ const L2_CONTENTION: usize = 0x20;
 
 #[derive(Debug)]
 struct SlotLocks {
-    locks: Box<[atomic::AtomicU32]>,
+    locks_ptr: *const atomic::AtomicU32,
+    active_slots: atomic::AtomicUsize,
+    max_slots: usize,
+    lock_bytes: usize,
+}
+
+unsafe impl Send for SlotLocks {}
+unsafe impl Sync for SlotLocks {}
+
+impl Drop for SlotLocks {
+    fn drop(&mut self) {
+        free_lock_table(self.locks_ptr, self.lock_bytes);
+        self.locks_ptr = core::ptr::null();
+        self.lock_bytes = 0;
+        self.max_slots = 0;
+        self.active_slots.store(0, atomic::Ordering::Release);
+    }
 }
 
 impl SlotLocks {
-    fn new(total_slots: usize) -> Self {
-        let mut slots = Vec::with_capacity(total_slots);
-        for _ in 0..total_slots {
-            slots.push(atomic::AtomicU32::new(0));
-        }
+    fn new(initial_slots: usize, max_slots: usize) -> FrozenResult<Self> {
+        let lock_bytes = match max_slots.checked_mul(core::mem::size_of::<atomic::AtomicU32>()) {
+            Some(b) => b,
+            None => return err::raw_error(err::INV, "slot count calculation overflowed usize"),
+        };
 
-        Self { locks: slots.into_boxed_slice() }
+        let locks_ptr = alloc_lock_table(lock_bytes)?;
+
+        Ok(Self {
+            locks_ptr,
+            active_slots: atomic::AtomicUsize::new(initial_slots),
+            max_slots,
+            lock_bytes,
+        })
     }
 
-    fn grow(&mut self, additional_slots: usize) {
-        if additional_slots == 0 {
+    #[inline(always)]
+    fn grow(&self, additional_slots: usize) {
+        if hints::unlikely(additional_slots == 0) {
             return;
         }
 
-        let total = self.locks.len() + additional_slots;
-        let mut slots = Vec::with_capacity(total);
-
-        for val in self.locks.iter() {
-            slots.push(atomic::AtomicU32::new(val.load(atomic::Ordering::Relaxed)));
-        }
-
-        for _ in 0..additional_slots {
-            slots.push(atomic::AtomicU32::new(0));
-        }
-
-        self.locks = slots.into_boxed_slice();
+        let _ = self.active_slots.fetch_add(additional_slots, atomic::Ordering::Release);
     }
 
     #[inline(always)]
     fn load_sequence(&self, start: usize, n: usize) -> Option<u64> {
-        if hints::likely(n == 1) {
-            let val = self.locks[start].load(atomic::Ordering::Acquire);
-            if hints::unlikely(val & WRITER_BIT != 0) {
-                return None;
-            }
-            return Some((val & SEQ_MASK) as u64);
+        if hints::unlikely(n == 0) {
+            return None;
         }
 
-        let mut h = 0xcbf2_9ce4_8422_2325u64;
-        for i in 0..n {
-            let val = self.locks[start + i].load(atomic::Ordering::Acquire);
-            if hints::unlikely(val & WRITER_BIT != 0) {
+        let active = self.active_slots.load(atomic::Ordering::Acquire);
+        let end = start.checked_add(n)?;
+
+        if hints::unlikely(end > active) {
+            return None;
+        }
+
+        let head_word = unsafe { &*self.locks_ptr.add(start) }.load(atomic::Ordering::Acquire);
+        if hints::unlikely((head_word & WRITER_BIT) != 0) {
+            return None;
+        }
+
+        if hints::likely(n == 1) {
+            return Some((head_word & SEQ_MASK) as u64);
+        }
+
+        let mut h = (head_word & SEQ_MASK) as u64;
+        for i in 1..n {
+            let val = unsafe { &*self.locks_ptr.add(start + i) }.load(atomic::Ordering::Acquire);
+            if hints::unlikely((val & WRITER_BIT) != 0) {
                 return None;
             }
-            h ^= (val & SEQ_MASK) as u64;
-            h = h.wrapping_mul(0x0100_0000_01b3);
+            h = h.rotate_left(0x0D) ^ ((val & SEQ_MASK) as u64);
         }
         Some(h)
     }
 
     #[inline(always)]
     fn read_lock(&self, index: usize) -> SlotReadGuard<'_> {
-        let val = &self.locks[index];
+        let val = unsafe { &*self.locks_ptr.add(index) };
         let mut spins = 0x00;
 
         loop {
@@ -372,7 +402,7 @@ impl SlotLocks {
 
     #[inline(always)]
     fn write_lock(&self, index: usize) -> SlotWriteGuard<'_> {
-        let val = &self.locks[index];
+        let val = unsafe { &*self.locks_ptr.add(index) };
         let mut spins = 0x00;
 
         loop {
@@ -436,7 +466,7 @@ struct MemMapInner {
     page_size: PageSize,
     base_ptr: atomic::AtomicPtr<u8>,
     mmap: RwLock<Option<PlatformMemMap>>,
-    slot_locks: RwLock<SlotLocks>,
+    slot_locks: SlotLocks,
     length: atomic::AtomicUsize,
     completion: Arc<Completion>,
     sync_condvar: Condvar,
@@ -703,7 +733,8 @@ where
         let completion = Arc::new(Completion::default());
         let sync_interval = cfg.sync_interval;
         let total_slots = length / core::mem::size_of::<T>();
-        let slot_locks = SlotLocks::new(total_slots);
+        let max_slots = cfg.max_len / core::mem::size_of::<T>();
+        let slot_locks = SlotLocks::new(total_slots, max_slots).with_module(cfg.module_id)?;
 
         let base_ptr = unsafe { mmap.as_ptr::<u8>(0) as *mut u8 };
         let inner = Arc::new(MemMapInner {
@@ -711,7 +742,7 @@ where
             page_size,
             base_ptr: atomic::AtomicPtr::new(base_ptr),
             mmap: RwLock::new(Some(mmap)),
-            slot_locks: RwLock::new(slot_locks),
+            slot_locks,
             length: atomic::AtomicUsize::new(length),
             completion: completion.clone(),
             sync_condvar: Condvar::new(),
@@ -1648,12 +1679,10 @@ where
             None => return err::default_error(err::INV).with_module(mid),
         };
 
-        // Serialize all concurrent growth operations under exclusive write locks
+        // Serialize all concurrent growth operations under exclusive write lock
         //
-        // Preserves the strict total lock ordering (slot_locks -> mmap) to prevent deadlocks with
-        // readers/writers, and prevents race conditions where concurrent grow calls sample stale
-        // lengths or collide on Win32 placeholder replacement
-        let mut slot_locks_guard = self.inner.slot_locks.write().unwrap_or_else(|e| e.into_inner());
+        // Prevents race conditions where concurrent grow calls sample stale lengths or
+        // collide on Win32 placeholder replacement
         let mut mmap_guard = self.inner.mmap.write().unwrap_or_else(|e| e.into_inner());
         let mmap = match mmap_guard.as_mut() {
             Some(m) => m,
@@ -1691,11 +1720,10 @@ where
             let _ = mmap.advise_random(curr_len, bytes_to_add);
         }
 
-        slot_locks_guard.grow(additional_slots);
+        self.inner.slot_locks.grow(additional_slots);
         self.inner.length.store(new_length, atomic::Ordering::Release);
 
         drop(mmap_guard);
-        drop(slot_locks_guard);
 
         let _ = self.inner.completion.increment_current_epoch();
         Ok(())
@@ -1888,12 +1916,11 @@ where
             None => return err::default_error(err::INV).with_module(mid),
         };
 
-        let slot_locks_guard = self.inner.slot_locks.read().unwrap_or_else(|e| e.into_inner());
         if hints::unlikely(offset.checked_add(size).is_none_or(|end| end > self.length())) {
             return err::default_error(err::HCF).with_module(mid);
         }
 
-        let _slot_guard = slot_locks_guard.read_lock(index);
+        let _slot_guard = self.inner.slot_locks.read_lock(index);
         let guard = self.inner.mmap.read().unwrap_or_else(|e| e.into_inner());
 
         let mmap = match guard.as_ref() {
@@ -1907,7 +1934,6 @@ where
 
         drop(guard);
         drop(_slot_guard);
-        drop(slot_locks_guard);
 
         Ok(res)
     }
@@ -2000,14 +2026,13 @@ where
             None => return err::default_error(err::INV).with_module(mid),
         };
 
-        let slot_locks_guard = self.inner.slot_locks.read().unwrap_or_else(|e| e.into_inner());
         if hints::unlikely(end_offset > self.length()) {
             return err::default_error(err::HCF).with_module(mid);
         }
 
         let mut slot_guards = Vec::with_capacity(n);
         for slot in start..end_slot {
-            slot_guards.push(slot_locks_guard.read_lock(slot));
+            slot_guards.push(self.inner.slot_locks.read_lock(slot));
         }
 
         let guard = self.inner.mmap.read().unwrap_or_else(|e| e.into_inner());
@@ -2026,7 +2051,6 @@ where
 
         drop(guard);
         drop(slot_guards);
-        drop(slot_locks_guard);
 
         Ok(res)
     }
@@ -2114,12 +2138,11 @@ where
             None => return err::default_error(err::INV).with_module(mid),
         };
 
-        let slot_locks_guard = self.inner.slot_locks.read().unwrap_or_else(|e| e.into_inner());
         if hints::unlikely(end_offset > self.length()) {
             return err::default_error(err::HCF).with_module(mid);
         }
 
-        let base_ptr = self.inner.base_ptr.load(atomic::Ordering::Relaxed);
+        let base_ptr = self.inner.base_ptr.load(atomic::Ordering::Acquire);
         if hints::unlikely(base_ptr.is_null()) {
             return err::default_error(err::INV).with_module(mid);
         }
@@ -2131,11 +2154,11 @@ where
 
         let mut spins = 0x00;
         loop {
-            if let Some(seq_before) = slot_locks_guard.load_sequence(start, n) {
+            if let Some(seq_before) = self.inner.slot_locks.load_sequence(start, n) {
                 let target_ref = unsafe { &*ptr };
                 let res = f(target_ref);
 
-                if let Some(seq_after) = slot_locks_guard.load_sequence(start, n)
+                if let Some(seq_after) = self.inner.slot_locks.load_sequence(start, n)
                     && hints::likely(seq_before == seq_after)
                 {
                     return Ok(res);
@@ -2317,12 +2340,11 @@ where
             None => return err::default_error(err::INV).with_module(mid),
         };
 
-        let slot_locks_guard = self.inner.slot_locks.read().unwrap_or_else(|e| e.into_inner());
         if hints::unlikely(offset.checked_add(size).is_none_or(|end| end > self.length())) {
             return err::default_error(err::HCF).with_module(mid);
         }
 
-        let _slot_guard = slot_locks_guard.write_lock(index);
+        let _slot_guard = self.inner.slot_locks.write_lock(index);
         let guard = self.inner.mmap.read().unwrap_or_else(|e| e.into_inner());
 
         let mmap = match guard.as_ref() {
@@ -2335,7 +2357,6 @@ where
 
         drop(guard);
         drop(_slot_guard);
-        drop(slot_locks_guard);
 
         let epoch = self.inner.completion.increment_current_epoch();
         if self.inner.is_parked.load(atomic::Ordering::Acquire) {
@@ -2442,14 +2463,13 @@ where
             None => return err::default_error(err::INV).with_module(mid),
         };
 
-        let slot_locks_guard = self.inner.slot_locks.read().unwrap_or_else(|e| e.into_inner());
         if hints::unlikely(end_offset > self.length()) {
             return err::default_error(err::HCF).with_module(mid);
         }
 
         let mut slot_guards = Vec::with_capacity(n);
         for slot in start..end_slot {
-            slot_guards.push(slot_locks_guard.write_lock(slot));
+            slot_guards.push(self.inner.slot_locks.write_lock(slot));
         }
 
         let guard = self.inner.mmap.read().unwrap_or_else(|e| e.into_inner());
@@ -2468,7 +2488,6 @@ where
 
         drop(guard);
         drop(slot_guards);
-        drop(slot_locks_guard);
 
         let epoch = self.inner.completion.increment_current_epoch();
         if self.inner.is_parked.load(atomic::Ordering::Acquire) {
@@ -2630,12 +2649,11 @@ where
             None => return err::default_error(err::INV).with_module(mid),
         };
 
-        let slot_locks_guard = self.inner.slot_locks.read().unwrap_or_else(|e| e.into_inner());
         if hints::unlikely(offset.checked_add(size).is_none_or(|end| end > self.length())) {
             return err::default_error(err::HCF).with_module(mid);
         }
 
-        let _slot_guard = slot_locks_guard.write_lock(index);
+        let _slot_guard = self.inner.slot_locks.write_lock(index);
         let guard = self.inner.mmap.read().unwrap_or_else(|e| e.into_inner());
 
         let mmap = match guard.as_ref() {
@@ -2649,7 +2667,6 @@ where
         if current != *expected {
             drop(guard);
             drop(_slot_guard);
-            drop(slot_locks_guard);
 
             return err::raw_error(
                 err::CAS,
@@ -2662,7 +2679,6 @@ where
 
         drop(guard);
         drop(_slot_guard);
-        drop(slot_locks_guard);
 
         let epoch = self.inner.completion.increment_current_epoch();
         if self.inner.is_parked.load(atomic::Ordering::Acquire) {
@@ -2889,9 +2905,6 @@ where
         }
 
         let size = core::mem::size_of::<T>();
-        let slot_locks_guard =
-            self.memmap.inner.slot_locks.read().unwrap_or_else(|e| e.into_inner());
-
         let current_length = self.memmap.length();
         for (index, _, _) in &self.ops {
             let offset = match index.checked_mul(size) {
@@ -2906,7 +2919,7 @@ where
 
         let mut slot_guards = Vec::with_capacity(self.ops.len());
         for (index, _, _) in &self.ops {
-            slot_guards.push(slot_locks_guard.write_lock(*index));
+            slot_guards.push(self.memmap.inner.slot_locks.write_lock(*index));
         }
 
         let guard = self.memmap.inner.mmap.read().unwrap_or_else(|e| e.into_inner());
@@ -2924,7 +2937,6 @@ where
             if current != *expected {
                 drop(guard);
                 drop(slot_guards);
-                drop(slot_locks_guard);
 
                 return err::raw_error(
                     err::CAS,
@@ -2944,7 +2956,6 @@ where
 
         drop(guard);
         drop(slot_guards);
-        drop(slot_locks_guard);
 
         let epoch = self.memmap.inner.completion.increment_current_epoch();
         if self.memmap.inner.is_parked.load(atomic::Ordering::Acquire) {
@@ -3963,10 +3974,10 @@ mod tests {
             mmap.write(2, |v| *v = 0x1234).unwrap();
             mmap.write(3, |v| *v = 0x5678).unwrap();
 
-            let barrier = Arc::new(std::sync::Barrier::new(4));
+            let barrier = Arc::new(std::sync::Barrier::new(8));
             let mut handles = Vec::new();
 
-            for _ in 0..4 {
+            for _ in 0..8 {
                 let mmap_clone = Arc::clone(&mmap);
                 let barrier_clone = Arc::clone(&barrier);
                 handles.push(std::thread::spawn(move || {
@@ -4137,10 +4148,10 @@ mod tests {
             mmap.write(2, |v| *v = 0x1234).unwrap();
             mmap.write(3, |v| *v = 0x5678).unwrap();
 
-            let barrier = Arc::new(std::sync::Barrier::new(4));
+            let barrier = Arc::new(std::sync::Barrier::new(8));
             let mut handles = Vec::new();
 
-            for _ in 0..4 {
+            for _ in 0..8 {
                 let mmap_clone = Arc::clone(&mmap);
                 let barrier_clone = Arc::clone(&barrier);
                 handles.push(std::thread::spawn(move || {
