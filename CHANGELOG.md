@@ -1,5 +1,24 @@
 # Changelog
 
+## `0.0.44`
+
+- `memmap`
+  - Replaced dynamic virtual memory slot locks with fixed-size striped seqlock pool
+    (65,536 cache-line aligned locks, 4 MiB footprint), fixing Windows pagefile commit
+    exhaustion (`ERROR_COMMITMENT_LIMIT` / `1455`)
+  - Eliminated platform lock table allocations (`VirtualAlloc2`, `mmap`, `free_lock_table`)
+    and dynamic lock table growth (`grow`)
+  - Added deadlock-free ascending stripe range acquisition (`write_lock_range`) for
+    multi-slot writes
+  - Implemented deduplicated multi-index stripe locking (`write_lock_indices`) for
+    batch transactions
+  - Hardened optimistic reads (`read_optimistic`) via stack-staged copy-then-validate OCC
+    with acquire memory fences, eliminating torn reads and speculation panics under writer contention
+  - Added direct by-value optimistic read helper (`read_optimistic_val`) avoiding closure indirection
+    for copyable types
+  - Implemented adaptive reader spinlock fallback (`read_exact`) after `0x40` contention spins to
+    prevent reader livelock
+
 ## `0.0.43`
 
 - `memmap`
