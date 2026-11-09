@@ -12,6 +12,7 @@ permissions:
 jobs:
   lints:
     name: Lints
+    timeout-minutes: 15
     env:
       RUSTFLAGS: "-D warnings"
     strategy:
@@ -48,6 +49,7 @@ jobs:
   release:
     needs: lints
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       
@@ -80,6 +82,7 @@ jobs:
   publish:
     needs: lints
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       
