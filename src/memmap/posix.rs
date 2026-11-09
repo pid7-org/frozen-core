@@ -413,6 +413,7 @@ impl MemMapInterface for POSIXMemMap {
     /// - The caller must uphold Rust's aliasing rules (no concurrent unsynchronized reads or writes
     ///   to overlapping bytes)
     /// - The memory mapping must not have been unmapped via [`POSIXMemMap::unmap`]
+    #[cfg(test)]
     #[inline]
     #[allow(unsafe_op_in_unsafe_fn)]
     unsafe fn as_mut_ptr<T>(&self, offset: usize) -> *mut T

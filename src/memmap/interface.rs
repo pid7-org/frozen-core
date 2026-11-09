@@ -129,6 +129,7 @@ pub(in crate::memmap) trait MemMapInterface: Sized + Send + Sync {
     /// - The caller must uphold Rust's aliasing rules (no concurrent unsynchronized reads or writes
     ///   to overlapping bytes)
     /// - The memory mapping must not have been unmapped via [`unmap`](MemMapInterface::unmap)
+    #[cfg(test)]
     unsafe fn as_mut_ptr<T>(&self, offset: usize) -> *mut T
     where
         T: Sized;

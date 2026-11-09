@@ -1920,19 +1920,16 @@ where
             return err::default_error(err::HCF).with_module(mid);
         }
 
+        let base_ptr = self.inner.base_ptr.load(atomic::Ordering::Acquire);
+        if hints::unlikely(base_ptr.is_null()) {
+            return err::default_error(err::INV).with_module(mid);
+        }
+
         let _slot_guard = self.inner.slot_locks.read_lock(index);
-        let guard = self.inner.mmap.read().unwrap_or_else(|e| e.into_inner());
-
-        let mmap = match guard.as_ref() {
-            Some(m) => m,
-            None => return err::default_error(err::INV).with_module(mid),
-        };
-
-        let ptr = unsafe { mmap.as_ptr::<T>(offset) };
+        let ptr = unsafe { base_ptr.add(offset) as *const T };
         let target_ref = unsafe { &*ptr };
         let res = f(target_ref);
 
-        drop(guard);
         drop(_slot_guard);
 
         Ok(res)
@@ -2030,26 +2027,24 @@ where
             return err::default_error(err::HCF).with_module(mid);
         }
 
+        let base_ptr = self.inner.base_ptr.load(atomic::Ordering::Acquire);
+        if hints::unlikely(base_ptr.is_null()) {
+            return err::default_error(err::INV).with_module(mid);
+        }
+
+        let ptr = unsafe { base_ptr.add(offset) as *const Target };
+        if hints::unlikely(!(ptr as usize).is_multiple_of(core::mem::align_of::<Target>())) {
+            return err::default_error(err::ALN).with_module(mid);
+        }
+
         let mut slot_guards = Vec::with_capacity(n);
         for slot in start..end_slot {
             slot_guards.push(self.inner.slot_locks.read_lock(slot));
         }
 
-        let guard = self.inner.mmap.read().unwrap_or_else(|e| e.into_inner());
-        let mmap = match guard.as_ref() {
-            Some(m) => m,
-            None => return err::default_error(err::INV).with_module(mid),
-        };
-
-        let ptr = unsafe { mmap.as_ptr::<Target>(offset) };
-        if hints::unlikely(!(ptr as usize).is_multiple_of(core::mem::align_of::<Target>())) {
-            return err::default_error(err::ALN).with_module(mid);
-        }
-
         let target_ref = unsafe { &*ptr };
         let res = f(target_ref);
 
-        drop(guard);
         drop(slot_guards);
 
         Ok(res)
@@ -2196,7 +2191,7 @@ where
     /// - Callers must guard against unsynchronized concurrent writes or data races
     #[inline(always)]
     pub unsafe fn as_ptr(&self) -> *const T {
-        self.inner.base_ptr.load(atomic::Ordering::Relaxed) as *const T
+        self.inner.base_ptr.load(atomic::Ordering::Acquire) as *const T
     }
 
     /// Returns a typed pointer to target type at slot `start`
@@ -2245,7 +2240,7 @@ where
             return err::default_error(err::HCF).with_module(mid);
         }
 
-        let base_ptr = self.inner.base_ptr.load(atomic::Ordering::Relaxed);
+        let base_ptr = self.inner.base_ptr.load(atomic::Ordering::Acquire);
         if hints::unlikely(base_ptr.is_null()) {
             return err::default_error(err::INV).with_module(mid);
         }
@@ -2280,7 +2275,7 @@ where
     /// Callers must ensure no concurrent unsynchronized writes occur during slice lifetime
     #[inline(always)]
     pub unsafe fn as_byte_slice(&self) -> &[u8] {
-        let ptr = self.inner.base_ptr.load(atomic::Ordering::Relaxed);
+        let ptr = self.inner.base_ptr.load(atomic::Ordering::Acquire);
         let len = self.length();
         if hints::unlikely(ptr.is_null() || len == 0) {
             return &[];
@@ -2344,18 +2339,15 @@ where
             return err::default_error(err::HCF).with_module(mid);
         }
 
+        let base_ptr = self.inner.base_ptr.load(atomic::Ordering::Acquire);
+        if hints::unlikely(base_ptr.is_null()) {
+            return err::default_error(err::INV).with_module(mid);
+        }
+
         let _slot_guard = self.inner.slot_locks.write_lock(index);
-        let guard = self.inner.mmap.read().unwrap_or_else(|e| e.into_inner());
-
-        let mmap = match guard.as_ref() {
-            Some(m) => m,
-            None => return err::default_error(err::INV).with_module(mid),
-        };
-
-        let ptr = unsafe { mmap.as_mut_ptr::<T>(offset) };
+        let ptr = unsafe { base_ptr.add(offset) as *mut T };
         let res = f(unsafe { &mut *ptr });
 
-        drop(guard);
         drop(_slot_guard);
 
         let epoch = self.inner.completion.increment_current_epoch();
@@ -2467,26 +2459,24 @@ where
             return err::default_error(err::HCF).with_module(mid);
         }
 
+        let base_ptr = self.inner.base_ptr.load(atomic::Ordering::Acquire);
+        if hints::unlikely(base_ptr.is_null()) {
+            return err::default_error(err::INV).with_module(mid);
+        }
+
+        let ptr = unsafe { base_ptr.add(offset) as *mut Target };
+        if hints::unlikely(!(ptr as usize).is_multiple_of(core::mem::align_of::<Target>())) {
+            return err::default_error(err::ALN).with_module(mid);
+        }
+
         let mut slot_guards = Vec::with_capacity(n);
         for slot in start..end_slot {
             slot_guards.push(self.inner.slot_locks.write_lock(slot));
         }
 
-        let guard = self.inner.mmap.read().unwrap_or_else(|e| e.into_inner());
-        let mmap = match guard.as_ref() {
-            Some(m) => m,
-            None => return err::default_error(err::INV).with_module(mid),
-        };
-
-        let ptr = unsafe { mmap.as_mut_ptr::<Target>(offset) };
-        if hints::unlikely(!(ptr as usize).is_multiple_of(core::mem::align_of::<Target>())) {
-            return err::default_error(err::ALN).with_module(mid);
-        }
-
         let target_ref = unsafe { &mut *ptr };
         let res = f(target_ref);
 
-        drop(guard);
         drop(slot_guards);
 
         let epoch = self.inner.completion.increment_current_epoch();
@@ -2653,19 +2643,16 @@ where
             return err::default_error(err::HCF).with_module(mid);
         }
 
+        let base_ptr = self.inner.base_ptr.load(atomic::Ordering::Acquire);
+        if hints::unlikely(base_ptr.is_null()) {
+            return err::default_error(err::INV).with_module(mid);
+        }
+
         let _slot_guard = self.inner.slot_locks.write_lock(index);
-        let guard = self.inner.mmap.read().unwrap_or_else(|e| e.into_inner());
-
-        let mmap = match guard.as_ref() {
-            Some(m) => m,
-            None => return err::default_error(err::INV).with_module(mid),
-        };
-
-        let ptr = unsafe { mmap.as_mut_ptr::<T>(offset) };
+        let ptr = unsafe { base_ptr.add(offset) as *mut T };
         let current = unsafe { ptr.read() };
 
         if current != *expected {
-            drop(guard);
             drop(_slot_guard);
 
             return err::raw_error(
@@ -2677,7 +2664,6 @@ where
 
         unsafe { core::ptr::write(ptr, val.clone()) };
 
-        drop(guard);
         drop(_slot_guard);
 
         let epoch = self.inner.completion.increment_current_epoch();
@@ -2922,20 +2908,18 @@ where
             slot_guards.push(self.memmap.inner.slot_locks.write_lock(*index));
         }
 
-        let guard = self.memmap.inner.mmap.read().unwrap_or_else(|e| e.into_inner());
-        let mmap = match guard.as_ref() {
-            Some(m) => m,
-            None => return err::default_error(err::INV).with_module(mid),
-        };
+        let base_ptr = self.memmap.inner.base_ptr.load(atomic::Ordering::Acquire);
+        if hints::unlikely(base_ptr.is_null()) {
+            return err::default_error(err::INV).with_module(mid);
+        }
 
         // (T1) State Precondition Verification (CAS)
         for (index, expected, _) in &self.ops {
             let offset = *index * size;
-            let ptr = unsafe { mmap.as_ptr::<T>(offset) };
+            let ptr = unsafe { base_ptr.add(offset) as *const T };
             let current = unsafe { ptr.read() };
 
             if current != *expected {
-                drop(guard);
                 drop(slot_guards);
 
                 return err::raw_error(
@@ -2949,12 +2933,11 @@ where
         // (T2) Apply mutations
         for (index, _, new) in self.ops {
             let offset = index * size;
-            let ptr = unsafe { mmap.as_mut_ptr::<T>(offset) };
+            let ptr = unsafe { base_ptr.add(offset) as *mut T };
 
             unsafe { core::ptr::write(ptr, new) };
         }
 
-        drop(guard);
         drop(slot_guards);
 
         let epoch = self.memmap.inner.completion.increment_current_epoch();
