@@ -1,5 +1,17 @@
 # Changelog
 
+## `0.0.43`
+
+- `memmap`
+  - Replaced heap-allocated `SlotLocks` array with stable fixed-address virtual memory
+    over-reservation (`MAP_NORESERVE` on POSIX, `MEM_RESERVE` on Windows), eliminating
+    outer `RwLock<SlotLocks>` and all reader RMW bus traffic
+  - Optimized multi-slot sequence validation via lock-free scalar rotation (`0x0D`) and XOR,
+    short-circuiting single-slot loads without hashing overhead
+  - Bypassed platform `mmap` read lock across `read`, `read_exact`, `write`, `write_exact`,
+    `compare_and_write`, and transaction `commit`, accessing `base_ptr` directly under slot locks
+  - Confined `mmap` write-locking strictly to mapping lifecycle boundaries (`grow`, `delete`)
+
 ## `0.0.42`
 
 - `memmap`
