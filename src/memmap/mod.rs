@@ -2284,16 +2284,25 @@ where
             return err::default_error(err::ALN).with_module(mid);
         }
 
+        let mut buf = core::mem::MaybeUninit::<Target>::uninit();
         let mut spins = 0x00;
         loop {
             if let Some(seq_before) = self.inner.slot_locks.load_sequence(start, n) {
-                let target_ref = unsafe { &*ptr };
-                let res = f(target_ref);
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        ptr as *const u8,
+                        buf.as_mut_ptr() as *mut u8,
+                        target_size,
+                    );
+                }
+
+                core::sync::atomic::fence(atomic::Ordering::Acquire);
 
                 if let Some(seq_after) = self.inner.slot_locks.load_sequence(start, n)
                     && hints::likely(seq_before == seq_after)
                 {
-                    return Ok(res);
+                    let target_ref = unsafe { &*buf.as_ptr() };
+                    return Ok(f(target_ref));
                 }
             }
 
@@ -2302,11 +2311,48 @@ where
                 std::hint::spin_loop();
             } else if spins < L2_CONTENTION {
                 std::thread::yield_now();
-            } else {
+            } else if spins < (L2_CONTENTION << 1) {
                 let ns = 0x30 << (spins - L2_CONTENTION).min(0x0A);
                 std::thread::sleep(std::time::Duration::from_nanos(ns));
+            } else {
+                return self.read_exact(start, f);
             }
         }
+    }
+
+    /// Optimistically reads target type by value without acquiring per-slot reader spinlocks
+    ///
+    /// Copies target data into a local value after sequence validation; avoids closure
+    /// indirection for copyable types
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::memmap::{MemMap, MemMapCfg};
+    /// use std::time::Duration;
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = MemMapCfg {
+    ///     module_id: 1,
+    ///     path: dir.path().to_path_buf(),
+    ///     name: *b"oval",
+    ///     version: 1,
+    ///     initial_pages: 1,
+    ///     max_len: 0x10_0000,
+    ///     sync_interval: Some(Duration::from_millis(0x64)),
+    ///     memory_priority_hint: false,
+    ///     sequential_access_hint: false,
+    /// };
+    ///
+    /// let mmap = MemMap::<u64>::new(cfg).unwrap();
+    /// mmap.write(0, |v| *v = 0xAA).unwrap();
+    ///
+    /// let val = mmap.read_optimistic_val::<u64>(0).unwrap();
+    /// assert_eq!(val, 0xAA);
+    /// ```
+    #[inline(always)]
+    pub fn read_optimistic_val<Target: Copy>(&self, start: usize) -> FrozenResult<Target> {
+        self.read_optimistic(start, |v: &Target| *v)
     }
 
     /// Optimistically reads a single slot `index` without acquiring per-slot reader spinlocks
@@ -4220,6 +4266,15 @@ mod tests {
 
             let keys = mmap.read_optimistic(2, |k: &[u64; 2]| *k).unwrap();
             assert_eq!(keys, [0x3333, 0x4444]);
+
+            let single_val = mmap.read_optimistic_val::<u64>(0).unwrap();
+            assert_eq!(single_val, 0x1111);
+
+            let node_val = mmap.read_optimistic_val::<TestNode>(0).unwrap();
+            assert_eq!(node_val, TestNode { id: 0x1111, flags: 0x2222, keys: [0x3333, 0x4444] });
+
+            let keys_val = mmap.read_optimistic_val::<[u64; 2]>(2).unwrap();
+            assert_eq!(keys_val, [0x3333, 0x4444]);
         }
 
         #[test]
