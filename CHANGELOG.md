@@ -1,5 +1,17 @@
 # Changelog
 
+## `0.0.42`
+
+- `memmap`
+  - Transitioned `SlotLocks` from atomic CAS reader counting to optimistic sequence locks
+    (seqlock), eliminating cross-core cache invalidation storms and interconnect RFO traffic (#115)
+  - Added safe, zero-atomic `MemMap::read_optimistic` and `MemMap::read_optimistic_slot` with
+    automatic collision detection and backoff retry (#115)
+  - Eliminated temporary heap allocations (`Vec::with_capacity`) on pure read paths (#115)
+  - Cached `base_ptr` in `MemMapInner` to bypass outer `RwLock` atomic RMWs on read paths (#115)
+  - Exposed raw memory inspection primitives: `as_ptr`, `as_ptr_at`, `as_slice`, and
+    `as_byte_slice` (#115)
+
 ## `0.0.41`
 
 - `core`
