@@ -6,7 +6,7 @@ use super::{
     interface::MemMapInterface,
 };
 use crate::{error::FrozenResult, hints};
-use core::{ptr, sync::atomic};
+use core::ptr;
 use libc::{
     _SC_PAGESIZE, EACCES, EAGAIN, EBADF, EBUSY, EINTR, EINVAL, EIO, ENODEV, ENOMEM, EOVERFLOW,
     EPERM, ETXTBSY, MADV_DONTNEED, MADV_RANDOM, MADV_SEQUENTIAL, MADV_WILLNEED, MAP_ANON,
@@ -616,47 +616,6 @@ fn munmap_raw(ptr: TPtr, length: size_t) -> FrozenResult<()> {
         EINVAL | ENOMEM => raw_error(err::HCF, err_msg),
 
         _ => raw_error(err::UNK, err_msg),
-    }
-}
-
-/// Allocates virtual address space for the slot locks table via anonymous `mmap(2)`
-///
-/// Reserves `bytes` virtual address space with `MAP_PRIVATE | MAP_ANON | MAP_NORESERVE`
-/// so that pages are committed on demand by the OS kernel without upfront RAM allocation
-pub(super) fn alloc_lock_table(bytes: usize) -> FrozenResult<*const atomic::AtomicU32> {
-    if hints::unlikely(bytes == 0) {
-        return raw_error(err::HCF, "lock table allocation length must be greater than zero");
-    }
-
-    let ptr = unsafe {
-        mmap(
-            ptr::null_mut(),
-            bytes,
-            PROT_READ | PROT_WRITE,
-            MAP_PRIVATE | MAP_ANON | MAP_NORESERVE,
-            -1,
-            0,
-        )
-    };
-
-    if ptr == MAP_FAILED {
-        let errno = last_errno();
-        let err_msg = err_msg(errno);
-
-        return match errno {
-            ENOMEM => raw_error(err::NMM, err_msg),
-            _ => raw_error(err::HCF, err_msg),
-        };
-    }
-
-    Ok(ptr as *const atomic::AtomicU32)
-}
-
-/// Releases virtual memory backing the slot locks table via `munmap(2)`
-#[inline]
-pub(super) fn free_lock_table(ptr: *const atomic::AtomicU32, bytes: usize) {
-    if !ptr.is_null() && bytes > 0 {
-        let _ = unsafe { munmap(ptr as *mut c_void, bytes) };
     }
 }
 

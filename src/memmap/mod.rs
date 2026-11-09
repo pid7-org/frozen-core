@@ -63,12 +63,6 @@ mod posix;
 #[cfg(target_os = "windows")]
 mod windows;
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use posix::{alloc_lock_table, free_lock_table};
-
-#[cfg(target_os = "windows")]
-use windows::{alloc_lock_table, free_lock_table};
-
 pub(in crate::memmap) use interface::MemMapInterface;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -278,6 +272,11 @@ impl MemMapCfg {
     }
 }
 
+const STRIPE_POWER: usize = 0x10;
+const STRIPE_COUNT: usize = 1 << STRIPE_POWER;
+const STRIPE_MASK: usize = STRIPE_COUNT - 1;
+const CHUNK_SHIFT: usize = 0x02;
+
 const WRITER_BIT: u32 = 0x8000_0000;
 const SEQ_SHIFT: u32 = 0x10;
 const SEQ_INC: u32 = 1 << SEQ_SHIFT;
@@ -286,51 +285,31 @@ const SEQ_MASK: u32 = 0x7FFF_0000;
 const L1_CONTENTION: usize = 0x10;
 const L2_CONTENTION: usize = 0x20;
 
+/// Cache-line aligned sequence lock wrapper preventing false sharing across stripe locks
+#[repr(align(64))]
+#[derive(Debug)]
+struct AlignedLock(atomic::AtomicU32);
+
 #[derive(Debug)]
 struct SlotLocks {
-    locks_ptr: *const atomic::AtomicU32,
-    active_slots: atomic::AtomicUsize,
-    max_slots: usize,
-    lock_bytes: usize,
+    locks: Box<[AlignedLock; STRIPE_COUNT]>,
 }
 
 unsafe impl Send for SlotLocks {}
 unsafe impl Sync for SlotLocks {}
 
-impl Drop for SlotLocks {
-    fn drop(&mut self) {
-        free_lock_table(self.locks_ptr, self.lock_bytes);
-        self.locks_ptr = core::ptr::null();
-        self.lock_bytes = 0;
-        self.max_slots = 0;
-        self.active_slots.store(0, atomic::Ordering::Release);
-    }
-}
-
 impl SlotLocks {
-    fn new(initial_slots: usize, max_slots: usize) -> FrozenResult<Self> {
-        let lock_bytes = match max_slots.checked_mul(core::mem::size_of::<atomic::AtomicU32>()) {
-            Some(b) => b,
-            None => return err::raw_error(err::INV, "slot count calculation overflowed usize"),
-        };
-
-        let locks_ptr = alloc_lock_table(lock_bytes)?;
-
-        Ok(Self {
-            locks_ptr,
-            active_slots: atomic::AtomicUsize::new(initial_slots),
-            max_slots,
-            lock_bytes,
-        })
+    fn new() -> Self {
+        let layout = std::alloc::Layout::new::<[AlignedLock; STRIPE_COUNT]>();
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) as *mut [AlignedLock; STRIPE_COUNT] };
+        assert!(!ptr.is_null(), "out of memory allocating striped lock table");
+        let locks = unsafe { Box::from_raw(ptr) };
+        Self { locks }
     }
 
     #[inline(always)]
-    fn grow(&self, additional_slots: usize) {
-        if hints::unlikely(additional_slots == 0) {
-            return;
-        }
-
-        let _ = self.active_slots.fetch_add(additional_slots, atomic::Ordering::Release);
+    fn stripe_index(slot: usize) -> usize {
+        (slot >> CHUNK_SHIFT) & STRIPE_MASK
     }
 
     #[inline(always)]
@@ -339,36 +318,38 @@ impl SlotLocks {
             return None;
         }
 
-        let active = self.active_slots.load(atomic::Ordering::Acquire);
-        let end = start.checked_add(n)?;
+        let chunk_first = start >> CHUNK_SHIFT;
+        let end_minus_one = start.checked_add(n - 1)?;
+        let chunk_last = end_minus_one >> CHUNK_SHIFT;
 
-        if hints::unlikely(end > active) {
+        let first_stripe = chunk_first & STRIPE_MASK;
+        let head = self.locks[first_stripe].0.load(atomic::Ordering::Acquire);
+        if hints::unlikely((head & WRITER_BIT) != 0) {
             return None;
         }
 
-        let head_word = unsafe { &*self.locks_ptr.add(start) }.load(atomic::Ordering::Acquire);
-        if hints::unlikely((head_word & WRITER_BIT) != 0) {
-            return None;
+        let mut hash = (head & SEQ_MASK) as u64;
+        if hints::likely(chunk_first == chunk_last) {
+            return Some(hash);
         }
 
-        if hints::likely(n == 1) {
-            return Some((head_word & SEQ_MASK) as u64);
-        }
-
-        let mut h = (head_word & SEQ_MASK) as u64;
-        for i in 1..n {
-            let val = unsafe { &*self.locks_ptr.add(start + i) }.load(atomic::Ordering::Acquire);
+        let span = (chunk_last - chunk_first).min(STRIPE_COUNT - 1);
+        for offset in 1..=span {
+            let stripe = (chunk_first + offset) & STRIPE_MASK;
+            let val = self.locks[stripe].0.load(atomic::Ordering::Acquire);
             if hints::unlikely((val & WRITER_BIT) != 0) {
                 return None;
             }
-            h = h.rotate_left(0x0D) ^ ((val & SEQ_MASK) as u64);
+            hash = hash.rotate_left(0x0D) ^ ((val & SEQ_MASK) as u64);
         }
-        Some(h)
+
+        Some(hash)
     }
 
     #[inline(always)]
     fn read_lock(&self, index: usize) -> SlotReadGuard<'_> {
-        let val = unsafe { &*self.locks_ptr.add(index) };
+        let stripe = Self::stripe_index(index);
+        let val = &self.locks[stripe].0;
         let mut spins = 0x00;
 
         loop {
@@ -401,8 +382,7 @@ impl SlotLocks {
     }
 
     #[inline(always)]
-    fn write_lock(&self, index: usize) -> SlotWriteGuard<'_> {
-        let val = unsafe { &*self.locks_ptr.add(index) };
+    fn acquire_stripe(val: &atomic::AtomicU32) -> u32 {
         let mut spins = 0x00;
 
         loop {
@@ -418,7 +398,7 @@ impl SlotLocks {
                     )
                     .is_ok()
             {
-                return SlotWriteGuard { lock: val, seq: state & SEQ_MASK };
+                return state & SEQ_MASK;
             }
 
             if hints::likely(spins < L1_CONTENTION) {
@@ -431,6 +411,140 @@ impl SlotLocks {
             }
 
             spins += 1;
+        }
+    }
+
+    #[inline(always)]
+    fn write_lock(&self, index: usize) -> SlotWriteGuard<'_> {
+        let stripe = Self::stripe_index(index);
+        let val = &self.locks[stripe].0;
+        let seq = Self::acquire_stripe(val);
+        SlotWriteGuard { lock: val, seq }
+    }
+
+    fn write_lock_range(&self, start: usize, n: usize) -> MultiStripeGuard<'_> {
+        if hints::unlikely(n == 0) {
+            return MultiStripeGuard {
+                locks: &self.locks,
+                stripes_inline: [0usize; 0x10],
+                stripes_heap: Vec::new(),
+                use_heap: false,
+                count: 0,
+            };
+        }
+
+        let chunk_first = start >> CHUNK_SHIFT;
+        let end_minus_one = match start.checked_add(n - 1) {
+            Some(e) => e,
+            None => {
+                return MultiStripeGuard {
+                    locks: &self.locks,
+                    stripes_inline: [0usize; 0x10],
+                    stripes_heap: Vec::new(),
+                    use_heap: false,
+                    count: 0,
+                };
+            }
+        };
+        let chunk_last = end_minus_one >> CHUNK_SHIFT;
+        let span = (chunk_last - chunk_first).min(STRIPE_COUNT - 1);
+        let count = span + 1;
+
+        if count <= 0x10 {
+            let mut stripes_inline = [0usize; 0x10];
+            for (i, slot) in stripes_inline.iter_mut().enumerate().take(count) {
+                *slot = (chunk_first + i) & STRIPE_MASK;
+            }
+            stripes_inline[..count].sort_unstable();
+            for &stripe in &stripes_inline[..count] {
+                let _ = Self::acquire_stripe(&self.locks[stripe].0);
+            }
+
+            MultiStripeGuard {
+                locks: &self.locks,
+                stripes_inline,
+                stripes_heap: Vec::new(),
+                use_heap: false,
+                count,
+            }
+        } else {
+            let mut stripes_heap = Vec::with_capacity(count);
+            for i in 0..count {
+                stripes_heap.push((chunk_first + i) & STRIPE_MASK);
+            }
+            stripes_heap.sort_unstable();
+            for &stripe in &stripes_heap {
+                let _ = Self::acquire_stripe(&self.locks[stripe].0);
+            }
+
+            MultiStripeGuard {
+                locks: &self.locks,
+                stripes_inline: [0usize; 0x10],
+                stripes_heap,
+                use_heap: true,
+                count,
+            }
+        }
+    }
+
+    fn write_lock_indices(&self, indices: &[usize]) -> MultiStripeGuard<'_> {
+        if hints::unlikely(indices.is_empty()) {
+            return MultiStripeGuard {
+                locks: &self.locks,
+                stripes_inline: [0usize; 0x10],
+                stripes_heap: Vec::new(),
+                use_heap: false,
+                count: 0,
+            };
+        }
+
+        if indices.len() <= 0x10 {
+            let mut stripes_inline = [0usize; 0x10];
+            for (entry, &slot) in stripes_inline.iter_mut().zip(indices.iter()) {
+                *entry = Self::stripe_index(slot);
+            }
+            stripes_inline[..indices.len()].sort_unstable();
+            let mut dedup_count = 0;
+            let len = indices.len();
+            let mut idx = 0;
+            while idx < len {
+                let val = stripes_inline[idx];
+                if dedup_count == 0 || stripes_inline[dedup_count - 1] != val {
+                    stripes_inline[dedup_count] = val;
+                    dedup_count += 1;
+                }
+                idx += 1;
+            }
+
+            for &stripe in &stripes_inline[..dedup_count] {
+                let _ = Self::acquire_stripe(&self.locks[stripe].0);
+            }
+
+            MultiStripeGuard {
+                locks: &self.locks,
+                stripes_inline,
+                stripes_heap: Vec::new(),
+                use_heap: false,
+                count: dedup_count,
+            }
+        } else {
+            let mut stripes_heap: Vec<usize> =
+                indices.iter().map(|&slot| Self::stripe_index(slot)).collect();
+            stripes_heap.sort_unstable();
+            stripes_heap.dedup();
+
+            for &stripe in &stripes_heap {
+                let _ = Self::acquire_stripe(&self.locks[stripe].0);
+            }
+
+            let count = stripes_heap.len();
+            MultiStripeGuard {
+                locks: &self.locks,
+                stripes_inline: [0usize; 0x10],
+                stripes_heap,
+                use_heap: true,
+                count,
+            }
         }
     }
 }
@@ -456,6 +570,32 @@ impl Drop for SlotWriteGuard<'_> {
     fn drop(&mut self) {
         let next_seq = (self.seq.wrapping_add(SEQ_INC)) & SEQ_MASK;
         self.lock.store(next_seq, atomic::Ordering::Release);
+    }
+}
+
+/// RAII multi-stripe write guard
+struct MultiStripeGuard<'a> {
+    locks: &'a [AlignedLock; STRIPE_COUNT],
+    stripes_inline: [usize; 0x10],
+    stripes_heap: Vec<usize>,
+    use_heap: bool,
+    count: usize,
+}
+
+impl Drop for MultiStripeGuard<'_> {
+    fn drop(&mut self) {
+        let slice = if self.use_heap {
+            &self.stripes_heap[..self.count]
+        } else {
+            &self.stripes_inline[..self.count]
+        };
+
+        for &stripe in slice.iter().rev() {
+            let val = &self.locks[stripe].0;
+            let state = val.load(atomic::Ordering::Relaxed);
+            let next_seq = (state.wrapping_add(SEQ_INC)) & SEQ_MASK;
+            val.store(next_seq, atomic::Ordering::Release);
+        }
     }
 }
 
@@ -732,9 +872,7 @@ where
         let length = mmap.length();
         let completion = Arc::new(Completion::default());
         let sync_interval = cfg.sync_interval;
-        let total_slots = length / core::mem::size_of::<T>();
-        let max_slots = cfg.max_len / core::mem::size_of::<T>();
-        let slot_locks = SlotLocks::new(total_slots, max_slots).with_module(cfg.module_id)?;
+        let slot_locks = SlotLocks::new();
 
         let base_ptr = unsafe { mmap.as_ptr::<u8>(0) as *mut u8 };
         let inner = Arc::new(MemMapInner {
@@ -1720,7 +1858,6 @@ where
             let _ = mmap.advise_random(curr_len, bytes_to_add);
         }
 
-        self.inner.slot_locks.grow(additional_slots);
         self.inner.length.store(new_length, atomic::Ordering::Release);
 
         drop(mmap_guard);
@@ -2469,15 +2606,12 @@ where
             return err::default_error(err::ALN).with_module(mid);
         }
 
-        let mut slot_guards = Vec::with_capacity(n);
-        for slot in start..end_slot {
-            slot_guards.push(self.inner.slot_locks.write_lock(slot));
-        }
+        let slot_guard = self.inner.slot_locks.write_lock_range(start, n);
 
         let target_ref = unsafe { &mut *ptr };
         let res = f(target_ref);
 
-        drop(slot_guards);
+        drop(slot_guard);
 
         let epoch = self.inner.completion.increment_current_epoch();
         if self.inner.is_parked.load(atomic::Ordering::Acquire) {
@@ -2903,10 +3037,8 @@ where
             }
         }
 
-        let mut slot_guards = Vec::with_capacity(self.ops.len());
-        for (index, _, _) in &self.ops {
-            slot_guards.push(self.memmap.inner.slot_locks.write_lock(*index));
-        }
+        let slot_indices: Vec<usize> = self.ops.iter().map(|(index, _, _)| *index).collect();
+        let slot_guard = self.memmap.inner.slot_locks.write_lock_indices(&slot_indices);
 
         let base_ptr = self.memmap.inner.base_ptr.load(atomic::Ordering::Acquire);
         if hints::unlikely(base_ptr.is_null()) {
@@ -2920,7 +3052,7 @@ where
             let current = unsafe { ptr.read() };
 
             if current != *expected {
-                drop(slot_guards);
+                drop(slot_guard);
 
                 return err::raw_error(
                     err::CAS,
@@ -2938,7 +3070,7 @@ where
             unsafe { core::ptr::write(ptr, new) };
         }
 
-        drop(slot_guards);
+        drop(slot_guard);
 
         let epoch = self.memmap.inner.completion.increment_current_epoch();
         if self.memmap.inner.is_parked.load(atomic::Ordering::Acquire) {
@@ -5835,6 +5967,242 @@ mod tests {
             let slots = mmap.length() / core::mem::size_of::<u64>();
             assert!(mmap.write(slots - 1, |v| *v = 0xAA).is_ok());
             assert_eq!(mmap.read(slots - 1, |v| *v).unwrap(), 0xAA);
+        }
+    }
+
+    mod striped_locks {
+        use super::*;
+
+        #[test]
+        fn ok_minimal_stack_allocation_safety() {
+            let handle = std::thread::Builder::new()
+                .stack_size(0x0008_0000)
+                .spawn(|| {
+                    let locks = SlotLocks::new();
+                    assert_eq!(core::mem::align_of::<AlignedLock>(), 0x40);
+                    assert_eq!(core::mem::size_of::<AlignedLock>(), 0x40);
+                    assert_eq!(core::mem::size_of::<[AlignedLock; STRIPE_COUNT]>(), 0x0040_0000);
+                    assert!(locks.load_sequence(0, 1).is_some());
+                })
+                .unwrap();
+
+            handle.join().unwrap();
+        }
+
+        #[test]
+        fn ok_stripe_wrapping_boundary_concurrency() {
+            let locks = SlotLocks::new();
+            let start_slot = 0x0003_FFFE;
+            let span_n = 6;
+
+            let seq_init = locks.load_sequence(start_slot, span_n).unwrap();
+
+            {
+                let _guard = locks.write_lock_range(start_slot, span_n);
+                let stripe_high = &locks.locks[0xFFFF].0;
+                let stripe_low = &locks.locks[0x0000].0;
+                assert_ne!(stripe_high.load(atomic::Ordering::Relaxed) & WRITER_BIT, 0);
+                assert_ne!(stripe_low.load(atomic::Ordering::Relaxed) & WRITER_BIT, 0);
+
+                assert!(locks.load_sequence(start_slot, span_n).is_none());
+            }
+
+            let seq_after = locks.load_sequence(start_slot, span_n).unwrap();
+            assert_ne!(seq_init, seq_after);
+        }
+
+        #[test]
+        fn ok_multi_stripe_large_span_buffer_fallback() {
+            let locks = SlotLocks::new();
+            let n_slots = 128;
+            {
+                let _guard = locks.write_lock_range(0, n_slots);
+                for s in 0..0x20 {
+                    let val = locks.locks[s].0.load(atomic::Ordering::Relaxed);
+                    assert_ne!(
+                        val & WRITER_BIT,
+                        0,
+                        "stripe {} should be locked under large span",
+                        s
+                    );
+                }
+                let val32 = locks.locks[0x20].0.load(atomic::Ordering::Relaxed);
+                assert_eq!(val32 & WRITER_BIT, 0);
+            }
+
+            for s in 0..0x20 {
+                let val = locks.locks[s].0.load(atomic::Ordering::Relaxed);
+                assert_eq!(val & WRITER_BIT, 0);
+                assert_eq!(val & SEQ_MASK, SEQ_INC);
+            }
+        }
+
+        #[test]
+        fn ok_batch_tx_co_stripe_atomic_commit() {
+            let (_dir, cfg) = tmp_cfg();
+            let mmap = MemMap::<u64>::new(cfg).unwrap();
+
+            let mut tx = mmap.new_tx();
+            tx.write(&0u64, &0x1111, 0).unwrap();
+            tx.write(&0u64, &0x2222, 1).unwrap();
+            tx.write(&0u64, &0x3333, 2).unwrap();
+            tx.write(&0u64, &0x4444, 3).unwrap();
+            let ticket = tx.commit().unwrap();
+            let _ = ticket.force();
+            assert!(ticket.is_durable());
+
+            assert_eq!(mmap.read(0, |v| *v).unwrap(), 0x1111);
+            assert_eq!(mmap.read(1, |v| *v).unwrap(), 0x2222);
+            assert_eq!(mmap.read(2, |v| *v).unwrap(), 0x3333);
+            assert_eq!(mmap.read(3, |v| *v).unwrap(), 0x4444);
+
+            let mut tx2 = mmap.new_tx();
+            tx2.write(&0x1111, &0xDDDD, 0).unwrap();
+            tx2.write(&0x2222, &0xBBBB, 1).unwrap();
+            tx2.write(&0u64, &0xAAAA, 12).unwrap();
+            tx2.write(&0u64, &0xCCCC, 13).unwrap();
+            let ticket2 = tx2.commit().unwrap();
+            let _ = ticket2.force();
+            assert!(ticket2.is_durable());
+
+            assert_eq!(mmap.read(0, |v| *v).unwrap(), 0xDDDD);
+            assert_eq!(mmap.read(1, |v| *v).unwrap(), 0xBBBB);
+            assert_eq!(mmap.read(12, |v| *v).unwrap(), 0xAAAA);
+            assert_eq!(mmap.read(13, |v| *v).unwrap(), 0xCCCC);
+        }
+
+        #[test]
+        fn ok_concurrent_tx_overlapping_deadlock_freedom() {
+            let (_dir, cfg) = tmp_cfg();
+            let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
+
+            for i in 0..0x40 {
+                mmap.write(i, |v| *v = 0).unwrap();
+            }
+
+            let barrier = Arc::new(std::sync::Barrier::new(8));
+            let mut handles = Vec::new();
+
+            for t in 0..8 {
+                let m = Arc::clone(&mmap);
+                let b = Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    b.wait();
+                    for iter in 0..0x64 {
+                        let mut tx = m.new_tx();
+                        let slots = match t % 4 {
+                            0 => vec![0x04, 0x08, 0x0C],
+                            1 => vec![0x04, 0x0C, 0x10],
+                            2 => vec![0x08, 0x0C, 0x14],
+                            _ => vec![0x04, 0x10, 0x14],
+                        };
+                        for &slot in &slots {
+                            let cur = m.read(slot, |v| *v).unwrap();
+                            let _ = tx.write(&cur, &(cur.wrapping_add(1)), slot);
+                        }
+                        let _ = tx.commit();
+                        if iter % 0x10 == 0 {
+                            std::thread::yield_now();
+                        }
+                    }
+                }));
+            }
+
+            for h in handles {
+                h.join().unwrap();
+            }
+        }
+
+        #[test]
+        fn ok_zero_length_invariants() {
+            let locks = SlotLocks::new();
+            let guard = locks.write_lock_range(0, 0);
+            assert_eq!(guard.count, 0);
+
+            let guard_indices = locks.write_lock_indices(&[]);
+            assert_eq!(guard_indices.count, 0);
+
+            assert_eq!(locks.load_sequence(0, 0), None);
+            assert_eq!(locks.load_sequence(10, 0), None);
+        }
+
+        #[test]
+        fn ok_optimistic_read_spanned_writer_isolation() {
+            let (_dir, cfg) = tmp_cfg();
+            let mmap = Arc::new(MemMap::<u64>::new(cfg).unwrap());
+
+            #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+            #[repr(C)]
+            struct QuadWord {
+                a: u64,
+                b: u64,
+                c: u64,
+                d: u64,
+            }
+
+            mmap.write_exact(0, |q: &mut QuadWord| {
+                q.a = 0;
+                q.b = 0;
+                q.c = 0;
+                q.d = 0;
+            })
+            .unwrap();
+
+            let stop = Arc::new(atomic::AtomicBool::new(false));
+            let barrier = Arc::new(std::sync::Barrier::new(5));
+            let mut handles = Vec::new();
+
+            {
+                let m = Arc::clone(&mmap);
+                let b = Arc::clone(&barrier);
+                let s = Arc::clone(&stop);
+                handles.push(std::thread::spawn(move || {
+                    b.wait();
+                    let mut val = 1u64;
+                    while !s.load(atomic::Ordering::Relaxed) && val < 0x07D0 {
+                        m.write_exact(0, |q: &mut QuadWord| {
+                            q.a = val;
+                            q.b = val;
+                            q.c = val;
+                            q.d = val;
+                        })
+                        .unwrap();
+                        val = val.wrapping_add(1);
+                    }
+                    s.store(true, atomic::Ordering::Release);
+                }));
+            }
+
+            for _ in 0..4 {
+                let m = Arc::clone(&mmap);
+                let b = Arc::clone(&barrier);
+                let s = Arc::clone(&stop);
+                handles.push(std::thread::spawn(move || {
+                    b.wait();
+                    while !s.load(atomic::Ordering::Relaxed) {
+                        let quad: QuadWord = m.read_optimistic(0, |q: &QuadWord| *q).unwrap();
+                        assert_eq!(
+                            quad.a, quad.b,
+                            "torn read detected: a != b ({} vs {})",
+                            quad.a, quad.b
+                        );
+                        assert_eq!(
+                            quad.b, quad.c,
+                            "torn read detected: b != c ({} vs {})",
+                            quad.b, quad.c
+                        );
+                        assert_eq!(
+                            quad.c, quad.d,
+                            "torn read detected: c != d ({} vs {})",
+                            quad.c, quad.d
+                        );
+                    }
+                }));
+            }
+
+            for h in handles {
+                h.join().unwrap();
+            }
         }
     }
 }

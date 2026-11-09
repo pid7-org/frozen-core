@@ -4,7 +4,7 @@ use super::{
     interface::MemMapInterface,
 };
 use crate::{error::FrozenResult, hints};
-use core::{ptr, sync::atomic};
+use core::ptr;
 use std::time::Duration;
 use windows_sys::Win32::{
     Foundation::{
@@ -15,7 +15,7 @@ use windows_sys::Win32::{
     },
     System::{
         Memory::{
-            CreateFileMappingW, FlushViewOfFile, MEM_COMMIT, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE,
+            CreateFileMappingW, FlushViewOfFile, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE,
             MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER,
             MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3, PAGE_NOACCESS, PAGE_READWRITE,
             PrefetchVirtualMemory, UnmapViewOfFile, VirtualAlloc2, VirtualFreeEx, VirtualUnlock,
@@ -857,47 +857,6 @@ fn munmap_raw(ptr: TPtr, length: usize) -> FrozenResult<()> {
     match code {
         ERROR_INVALID_ADDRESS | ERROR_INVALID_PARAMETER => raw_error(err::HCF, err_msg),
         _ => raw_error(err::UNK, err_msg),
-    }
-}
-
-/// Allocates virtual address space for the slot locks table via Win32 VirtualAlloc2
-pub(super) fn alloc_lock_table(bytes: usize) -> FrozenResult<*const atomic::AtomicU32> {
-    if hints::unlikely(bytes == 0) {
-        return raw_error(err::HCF, "lock table allocation length must be greater than zero");
-    }
-
-    let ptr = unsafe {
-        VirtualAlloc2(
-            GetCurrentProcess(),
-            ptr::null_mut(),
-            bytes,
-            MEM_RESERVE | MEM_COMMIT,
-            PAGE_READWRITE,
-            ptr::null_mut(),
-            0,
-        )
-    };
-
-    if ptr.is_null() {
-        let code = last_error();
-        let err_msg = err_msg(code);
-
-        return match code {
-            ERROR_NOT_ENOUGH_MEMORY | ERROR_OUTOFMEMORY => raw_error(err::NMM, err_msg),
-            _ => raw_error(err::HCF, err_msg),
-        };
-    }
-
-    Ok(ptr as *const atomic::AtomicU32)
-}
-
-/// Releases virtual memory backing the slot locks table via Win32 VirtualFreeEx
-#[inline]
-pub(super) fn free_lock_table(ptr: *const atomic::AtomicU32, _bytes: usize) {
-    if !ptr.is_null() {
-        let _ = unsafe {
-            VirtualFreeEx(GetCurrentProcess(), ptr as *mut core::ffi::c_void, 0, MEM_RELEASE)
-        };
     }
 }
 
